@@ -305,3 +305,61 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 重复。审查同意应当合并成一个内部的 `applyBinding(epoch + 1)` 之类函数，但**合并必须先有测试覆盖**（尤其
 归档失败、epoch 竞争、旧 epoch 提议失效这三条路径），否则是拿行为风险换行数。本次修复 pass 不做，记录在此：
 下次动 `roster.ts` 时优先处理。
+
+## D37 — 已知缺口：已封存产物被篡改时，**本包自己的 baseline 比对抓不到**
+
+> 来源：L3 第三轮（失败构造）实测 + 事后核对代码。原始证据见
+> `docs/verify/records/20261029-session-040cb6df.md` §4.8 / §9.2。
+
+### 实测（`session-040cb6df`）
+
+把已封存产物 `re/runs/RUN-L3-001/artifacts/t001-hash.txt` 改一个字节后收口，返回的是
+**`SUBMISSION_INVALID`（`status=blocked`、`phase=integrating`）**，不是任务说明预测的 `CHECK_FAILED` 或
+`BASELINE_MISMATCH`。原因很简单：**该产物正好在本次提交的 `artifacts` 列表里**，提交校验重算文件哈希就
+对不上（`r2-s6c-rt_conclude.txt`：「产物缺失或哈希不符…文件哈希与预期不一致」），根本走不到 baseline 比对，
+更走不到最后的 `check --hashes`。这是**更早**的失败，属可接受的 fail-fast。
+
+### 代码事实（这才是缺口所在）
+
+1. `src/dispatch.ts:1744-1760`：真实派发路径的 `captureBaseline({ targetIds, … })` **从不传 `artifacts`**，
+   所以 `re/team/baselines/<D>.json` 的 `artifacts` 恒为 `[]`。L3 回执对得上：
+   `r2-s6b-receipt.json` 的 `baseline.compared = {targets: 1, preexisting_seals: 0, artifacts: 0}`。
+2. `src/baseline.ts:393-478`：`compareBaseline()` 只哈希 `baseline.targets` 与 `baseline.artifacts`；
+   `preexisting_seals` **只比对 seal 文件自身的 `path`+`sha256`**，从不重算被封存 RUN 里产物的字节哈希。
+   `src/conclude.ts:1340-1352` 调用它时也没有传任何 artifacts。
+
+**结论**：被篡改的已封存产物**无论是否出现在 `submission.artifacts` 里，baseline 比对都抓不到**。
+若它不在提交列表里，唯一检测点是收口最后一步 skill 的 `check --hashes`
+（实测 `r2-s6c-precheck-after-tamper.txt`：`ERROR: RUN-L3-001: artifact/script hash mismatch: …`，退出码 1），
+而那时**路线文件已回写、INDEX 已刷新、封存已复用**，失败会是 `partial`（带已落盘的副作用）而不是前置拒绝。
+
+### 裁决：本次不实现，按 `not-run` 缺口记录
+
+加"对已封存 RUN 的产物重算哈希"不是一行判断，而是给 `baseline` 引入新的语义（要覆盖:既有 seal 只校验复用的
+路径、大项目全量哈希的成本、以及"产物在 seal 之后被合法补正"的处置），必须配自己的失败注入测试。塞进一个
+修复 pass 会变成"顺手改行为"，与 D33/D34 的处置一致。
+
+**这条缺口没有自动化用例覆盖，也不该写一条"断言我们抓不到"的用例把它固化。** 已在
+`docs/verify/acceptance-status.md` 的「矩阵外的已知缺口」里登记为 `G3`，并已转成
+[`tickets/T17-baseline-artifacts.md`](tickets/T17-baseline-artifacts.md)（Lead 复核后立项：派发侧真的冻结
+依赖产物身份 + 收口侧在写盘之前比对）。T17 落地时这条 D37 应随之改成"已实现"，并由 T17 补它自己那条
+"`SUBMISSION_INVALID`（提交自报的产物变了）vs `BASELINE_MISMATCH`（依赖的既有证据变了）"的区分记录。
+
+## D38 — `checks/check-hashes.json` 的 `audit_pending: true` 是**预期行为**
+
+> 来源：L3 第 6 步首轮与第 6b 步两次实测（`r2-s6-check-hashes.json`、`r2-s6b-check-hashes.json`，
+> `exit_code` 都是 `0`）。
+
+`rt_conclude` 的持久化顺序是
+**checks（baseline/seal/impact/index/check-hashes）→ 路线回写 → impact → index → check --hashes →
+完成任务 → 回执 → 审计**。所以 `check --hashes` 看到的那份 `re/team/audit.jsonl` 必然**还没有**
+本次收口那条 `conclude` 记录，`project.py check` 于是报 `audit_pending: true` 并以退出码 0 通过。
+
+- 这是**顺序的正确投影**，不是缺陷：审计在检查之后写（契约要求 `audit_written` 如实回报，L3 两次都是 `true`）；
+- **不得**为了让这个字段变 `false` 而把审计提前到 checks 之前 —— 那会让"检查通过"与"审计已记"互相冒充；
+- skill 级别的 stage audit（`audit-scope`）是**交接职责**，由 Lead 在收口后按 skill 走，插件不代劳、也不
+  声称它已完成。
+
+判定：任何时候看到 `check-hashes` 的 `audit_pending: true` 且 `exit_code: 0`，都按预期行为处理；只有
+`audit_written: false` 才是需要报告的异常（那条路径 L1 有覆盖：`audit.test.mjs` /
+`conclude.test.mjs`「审计写失败 → ok + audit_written=false 且有诊断」）。
