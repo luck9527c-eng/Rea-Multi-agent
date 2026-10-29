@@ -8,3 +8,5 @@ packages/dsh-redteam-lead/dist/** -text
 # 二进制
 *.png binary
 *.ico binary
+docs/examples/** -text
+

@@ -5,7 +5,7 @@
 - inventory_revision：`example-20261029-001`
 - collected_at：`2026-10-29T15:08:01+08:00`
 - host.id：`example-local-windows`
-- 源 JSON SHA256：`1619e6bf7478a177a03dd45f2be09fb50c25d77d14e1be27cf8acb864cb7b600`
+- 源 JSON SHA256：`cbfd4d1a8ed8b948823a6b8e95a05b04c01dde6569bb5ce0e8646be178a4437b`
 - 不可变快照：[ENV-tools-example.json](ENV-tools-example.json)（与源 JSON 字节相同）
 
 ## 发现范围
