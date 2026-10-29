@@ -25,7 +25,9 @@ import { mkdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { ContractError } from './errors.js'
+import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js'
 import * as defaultPaths from './paths.js'
+import type { Diagnostic } from './types.js'
 
 /** 不可变契约目录。 */
 export const DISPATCHES_DIR = 're/team/dispatches'
@@ -71,27 +73,262 @@ const SHA256 = /^[0-9a-f]{64}$/u
 const PATH_NEXT_STEP =
   '只使用本次尝试分配目录 re/team/work/<dispatch-id>/<attempt-id>/ 内的相对路径，不要传绝对路径、.. 、反斜杠或 ADS'
 
-function sha256Text(text) {
+// ---------------------------------------------------------------------------
+// 本模块的形状
+//
+// 共享层（`types.ts`）只收跨模块的 `Diagnostic`/`Envelope`；契约自己的入参与产物
+// 都写在这里。JSON 边界一律按字段读（`route`/`baseline_ref` 用 `Record<string, unknown>`），
+// 不假设项目记录里一定有某个键。
+// ---------------------------------------------------------------------------
+
+/** 岗位目录条目（`catalog` 的产物；契约只读这几个字段）。 */
+export interface CatalogPost {
+  id: string
+  display_name?: string | null
+  focus?: string | null
+  priority?: unknown
+  required?: readonly string[]
+  optional?: readonly string[]
+  anchors_required?: readonly string[]
+  enabled?: boolean
+  disabled_reason?: string | null
+}
+
+/** 路线记录（项目 skill 的 `re/routes/<id>.json`）；按字段读，不假设完整形状。 */
+export type RouteRecord = Record<string, unknown>
+
+/** 契约里的 `baseline_ref`（T7 快照直接内联；具体键由 baseline 模块决定）。 */
+export type BaselineRef = Record<string, unknown>
+
+/** `mergeRequirements` 的产物（只追加的四个集合；`buildContract` 允许传 `{}`）。 */
+export interface MergedRequirements {
+  evidence_required?: string[]
+  prohibited?: string[]
+  capability_needs?: string[]
+  optional?: string[]
+}
+
+/** `classifyRoute` 的判定：只有可派发时才带 `status` 与 `target_ids`。 */
+export type RouteClassification =
+  | {
+    dispatchable: true
+    code: null
+    reason: string
+    next_step: string
+    status: string
+    target_ids: string[]
+  }
+  | { dispatchable: false; code: string; reason: string; next_step: string }
+
+/** `buildTaskSummary` 的入参。 */
+export interface TaskSummaryInput {
+  postId: string
+  routeId: string
+  targetIds: unknown
+  dispatchId: string
+  attemptId: string
+  operationId: string
+  contractRef: string
+  contractSha256: string
+  workDir: string
+  objective: unknown
+  attemptIndex?: number
+}
+
+/** `measureMessageBytes` 的入参（`blocks` 是宿主 content 块数组）。 */
+export interface MessageMeasureInput {
+  callerName: unknown
+  blocks: unknown
+}
+
+/** `buildDeliveryEnvelope` 的入参：必填字段缺一即 `INVALID_ARGUMENT`。 */
+export interface DeliveryEnvelopeInput {
+  callerName?: unknown
+  member?: unknown
+  dispatchId?: unknown
+  attemptId?: unknown
+  taskId?: unknown
+  taskRevision?: unknown
+  routeId?: unknown
+  postId?: unknown
+  contractRef?: unknown
+  contractSha256?: unknown
+  workDir?: unknown
+  runIdReservation?: unknown
+  objective?: unknown
+  rulesEntry?: unknown
+  skillCopyPath?: unknown
+  maxBytes?: number
+  headroomBytes?: number
+}
+
+/** 交付信封：成功带可直接发送的 blocks；失败只带字节数与原因（码固定）。 */
+export type DeliveryEnvelope =
+  | {
+    ok: true
+    blocks: { type: string; text: string }[]
+    text: string
+    bytes: number
+    envelope_id: string
+    dedupe_key: string
+    limit: number
+    headroom: number
+    trimmed: string[]
+    variant: string
+  }
+  | { ok: false; code: 'DELIVERY_FAILED'; bytes: number; limit: number; reason: string }
+
+/** `buildMemberPrompt` 的入参。 */
+export interface MemberPromptInput {
+  post: unknown
+  rulesEntry: unknown
+  skillCopyPath?: unknown
+}
+
+/** `buildWorkRules` 的入参。 */
+export interface WorkRulesInput {
+  workDir: unknown
+}
+
+/** `assertAttemptDir` / `assertAttemptPath` 的入参。 */
+export interface AttemptDirInput {
+  root: string
+  dispatchId: unknown
+  attemptId: unknown
+  candidate: unknown
+}
+
+/** `assertAttemptPath` 的入参（`label` 只出现在拒绝文本里）。 */
+export interface AttemptPathInput extends AttemptDirInput {
+  label?: string
+}
+
+/** `ensureWorkDir` 的入参（`paths` 默认用本模块的默认实现）。 */
+export interface EnsureWorkDirInput {
+  root: string
+  dispatchId: unknown
+  attemptId: unknown
+  paths?: typeof defaultPaths
+}
+
+/** `buildContract` 的入参（必填项由 `requireField` 在运行期拒绝）。 */
+export interface BuildContractInput {
+  dispatchId?: unknown
+  attemptId?: unknown
+  attemptIndex?: unknown
+  operationId?: unknown
+  createdAt?: unknown
+  projectRoot?: unknown
+  binding?: unknown
+  post?: CatalogPost | null
+  route?: RouteRecord | null
+  targets?: readonly unknown[]
+  baselineRef?: BaselineRef | null
+  objective?: unknown
+  requirements?: MergedRequirements
+  capabilityMatch?: unknown
+  resources?: unknown
+  dependsOnTasks?: readonly unknown[]
+  timeboxMs?: unknown
+  deliveryTimeoutMs?: unknown
+  workDir?: unknown
+  runIdReservation?: unknown
+  contractRef?: string
+  retryOf?: unknown
+  caller?: unknown
+}
+
+/** `readStartAck` 的入参。 */
+export interface StartAckInput {
+  root: string
+  dispatchId: unknown
+  attemptId: unknown
+}
+
+/** `serializeContract` 的产物：文本 + 文件字节数 + 文本的 SHA256。 */
+export interface SerializedContract {
+  text: string
+  bytes: number
+  sha256: string
+}
+
+/** `buildContract` 的产物：契约对象、引用路径与序列化结果。 */
+export interface BuiltContract extends SerializedContract {
+  contract: Record<string, unknown>
+  ref: string
+}
+
+/** `persistContract` 的产物。 */
+export interface PersistedContract {
+  ref: string
+  path: string
+  sha256: string
+  bytes: number
+  created: boolean
+}
+
+/** `persistContract` 的入参（`atomic` 就是 `deps.atomic` 的形状）。 */
+export interface PersistContractInput {
+  root: string
+  ref: string
+  text: string
+  atomic: typeof import('./atomic.js')
+  paths?: typeof defaultPaths
+}
+
+/** `projectAdapter` 在本模块只用到 `readSeals()`。 */
+export interface SealsReader {
+  readSeals(): Promise<unknown>
+}
+
+/** `captureBaseline` 的入参。 */
+export interface CaptureBaselineInput {
+  root: string
+  targetIds: unknown
+  projectAdapter: SealsReader
+  atomic: Pick<typeof import('./atomic.js'), 'sha256File'>
+  paths?: typeof defaultPaths
+  now?: unknown
+  dependencyRunIds?: readonly string[]
+}
+
+/** `captureBaseline` 的产物：失败带稳定码，成功带内联基准。 */
+export type BaselineCapture =
+  | { ok: true; baseline_ref: BaselineRef }
+  | { ok: false; code: string; reason: string; next_step: string; diagnostics: Diagnostic[] }
+
+function sha256Text(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
 /** 键排序后的稳定 JSON（用于摘要与去重，不用于人读文件）。 */
-export function canonicalJson(value) {
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(',')}]`
-  const keys = Object.keys(value).sort()
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  // 上一行已排除非对象：这里读同一条记录的键与值是安全的（`recordOf` 原样返回该对象）。
+  const record = recordOf(value)
+  const keys = Object.keys(record).sort()
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`
 }
 
-function pathInvalid(message, details) {
+function pathInvalid(message: string, details?: Record<string, unknown>): ContractError {
   return new ContractError({ code: 'PATH_INVALID', message, nextStep: PATH_NEXT_STEP, details })
 }
 
-function invalid(message, nextStep) {
+function invalid(message: string, nextStep: string): ContractError {
   return new ContractError({ code: 'INVALID_ARGUMENT', message, nextStep })
 }
 
-function nonEmpty(value) {
+/** 必填项：`null`/`undefined` 按「缺字段」拒绝，其余原样返回（用于收窄）。 */
+function requireField<T>(field: string, value: T | null | undefined): T {
+  if (value === null || value === undefined) {
+    throw invalid(`组装契约缺少 ${field}`, '由 handleDispatch 的 preflight 结果补齐后再落盘')
+  }
+  return value
+}
+
+/** 非空文本判定（谓词形式：通过后调用方拿到 `string`）。 */
+function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
@@ -105,10 +342,9 @@ function nonEmpty(value) {
  * 同一 operation 必须得到同一 dispatch（否则重入会写第二份契约）；不同 operation
  * 用 8 位摘要区分，避免截断后撞名。
  *
- * @param {string} operationId
- * @returns {string}
+ * `operationId` 按 `unknown` 收：形状由本函数自己拒绝（与迁移前的 `nonEmpty` 判定一致）。
  */
-export function dispatchIdFor(operationId) {
+export function dispatchIdFor(operationId: unknown): string {
   if (!nonEmpty(operationId)) {
     throw invalid('dispatch ID 需要一个非空的 operation_id', '传入 $defs.id 形状的 operation_id')
   }
@@ -126,11 +362,11 @@ export function dispatchIdFor(operationId) {
 }
 
 /**
- * 尝试序号 → `A-000001`（`$defs.attemptId`）。
- * @param {number} index 从 1 开始
+ * 尝试序号 → `A-000001`（`$defs.attemptId`）。序号从 1 开始。
  */
-export function attemptIdOf(index) {
-  if (!Number.isInteger(index) || index < 1 || index > 999999) {
+export function attemptIdOf(index: unknown): string {
+  // `Number.isInteger` 对非数字一律 false；先判 `typeof` 只是为了拿到收窄后的 number。
+  if (typeof index !== 'number' || !Number.isInteger(index) || index < 1 || index > 999999) {
     throw invalid(`attempt 序号必须是 1..999999 的整数: ${JSON.stringify(index)}`, '从 1 开始按序递增')
   }
   return `A-${String(index).padStart(6, '0')}`
@@ -140,7 +376,7 @@ export function attemptIdOf(index) {
  * 契约文件的项目内路径。第 1 次尝试沿用 `<dispatch-id>.json`（ticket 的固定路径），
  * 重试追加 attempt 后缀，绝不覆盖首份契约。
  */
-export function contractRefFor(dispatchId, attemptId, attemptIndex = 1) {
+export function contractRefFor(dispatchId: unknown, attemptId: unknown, attemptIndex: unknown = 1): string {
   if (!DISPATCH_ID.test(String(dispatchId))) {
     throw invalid(`dispatch_id 不合法: ${JSON.stringify(dispatchId)}`, '用 dispatchIdFor() 派生')
   }
@@ -153,12 +389,12 @@ export function contractRefFor(dispatchId, attemptId, attemptIndex = 1) {
 }
 
 /** attempt 本地记录路径（dispatch/attempt → task/member 的恢复关联）。 */
-export function attemptRefFor(dispatchId, attemptId) {
+export function attemptRefFor(dispatchId: unknown, attemptId: unknown): string {
   return `${ATTEMPTS_DIR}/${dispatchId}.${attemptId}.json`
 }
 
 /** 本次尝试的工作目录（项目内相对路径，无尾随 `/`：`$defs.path` 不允许空段）。 */
-export function workDirFor(dispatchId, attemptId) {
+export function workDirFor(dispatchId: unknown, attemptId: unknown): string {
   if (!DISPATCH_ID.test(String(dispatchId))) {
     throw invalid(`dispatch_id 不合法: ${JSON.stringify(dispatchId)}`, '用 dispatchIdFor() 派生')
   }
@@ -169,12 +405,12 @@ export function workDirFor(dispatchId, attemptId) {
 }
 
 /** 提交清单的默认落点（必须在本 attempt 目录内）。 */
-export function submissionRefFor(dispatchId, attemptId) {
+export function submissionRefFor(dispatchId: unknown, attemptId: unknown): string {
   return `${workDirFor(dispatchId, attemptId)}/submission.json`
 }
 
 /** RUN ID 预留（`^RUN-[A-Za-z0-9_-]+$`）；真正封存由 Lead 在收口时做。 */
-export function runIdReservationFor(dispatchId, attemptId) {
+export function runIdReservationFor(dispatchId: unknown, attemptId: unknown): string {
   return `RUN-${dispatchId}-${attemptId}`
 }
 
@@ -185,25 +421,23 @@ export function runIdReservationFor(dispatchId, attemptId) {
 /**
  * 路线的目标集合。项目 skill 的记录允许 `target_ids` 或 `targets`（字符串或对象）两种登记，
  * 两种都认；都不存在时返回空数组（由调用方拒绝）。
- *
- * @param {unknown} route
- * @returns {string[]}
  */
-export function routeTargetIds(route) {
+export function routeTargetIds(route: unknown): string[] {
   if (!route || typeof route !== 'object') return []
-  const raw = Array.isArray(route.target_ids)
-    ? route.target_ids
-    : (Array.isArray(route.targets) ? route.targets : [])
-  const ids = []
+  const view = recordOf(route)
+  const raw = Array.isArray(view.target_ids)
+    ? view.target_ids
+    : (Array.isArray(view.targets) ? view.targets : [])
+  const ids: string[] = []
   for (const item of raw) {
-    const id = typeof item === 'string' ? item : (item && typeof item.id === 'string' ? item.id : null)
+    const id = typeof item === 'string' ? item : (isRecord(item) && typeof item.id === 'string' ? item.id : null)
     if (id !== null && !ids.includes(id)) ids.push(id)
   }
   return ids
 }
 
 /** 路线内容摘要（完整内容的 SHA256，用于契约里的「路线版本」）。 */
-export function routeDigest(route) {
+export function routeDigest(route: unknown): string {
   return sha256Text(canonicalJson(route ?? null))
 }
 
@@ -211,12 +445,9 @@ export function routeDigest(route) {
  * 判定一条路线是否是「已由 Lead 按 skill 建立、尚未收口的可执行问题」。
  *
  * 不是真值判定：这里只读记录，不推断结论；返回的 `code` 是 caller 用来无副作用拒绝的稳定码。
- *
- * @param {unknown} route `projectAdapter.readRoute()` 的内容
- * @returns {{ dispatchable: boolean, code: string|null, reason: string, next_step: string,
- *             status?: string, target_ids?: string[] }}
+ * `route` 就是 `projectAdapter.readRoute()` 的内容（按字段读，形状不完整也算拒绝）。
  */
-export function classifyRoute(route) {
+export function classifyRoute(route: unknown): RouteClassification {
   if (!route || typeof route !== 'object' || Array.isArray(route)) {
     return {
       dispatchable: false,
@@ -225,17 +456,19 @@ export function classifyRoute(route) {
       next_step: '先按项目 skill 建立 re/routes/<id>.json（路线、问题、判据、目标、预算）',
     }
   }
-  const id = typeof route.id === 'string' ? route.id : (typeof route.route_id === 'string' ? route.route_id : null)
+  const view = recordOf(route)
+  const id = typeof view.id === 'string' ? view.id : (typeof view.route_id === 'string' ? view.route_id : null)
   if (id === null || !ROUTE_ID.test(id)) {
     return {
       dispatchable: false,
       code: 'PROJECT_NOT_CONFIGURED',
-      reason: `路线记录缺少合法的 id（实际 ${JSON.stringify(route.id)}）`,
+      reason: `路线记录缺少合法的 id（实际 ${JSON.stringify(view.id)}）`,
       next_step: '按 skill 修正路线记录的 id（^R-[A-Za-z0-9_-]+$）',
     }
   }
-  const status = route.status
-  if (!ROUTE_STATUSES.includes(status)) {
+  const status = view.status
+  // `includes` 只可能命中字符串；先判 `typeof` 与原来的「不在枚举内」等价。
+  if (typeof status !== 'string' || !ROUTE_STATUSES.includes(status)) {
     return {
       dispatchable: false,
       code: 'PROJECT_NOT_CONFIGURED',
@@ -267,15 +500,16 @@ export function classifyRoute(route) {
 }
 
 /** 契约里的路线投影：版本（摘要）+ 问题/判据/预算 + 依赖，不复制事实层。 */
-export function routeProjection(route) {
-  const projected = {
-    id: route?.id ?? route?.route_id ?? null,
-    status: route?.status ?? null,
+export function routeProjection(route: unknown): Record<string, unknown> {
+  const view = recordOf(route)
+  const projected: Record<string, unknown> = {
+    id: view.id ?? view.route_id ?? null,
+    status: view.status ?? null,
     digest: routeDigest(route),
     target_ids: routeTargetIds(route),
   }
   for (const key of ['problem', 'hypothesis', 'criteria', 'budget', 'depends_on', 'closure', 'conditions']) {
-    if (route && route[key] !== undefined) projected[key] = route[key]
+    if (route && view[key] !== undefined) projected[key] = view[key]
   }
   return projected
 }
@@ -284,8 +518,8 @@ export function routeProjection(route) {
 // 要求合并（只追加）
 // ---------------------------------------------------------------------------
 
-function unionOf(base, extra) {
-  const out = []
+function unionOf(base: unknown, extra: unknown): string[] {
+  const out: string[] = []
   for (const value of [...(Array.isArray(base) ? base : []), ...(Array.isArray(extra) ? extra : [])]) {
     if (typeof value !== 'string' || value.trim().length === 0) continue
     if (!out.includes(value)) out.push(value)
@@ -297,15 +531,17 @@ function unionOf(base, extra) {
  * 岗位目录默认要求 ∪ 任务追加要求。**只追加**：传空数组不会删掉模板需求
  * （编排契约「工具输入与输出」：`evidence_required`/`prohibited`/`capability_needs` 都只追加）。
  *
- * @param {object} post 岗位目录条目（`required`/`optional`/`anchors_required`/`prohibited`）
- * @param {object} input 任务输入
+ * `post` 是岗位目录条目（`required`/`optional`/`anchors_required`/`prohibited`），
+ * `input` 是任务输入；两者都按字段读，非对象按空处理。
  */
-export function mergeRequirements(post, input = {}) {
+export function mergeRequirements(post: unknown, input: unknown = {}): MergedRequirements {
+  const postView = recordOf(post)
+  const inputView = recordOf(input)
   return {
-    evidence_required: unionOf(post?.anchors_required, input?.evidence_required),
-    prohibited: unionOf(post?.prohibited, input?.prohibited),
-    capability_needs: unionOf(post?.required, input?.capability_needs),
-    optional: unionOf(post?.optional, []),
+    evidence_required: unionOf(postView.anchors_required, inputView.evidence_required),
+    prohibited: unionOf(postView.prohibited, inputView.prohibited),
+    capability_needs: unionOf(postView.required, inputView.capability_needs),
+    optional: unionOf(postView.optional, []),
   }
 }
 
@@ -330,7 +566,7 @@ export function buildTaskSummary({
   workDir,
   objective,
   attemptIndex = 1,
-}) {
+}: TaskSummaryInput): { subject: string; description: string } {
   const targets = Array.isArray(targetIds) ? targetIds.join(',') : String(targetIds ?? '')
   const subject = `[rt_dispatch] ${postId} ${routeId} ${targets}`.slice(0, MAX_SUBJECT_CHARS)
   const lines = [
@@ -355,11 +591,8 @@ export function buildTaskSummary({
 
 /**
  * 宿主实际计量的字节数：`[{type:'text',text:'Team message from <name>:'}, ...blocks]` 的 UTF-8 字节（D9）。
- *
- * @param {{ callerName: string, blocks: object[] }} input
- * @returns {number}
  */
-export function measureMessageBytes({ callerName, blocks }) {
+export function measureMessageBytes({ callerName, blocks }: MessageMeasureInput): number {
   const content = [
     { type: 'text', text: `Team message from ${callerName}:` },
     ...(Array.isArray(blocks) ? blocks : []),
@@ -378,12 +611,9 @@ const DELIVERY_INSTRUCTIONS = Object.freeze([
  * 组装交付信封。消息只含引用与摘要，超长契约不受消息长度限制：
  * 依次尝试带 objective 摘录、更短的摘录、只留身份与哈希；仍然超限才 `DELIVERY_FAILED`。
  *
- * @param {object} input 见 `deliveryArgs()`（内部使用）
- * @returns {{ ok: true, blocks: object[], text: string, bytes: number, envelope_id: string,
- *             dedupe_key: string, limit: number, headroom: number, trimmed: string[] }
- *           | { ok: false, code: 'DELIVERY_FAILED', bytes: number, limit: number, reason: string }}
+ * 入参见 `deliveryArgs()`（内部使用）：必填字段缺一即 `INVALID_ARGUMENT`。
  */
-export function buildDeliveryEnvelope(input = {}) {
+export function buildDeliveryEnvelope(input: DeliveryEnvelopeInput = {}): DeliveryEnvelope {
   const {
     callerName,
     member,
@@ -412,7 +642,8 @@ export function buildDeliveryEnvelope(input = {}) {
       throw invalid(`交付信封缺少 ${field}`, '由 handleDispatch 组装完整信封后再发送')
     }
   }
-  if (!SHA256.test(contractSha256)) {
+  // 先判 `typeof`：非字符串本来就会让 `SHA256.test` 失败，这里只是把同一个拒绝写清楚。
+  if (typeof contractSha256 !== 'string' || !SHA256.test(contractSha256)) {
     throw invalid(`contract_sha256 必须是 64 位小写十六进制: ${contractSha256}`, '用契约文件字节的 SHA256')
   }
 
@@ -436,7 +667,7 @@ export function buildDeliveryEnvelope(input = {}) {
     instructions: [...DELIVERY_INSTRUCTIONS],
   }
 
-  const variants = [
+  const variants: { payload: Record<string, unknown>; tag: string }[] = [
     { payload: { ...base, objective_excerpt: String(objective ?? '').slice(0, 1200) }, tag: 'full' },
     { payload: { ...base, objective_excerpt: String(objective ?? '').slice(0, 240) }, tag: 'short' },
     { payload: base, tag: 'hashes-only' },
@@ -444,11 +675,11 @@ export function buildDeliveryEnvelope(input = {}) {
 
   const limit = maxBytes
   const budget = limit - Math.max(0, headroomBytes)
-  const trimmed = []
+  const trimmed: string[] = []
   let lastBytes = 0
   for (const variant of variants) {
     const envelopeId = sha256Text(canonicalJson(variant.payload))
-    const payload = { ...variant.payload, envelope_id: envelopeId }
+    const payload: Record<string, unknown> = { ...variant.payload, envelope_id: envelopeId }
     const text = JSON.stringify(payload)
     const blocks = [{ type: 'text', text }]
     const bytes = measureMessageBytes({ callerName, blocks })
@@ -480,10 +711,11 @@ export function buildDeliveryEnvelope(input = {}) {
 }
 
 /** 组成成员 bootstrap prompt：只载入角色、项目规则入口与「等待任务」，不载契约。 */
-export function buildMemberPrompt({ post, rulesEntry, skillCopyPath }) {
-  const display = post?.display_name ?? post?.id ?? '团队成员'
-  const postId = post?.id ?? 'unknown'
-  const focus = nonEmpty(post?.focus) ? post.focus : '按 Lead 派发的契约执行本岗位工作'
+export function buildMemberPrompt({ post, rulesEntry, skillCopyPath }: MemberPromptInput): string {
+  const view = recordOf(post)
+  const display = view.display_name ?? view.id ?? '团队成员'
+  const postId = view.id ?? 'unknown'
+  const focus = nonEmpty(view.focus) ? view.focus : '按 Lead 派发的契约执行本岗位工作'
   const lines = [
     `你是「${display}」岗位的团队成员（post=${postId}）。`,
     `职责：${focus}`,
@@ -499,7 +731,7 @@ export function buildMemberPrompt({ post, rulesEntry, skillCopyPath }) {
 }
 
 /** 契约里的三条行为规矩（含本次工作目录）。 */
-export function buildWorkRules({ workDir }) {
+export function buildWorkRules({ workDir }: WorkRulesInput): string[] {
   return WORK_RULES.map((rule) => (nonEmpty(workDir) ? `${rule}（工作目录 ${workDir}）` : rule))
 }
 
@@ -509,11 +741,8 @@ export function buildWorkRules({ workDir }) {
 
 /**
  * 校验 `work_dir` 恰好是本次尝试的分配目录。
- *
- * @param {{ root: string, dispatchId: string, attemptId: string, candidate: unknown }} input
- * @returns {Promise<string>}
  */
-export async function assertAttemptDir({ root, dispatchId, attemptId, candidate }) {
+export async function assertAttemptDir({ root, dispatchId, attemptId, candidate }: AttemptDirInput): Promise<string> {
   const expected = workDirFor(dispatchId, attemptId)
   if (typeof candidate !== 'string' || candidate.trim().length === 0) {
     throw pathInvalid(`work_dir 缺失或不是字符串: ${JSON.stringify(candidate)}`)
@@ -522,7 +751,7 @@ export async function assertAttemptDir({ root, dispatchId, attemptId, candidate 
   try {
     defaultPaths.assertProjectRelative(candidate)
   } catch (error) {
-    throw pathInvalid(`work_dir 不合法: ${error.message}`)
+    throw pathInvalid(`work_dir 不合法: ${thrownMessage(error)}`)
   }
   if (candidate !== expected) {
     throw pathInvalid(
@@ -536,12 +765,14 @@ export async function assertAttemptDir({ root, dispatchId, attemptId, candidate 
 
 /**
  * 校验任意路径（典型是 `submission_ref`）严格落在本次尝试目录内。
- *
- * @param {{ root: string, dispatchId: string, attemptId: string, candidate: unknown,
- *           label?: string }} input
- * @returns {Promise<string>} 通过校验的项目内相对路径
  */
-export async function assertAttemptPath({ root, dispatchId, attemptId, candidate, label = 'path' }) {
+export async function assertAttemptPath({
+  root,
+  dispatchId,
+  attemptId,
+  candidate,
+  label = 'path',
+}: AttemptPathInput): Promise<string> {
   if (typeof candidate !== 'string' || candidate.trim().length === 0) {
     throw pathInvalid(`${label} 缺失或不是字符串: ${JSON.stringify(candidate)}`)
   }
@@ -549,7 +780,7 @@ export async function assertAttemptPath({ root, dispatchId, attemptId, candidate
   try {
     relative = defaultPaths.assertProjectRelative(candidate)
   } catch (error) {
-    throw pathInvalid(`${label} 不是合法的项目内相对路径: ${error.message}`)
+    throw pathInvalid(`${label} 不是合法的项目内相对路径: ${thrownMessage(error)}`)
   }
   const dir = workDirFor(dispatchId, attemptId)
   if (!relative.startsWith(`${dir}/`)) {
@@ -562,7 +793,12 @@ export async function assertAttemptPath({ root, dispatchId, attemptId, candidate
 }
 
 /** 建（或复用）本次尝试的工作目录，返回项目内相对路径。 */
-export async function ensureWorkDir({ root, dispatchId, attemptId, paths = defaultPaths }) {
+export async function ensureWorkDir({
+  root,
+  dispatchId,
+  attemptId,
+  paths = defaultPaths,
+}: EnsureWorkDirInput): Promise<string> {
   const dir = workDirFor(dispatchId, attemptId)
   await paths.assertSafeWriteTarget(root, dir)
   await paths.assertNoCaseCollision(root, dir)
@@ -579,11 +815,8 @@ export async function ensureWorkDir({ root, dispatchId, attemptId, paths = defau
  *
  * 契约**不内嵌自己的 `contract_sha256`** —— 哈希就是文件字节的 SHA256，
  * 回执/交付信封/台账里引用它，因此「回执里的哈希与文件字节一致」永远成立。
- *
- * @param {object} input
- * @returns {{ contract: object, ref: string, text: string, sha256: string, bytes: number }}
  */
-export function buildContract(input = {}) {
+export function buildContract(input: BuildContractInput = {}): BuiltContract {
   const {
     dispatchId,
     attemptId,
@@ -592,10 +825,7 @@ export function buildContract(input = {}) {
     createdAt,
     projectRoot,
     binding = null,
-    post,
-    route,
     targets = [],
-    baselineRef,
     objective,
     requirements = {},
     capabilityMatch = null,
@@ -603,18 +833,17 @@ export function buildContract(input = {}) {
     dependsOnTasks = [],
     timeboxMs = 1800000,
     deliveryTimeoutMs = 60000,
-    workDir,
-    runIdReservation,
-    contractRef,
     retryOf = null,
     caller = null,
   } = input
 
-  for (const [field, value] of Object.entries({ post, route, baselineRef, workDir, runIdReservation, contractRef })) {
-    if (value === null || value === undefined) {
-      throw invalid(`组装契约缺少 ${field}`, '由 handleDispatch 的 preflight 结果补齐后再落盘')
-    }
-  }
+  // 必填项：与原循环同一顺序、同一拒绝文本（先报第一个缺的字段），顺带拿到收窄后的值。
+  const post = requireField('post', input.post)
+  const route = requireField('route', input.route)
+  const baselineRef = requireField('baselineRef', input.baselineRef)
+  const workDir = requireField('workDir', input.workDir)
+  const runIdReservation = requireField('runIdReservation', input.runIdReservation)
+  const contractRef = requireField('contractRef', input.contractRef)
   if (!Array.isArray(baselineRef.targets) || baselineRef.targets.length === 0) {
     throw new ContractError({
       code: 'BASELINE_MISMATCH',
@@ -626,7 +855,7 @@ export function buildContract(input = {}) {
     throw invalid('契约的 baseline_ref.preexisting_seals 必须是数组（首次无 seal 时为 []）', '重跑 captureBaseline')
   }
 
-  const contract = {
+  const contract: Record<string, unknown> = {
     schema_version: 1,
     contract_kind: 'rt_dispatch',
     contract_version: 1,
@@ -639,7 +868,9 @@ export function buildContract(input = {}) {
     retry_of: retryOf,
     route_id: route?.id ?? route?.route_id ?? null,
     post_id: post.id,
-    target_ids: targets.map((target) => (typeof target === 'string' ? target : target?.id)).filter(Boolean),
+    target_ids: targets.map((target) => (
+      typeof target === 'string' ? target : (isRecord(target) ? target.id : undefined)
+    )).filter(Boolean),
     project: { root: projectRoot, binding },
     post: {
       id: post.id,
@@ -710,20 +941,17 @@ export function buildContract(input = {}) {
  *
  * 只有文件存在、能解析、`attempt` 与本次一致且 `at` 是带时区的 ISO 时间时，才返回该时间；
  * 其余一律 `null`（尚未开始，或确认书不合法）。
- *
- * @param {{ root: string, dispatchId: string, attemptId: string }} input
- * @returns {Promise<string | null>}
  */
-export async function readStartAck({ root, dispatchId, attemptId }) {
+export async function readStartAck({ root, dispatchId, attemptId }: StartAckInput): Promise<string | null> {
   const relative = `${workDirFor(dispatchId, attemptId)}/start.json`
-  let parsed
+  let parsed: unknown
   try {
     const text = await readFile(join(root, ...relative.split('/')), 'utf8')
     parsed = JSON.parse(text)
   } catch {
     return null
   }
-  if (!parsed || typeof parsed !== 'object') return null
+  if (!isRecord(parsed)) return null
   if (nonEmpty(parsed.attempt) && parsed.attempt !== attemptId) return null
   if (!nonEmpty(parsed.at)) return null
   const stamp = Date.parse(parsed.at)
@@ -741,7 +969,7 @@ export async function readStartAck({ root, dispatchId, attemptId }) {
  *
  * 契约文件不内嵌 `contract_sha256` —— 否则无法满足「回执里的哈希与文件字节一致」。
  */
-export function serializeContract(contract) {
+export function serializeContract(contract: unknown): SerializedContract {
   if (!contract || typeof contract !== 'object' || Array.isArray(contract)) {
     throw invalid('契约必须是对象', '由 buildContract 组装')
   }
@@ -752,10 +980,14 @@ export function serializeContract(contract) {
 
 /**
  * 不可变写入契约：独占创建；同内容幂等；异内容 `OPERATION_CONFLICT`（不覆盖既有证据）。
- *
- * @returns {Promise<{ ref: string, path: string, sha256: string, bytes: number, created: boolean }>}
  */
-export async function persistContract({ root, ref, text, atomic, paths = defaultPaths }) {
+export async function persistContract({
+  root,
+  ref,
+  text,
+  atomic,
+  paths = defaultPaths,
+}: PersistContractInput): Promise<PersistedContract> {
   const absolute = await paths.assertSafeWriteTarget(root, ref)
   await paths.assertNoCaseCollision(root, ref)
   const bytes = Buffer.from(text, 'utf8')
@@ -770,12 +1002,12 @@ export async function persistContract({ root, ref, text, atomic, paths = default
 // baseline_ref
 // ---------------------------------------------------------------------------
 
-async function readProjectJson(root, relative) {
+async function readProjectJson(root: string, relative: string): Promise<unknown> {
   try {
     const text = await readFile(join(root, ...relative.split('/')), 'utf8')
     return JSON.parse(text)
   } catch (error) {
-    if (error?.code === 'ENOENT') return null
+    if (thrownCode(error) === 'ENOENT') return null
     if (error instanceof SyntaxError) {
       throw new ContractError({
         code: 'RECOVERY_REQUIRED',
@@ -785,39 +1017,42 @@ async function readProjectJson(root, relative) {
     }
     throw new ContractError({
       code: 'RECOVERY_REQUIRED',
-      message: `读取 ${relative} 失败：${error?.code ?? error?.message ?? 'unknown'}`,
+      message: `读取 ${relative} 失败：${thrownCode(error) ?? thrownMessage(error)}`,
       nextStep: '确认项目根可读后重试；读取失败的既存项必须报错',
     })
   }
 }
 
-function targetRecordsOf(registry) {
-  if (!registry || typeof registry !== 'object') return []
+function targetRecordsOf(registry: unknown): unknown[] {
+  if (!isRecord(registry)) return []
   if (Array.isArray(registry.targets)) return registry.targets
   if (Array.isArray(registry)) return registry
   return []
 }
 
-function hashOfTargetRecord(record) {
+function hashOfTargetRecord(record: unknown): string | null {
+  const view = recordOf(record)
   for (const field of ['sha256', 'byte_sha256', 'bytes_sha256', 'hash']) {
-    if (typeof record?.[field] === 'string' && SHA256.test(record[field])) return record[field]
+    const value = view[field]
+    if (typeof value === 'string' && SHA256.test(value)) return value
   }
   return null
 }
 
-function pathOfTargetRecord(record) {
+function pathOfTargetRecord(record: unknown): string | null {
+  const view = recordOf(record)
   for (const field of ['path', 'sample_path', 'file', 'artifact_path']) {
-    if (nonEmpty(record?.[field])) return record[field]
+    if (nonEmpty(view[field])) return view[field]
   }
   return null
 }
 
-function sealTargetId(sealPath) {
+function sealTargetId(sealPath: unknown): string | null {
   const matched = /^re\/seals\/targets\/(T-[A-Za-z0-9_-]+)\.json$/u.exec(String(sealPath))
   return matched === null ? null : matched[1]
 }
 
-function baselineFailure(reason, nextStep) {
+function baselineFailure(reason: string, nextStep: string): BaselineCapture {
   return {
     ok: false,
     code: 'BASELINE_MISMATCH',
@@ -833,11 +1068,8 @@ function baselineFailure(reason, nextStep) {
  * 「真实目标哈希」优先用**实际字节**算出（并核对登记值），登记值与字节不一致即
  * `BASELINE_MISMATCH`；既没登记哈希也没有可读样本时同样拒绝 ——
  * `preexisting_seals=[]` 只表示「首次目标尚无 seal」，不表示「没有目标身份」。
- *
- * @param {{ root: string, targetIds: string[], projectAdapter: object, atomic: object,
- *           paths: object, now?: string, dependencyRunIds?: string[] }} input
  */
-export async function captureBaseline(input) {
+export async function captureBaseline(input: CaptureBaselineInput): Promise<BaselineCapture> {
   const { root, targetIds, projectAdapter, atomic, dependencyRunIds = [] } = input
   const paths = input.paths ?? defaultPaths
   const now = nonEmpty(input.now) ? input.now : new Date().toISOString()
@@ -855,9 +1087,9 @@ export async function captureBaseline(input) {
     )
   }
 
-  const frozen = []
+  const frozen: Record<string, unknown>[] = []
   for (const targetId of ids) {
-    const record = records.find((item) => item && (item.id === targetId || item.target_id === targetId))
+    const record = records.find((item) => isRecord(item) && (item.id === targetId || item.target_id === targetId))
     if (!record) {
       return baselineFailure(
         `目标 ${targetId} 未在 re/targets.json 登记`,
@@ -877,7 +1109,7 @@ export async function captureBaseline(input) {
       continue
     }
 
-    let absolute
+    let absolute: string
     if (/^[A-Za-z]:[\\/]/u.test(relativePath) || relativePath.startsWith('/')) {
       // 明确登记的外部样本：只读
       absolute = relativePath
@@ -885,7 +1117,7 @@ export async function captureBaseline(input) {
       const relative = paths.assertProjectRelative(relativePath)
       absolute = paths.resolveInProject(root, relative)
     }
-    let actual
+    let actual: string
     try {
       actual = await atomic.sha256File(absolute)
     } catch (error) {
@@ -894,7 +1126,7 @@ export async function captureBaseline(input) {
         continue
       }
       return baselineFailure(
-        `目标 ${targetId} 的样本 ${relativePath} 读不到（${error?.code ?? 'unknown'}），也没有登记哈希`,
+        `目标 ${targetId} 的样本 ${relativePath} 读不到（${thrownCode(error) ?? 'unknown'}），也没有登记哈希`,
         `确认样本仍存在且可读，或为 ${targetId} 登记 sha256 后再派发`,
       )
     }
@@ -909,24 +1141,30 @@ export async function captureBaseline(input) {
   }
 
   const sealsResult = await projectAdapter.readSeals()
-  if (!sealsResult || sealsResult.ok !== true) {
+  const sealsView = recordOf(sealsResult)
+  if (sealsView.ok !== true) {
+    // 适配器码只取字符串：非字符串在 dispatch 侧同样会被 `stableCode` 兜底成 RECOVERY_REQUIRED。
+    const code = typeof sealsView.code === 'string' ? sealsView.code : 'RECOVERY_REQUIRED'
+    const detail = typeof sealsView.reason === 'string'
+      ? sealsView.reason
+      : (typeof sealsView.code === 'string' ? sealsView.code : 'unknown')
     return {
       ok: false,
-      code: sealsResult?.code ?? 'RECOVERY_REQUIRED',
-      reason: `读取 re/seals 失败：${sealsResult?.reason ?? sealsResult?.code ?? 'unknown'}`,
+      code,
+      reason: `读取 re/seals 失败：${detail}`,
       next_step: '确认项目根与 re/seals 可读；读取失败的既存项必须报错，不能当作没有 seal',
       diagnostics: [{
-        code: sealsResult?.code ?? 'RECOVERY_REQUIRED',
-        reason: `读取 re/seals 失败：${sealsResult?.reason ?? sealsResult?.code ?? 'unknown'}`,
+        code,
+        reason: `读取 re/seals 失败：${detail}`,
         next_step: '确认项目根与 re/seals 可读后重试',
       }],
     }
   }
 
   const wantedRunSeals = new Set(dependencyRunIds.filter(nonEmpty))
-  const preexisting = []
-  for (const seal of Array.isArray(sealsResult.seals) ? sealsResult.seals : []) {
-    if (!seal || !nonEmpty(seal.path)) continue
+  const preexisting: { path: string; sha256: unknown; bytes: unknown }[] = []
+  for (const seal of Array.isArray(sealsView.seals) ? sealsView.seals : []) {
+    if (!isRecord(seal) || !nonEmpty(seal.path)) continue
     const targetId = sealTargetId(seal.path)
     if (targetId !== null && ids.includes(targetId)) {
       preexisting.push({ path: seal.path, sha256: seal.sha256, bytes: seal.bytes })
@@ -947,7 +1185,7 @@ export async function captureBaseline(input) {
       preexisting_seals: preexisting,
       dependency_runs: [...wantedRunSeals].sort(),
       seal_scan: {
-        total: Array.isArray(sealsResult.seals) ? sealsResult.seals.length : 0,
+        total: Array.isArray(sealsView.seals) ? sealsView.seals.length : 0,
         matched: preexisting.length,
       },
     },
