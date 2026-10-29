@@ -6,6 +6,8 @@ import path from 'node:path'
 import * as atomic from '../src/atomic.mjs'
 import * as baseline from '../src/baseline.mjs'
 import * as paths from '../src/paths.mjs'
+import * as validate from '../src/validate.mjs'
+import { schemaDefs } from '../src/tool-schema.mjs'
 import { makeCtx, makeTempProject } from './helpers/host.mjs'
 import { createFakeProject } from './helpers/fake-project.mjs'
 import { createFakeTeam } from './helpers/fake-team.mjs'
@@ -279,6 +281,12 @@ test('正常 finding 交付：readRoute→impact→readRun→readSeals→seal→
 
   assert.equal(envelope.status, 'ok', JSON.stringify(envelope))
   assert.equal(envelope.code, null)
+  assert.deepEqual(validate.validateInput(schemaDefs, 'result', envelope).issues, [], '返回信封必须通过 $defs.result')
+  assert.deepEqual(
+    validate.validateInput(schemaDefs, 'concludeData', envelope.data).issues,
+    [],
+    'ok 的 data 必须通过 $defs.concludeData',
+  )
   assert.deepEqual(fx.fakeProject.order(), [
     'readRoute',
     'impact',
@@ -366,6 +374,7 @@ test('check --hashes 失败 → CHECK_FAILED，任务不完成，保留 stdout/s
   assert.equal(envelope.status, 'blocked')
   assert.equal(envelope.code, 'CHECK_FAILED')
   assert.equal(envelope.data.phase, 'integrating')
+  assert.deepEqual(validate.validateInput(schemaDefs, 'result', envelope).issues, [], '失败信封也必须通过 $defs.result')
   assert.match(envelope.diagnostics[0].reason, /history\/status mismatch/u)
   assert.equal(fx.team.snapshot().tasks.find((task) => task.id === TASK).status, 'in_progress')
   assert.equal(fx.team.callsFor('updateTask').length, 0)
