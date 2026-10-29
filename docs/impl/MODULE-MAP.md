@@ -10,6 +10,7 @@ packages/dsh-redteam-lead/
   package.json                  T2
   cordis.patch.yml              T2
   index.js                      T2   # 唯一入口：注册三工具、路由 action、装配依赖
+  src/tool-schema.mjs           T2   # 从 docs/specs/rt-tools.schema.json 复制的包内 schema（带漂移测试）
   bin/doctor.mjs                T2   # 只读自检 CLI（不依赖插件已挂载）
   locale/en.json, zh.json       T2
   README.md                     T2
@@ -23,6 +24,7 @@ packages/dsh-redteam-lead/
     identity.mjs                T1   # exec.agent -> role(lead|teammate|other) + membership
     operation.mjs               T1   # operation 台账、阶段、CAS、重放去重
     audit.mjs                   T1   # re/team/audit.jsonl append-only
+    catalog.data.json           T3   # 岗位目录的包内副本（漂移测试对 docs/specs/roster-catalog.json）
     catalog.mjs                 T3   # 岗位目录加载/校验、模板组合、mixed 并集
     capability.mjs              T3   # 能力族解析、matchCapabilities 纯函数、绑定
     capacity.mjs                T3   # 席位/activation 预算裁剪（含 CAPACITY_UNKNOWN）
@@ -31,6 +33,7 @@ packages/dsh-redteam-lead/
     compatibility.mjs           T4   # 项目副本/规则/脚本指纹与兼容性检查
     roster.mjs                  T5   # rt_roster handler（inspect/bind/takeover）
     binding.mjs                 T5   # re/team/binding.json、roster.json、epoch、takeover
+                            # 注：re/team/capacity.json 由项目/操作者声明，插件只读（T4 的 readDeclaredCapacity）
     dispatch.mjs                T6   # rt_dispatch handler
     contract.mjs                T6   # 派发契约构建、持久化、交付信封、任务板映射
     resources.mjs               T6   # re/team/resources.json 资源租用/隔离

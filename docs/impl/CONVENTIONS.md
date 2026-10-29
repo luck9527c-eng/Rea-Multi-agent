@@ -19,6 +19,8 @@
 
 见 [MODULE-MAP.md](MODULE-MAP.md)。**每个 ticket 只写自己 scope 内的文件**；跨 scope 的需求通过 Lead 记到后续 ticket，不要顺手改别人的文件。共享文件的唯一 owner 已在该表标注。
 
+绕不开的外部事实（容量、任务板状态机、角色授权、depth、版本漂移、项目 skill 基线）**先读 [DECISIONS.md](DECISIONS.md)**，再读 [SEAMS.md](SEAMS.md)。DECISIONS 与 specs 冲突时以 DECISIONS 为准，并在报告里指出冲突。
+
 ## 代码风格
 
 - 纯函数优先：决策（裁剪、匹配、校验、状态判定）写成接收显式输入的纯函数并单独测试；I/O 集中在 adapter 边界。
