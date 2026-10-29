@@ -1,8 +1,10 @@
 # T4 — 宿主与项目 skill 适配器 + 契约级测试替身
 
-**Blocked by:** T2（需要 `bin/doctor` 之外的装配不涉及；实际只需 T1 与其自身）
+**Blocked by:** 无（可立即开工）
 
-> 注：本 ticket 只需 T1。它**不改** `index.js`（T2 已定义 `deps` 键名），只填自己那几个键。
+> **与 T1 并行**：T1 正在另一 worktree 写 `src/errors.mjs` 等内核。你**不要**创建或修改 `src/errors.mjs`、`src/envelope.mjs`、`src/validate.mjs`、`src/paths.mjs`、`src/atomic.mjs`、`src/lock.mjs`、`src/identity.mjs`、`src/operation.mjs`、`src/audit.mjs`、`test/helpers/tmp.mjs`。
+> 适配器返回的失败用**契约表里的字符串错误码**（如 `'TEAM_SERVICE_UNAVAILABLE'`）放在普通对象里，不要 import `errors.mjs`；需要临时目录时自己用 `node:fs` + `node:os` 写局部 helper，不要动 `test/helpers/tmp.mjs`。
+> `index.js` 的 `deps` 键名已由 SEAMS 固定，你不需要改 `index.js`。
 
 ## 这个 ticket 打通什么
 

@@ -1,6 +1,9 @@
 # T3 — 岗位目录、能力匹配与预算裁剪（纯函数）
 
-**Blocked by:** T1（需要 `envelope`/`errors`/`validate`）
+**Blocked by:** 无（可立即开工）
+
+> **与 T1 并行**：T1 正在另一 worktree 写 `src/errors.mjs` 等内核。你**不要**创建或修改 `src/errors.mjs`、`src/envelope.mjs`、`src/validate.mjs`、`src/paths.mjs`、`src/atomic.mjs`、`src/lock.mjs`、`src/identity.mjs`、`src/operation.mjs`、`src/audit.mjs`、`test/helpers/tmp.mjs`。
+> 你返回的失败用**契约表里的字符串错误码**（如 `'UNKNOWN_CAPABILITY'`、`'CAPACITY_UNKNOWN'`）放在普通对象里，不要 import `errors.mjs`。T10 会统一常量来源。
 
 ## 这个 ticket 打通什么
 
