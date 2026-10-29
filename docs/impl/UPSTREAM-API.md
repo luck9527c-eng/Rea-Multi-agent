@@ -110,5 +110,56 @@ planBudget({ candidates, remainingMemberSlots, remainingActivations,
 - `recommended_members` = `member === null` 的 assigned 条数。
 - **`planBudget().capacity` 带 `known`/`available_*`，这是内部形状**：投进 `rosterData.capacity` 时只能保留 schema 的 4 个字段（`remaining_member_slots`/`remaining_activations`/`reserved_member_slots`/`reserved_activations`），未知用 `null`，**`known` 不得上线**（见 [DECISIONS.md](DECISIONS.md) D19）。
 
-## 尚未交付（T4）
-`createTeamAdapter` / `createProjectAdapter` / `compatibility` 与 `test/helpers/{fake-team,fake-project,host}.mjs` —— T4 交付后补进本文件。
+## T4 适配器与替身
+
+### `src/team-adapter.mjs`
+```js
+createTeamAdapter({ ctx })            // 或 { services, exec, agent, config, projectRoot }
+readDeclaredCapacity(projectRoot)     // 读校验 re/team/capacity.json
+CONTRACT_VERSION / ADAPTER_CONTRACT_VERSION = 1
+hasService()
+```
+服务获取链：`services.agentTeams` → `ctx.get('agentTeams')`；缺席时全部方法 `TEAM_SERVICE_UNAVAILABLE`。
+返回的 `capacity()` 形状见 [SEAMS.md](SEAMS.md) §3；**`activations.remaining` 恒为 null**，上限已声明时 `total` 有值 —— 组装规则见 [DECISIONS.md](DECISIONS.md) **D25（必读）**。
+错误映射：`TEAM_LEAD_REQUIRED → ROLE_REQUIRED`；`TEAM_MEMBER_LIMIT / ACTIVATION_LIMIT_REACHED → CAPACITY_EXHAUSTED`（带 `hostCode`、`retryable:false`）；`TEAM_TASK_STALE_REVISION → REVISION_CONFLICT`（带 `actualRevision`）；`TEAM_TASK_*` 原样透传；未知宿主码 → `RECOVERY_REQUIRED` + `hostCode` + 原文。
+`task` 投影额外带 `ready`/`writeScopes`；`getTask` 对墓碑返回 `status:'deleted'`。
+`spawnTeammate` 接受 `{name, prompt}`，内部补 `description`（prompt 首行截 200）/`context:'fresh'`/`provider:'spawn'`/自建 `AbortSignal`，调用方可覆盖。
+
+### `src/project-adapter.mjs`
+```js
+createProjectAdapter({ projectRoot, python, projectPy, spawn, env, timeoutMs, catalogPath })
+// probe / seal / impact / index / check / auditScope / readRoute / readRun / readSeals
+```
+- `index()` 是文本输出 → `{ok, json:null, stdout, exitCode}`。
+- `readRoute/readRun` 缺失 → `{ok:false, code:'PROJECT_NOT_CONFIGURED', notFound:true}`；**JSON 损坏 → `RECOVERY_REQUIRED`**（不当作"没有记录"）；ID 不匹配 `R-…`/`RUN-…` → `INVALID_ARGUMENT`（防穿越）。
+- `seal`：已有 seal 文件 → **不调用 CLI**，`alreadySealed:true, called:false`；CLI 退出 1 且 stderr 命中 `refusing to overwrite sealed execution` → 复用（`reused:true`）；其它退出 1 → `CHECK_FAILED` 真失败。
+- Python 解析顺序：显式 `python` > 项目配置里真实存在的绝对路径（散文里 pin，启发式）> PATH `python`/`python3`；实际用的记进 `compatibility.versions.{python,pythonExe,pythonSource}`。
+- `probe().gaps` 带 `blocking`：INDEX/项目配置/副本/团队规则/project.py/Python 缺失是 blocking；`tool-inventory.md` 与 catalog 缺失是 non-blocking（D11）。
+
+### `src/compatibility.mjs`
+```js
+CONTRACT_VERSION = 1
+SKILL_COPY_RELATIVE
+computeDigests(...)      // rule/script/catalog 摘要；算法 = `path<TAB>sha256` 行排序后再 sha256
+readBinding(root)
+checkCompatibility(...)  // 与已存 binding 比对，不一致 → 需重新做兼容性检查
+```
+
+### `test/helpers/`
+```js
+createFakeTeam(options)   // → { service, agent, agentFor(name), calls, callsFor(op), resetCalls, snapshot(),
+                          //     faults{beforeHost,afterHost,dropResponse,clear,list}, failNextSpawn({code,message}),
+                          //     failMember(name), setActivations(n), capacityDeclaration }
+createFakeProject({ projectRoot, responses:{check,impact,index,seal,probe,auditScope}, routes, runs, seals, ... })
+                          // 对象本身即 adapter + calls / callsFor(cmd) / order() / queue(cmd, resp) / reset()
+makeCtx({ role, agentName, team?, teamOpts, project?, projectOpts, capacity, tools,
+          depsOverrides, config, projectRoot, t, now })   // 直接可传给 handler
+makeTempProject({t, files}) / makeTempDir(t) / makeClock(start) / makeFakeTools({...}) / makeFs() / DEP_KEYS
+```
+- `createFakeTeam` 的 `service` 是**宿主形状**，抛**宿主码**（`TEAM_LEAD_REQUIRED`/`TEAM_MEMBER_LIMIT`/`ACTIVATION_LIMIT_REACHED`…），端到端经真实适配器才变成契约码 —— 测契约码就要走 `makeCtx`。
+- `faults.beforeHost(op)` = 副作用前抛；`afterHost(op)` = 副作用后抛（模拟成功但响应丢失）；`dropResponse(op)` = 成功但返回丢失，`error.effectApplied=true`。
+- `makeCtx` 的 `deps` 已装 T1/T3 真实模块；`binding/contract/resources/submission/anchors/baseline` 仍为 `null`（由 T5/T6/T7 填）。
+- `capacity:{known:true,maxMembers,maxActiveSubagents,via:'project'|'config'}` 会落成 `re/team/capacity.json` 或 `ctx.config.capacity`；不传就 `known:false`。
+
+## 尚未交付（T5/T6/T7）
+`src/{roster,binding,dispatch,contract,resources,conclude,submission,anchors,baseline}.mjs` 与其测试。
