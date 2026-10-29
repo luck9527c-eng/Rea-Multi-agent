@@ -18,6 +18,8 @@ import path from 'node:path'
 import * as atomicModule from './atomic.js'
 import * as pathsModule from './paths.js'
 import { ContractError } from './errors.js'
+import { isRecord, thrownCode, thrownMessage } from './guards.js'
+import type { Clock, FsLike } from './types.js'
 
 /** 项目内固定路径（统一 `/`）。 */
 export const BINDING_PATH = 're/team/binding.json'
@@ -57,8 +59,37 @@ const RECOVERY_SIGNALS = Object.freeze([
   },
 ])
 
-function deps0(deps) {
-  const value = deps && typeof deps === 'object' ? deps : {}
+/**
+ * 本模块用到的 `deps.fs` 子集：`fs/promises` 的薄封装，外加**可选**的 `rm`
+ * （追加 INDEX 失败时要清临时文件；旧的/测试替身 fs 没有 `rm`，故保持可选调用 `fs.rm?.()`）。
+ */
+export interface BindingFs extends FsLike {
+  rm?: (target: string, options?: { force?: boolean }) => Promise<void>
+}
+
+/**
+ * 本模块接受的 `deps`（`ctx.deps` 的一个子集）。
+ *
+ * 全部可选：`index.ts` 先建骨架再挂模块，测试也常只注入一两个键；
+ * 每个键在 `deps0` 里回落到本包真实实现。
+ */
+export interface BindingDeps {
+  atomic?: typeof atomicModule
+  paths?: typeof pathsModule
+  fs?: BindingFs
+  clock?: Clock
+}
+
+/** `deps0` 的产物：四个键都已有确定实现。 */
+interface ResolvedBindingDeps {
+  atomic: typeof atomicModule
+  paths: typeof pathsModule
+  fs: BindingFs
+  clock: Clock
+}
+
+function deps0(deps?: BindingDeps | null): ResolvedBindingDeps {
+  const value: BindingDeps = deps ?? {}
   return {
     atomic: value.atomic ?? atomicModule,
     paths: value.paths ?? pathsModule,
@@ -67,24 +98,35 @@ function deps0(deps) {
   }
 }
 
-function isoNow(deps) {
+function isoNow(deps?: BindingDeps | null): string {
   const clock = deps0(deps).clock
   if (clock && typeof clock.isoNow === 'function') return clock.isoNow()
   if (clock && typeof clock.now === 'function') return new Date(clock.now()).toISOString()
   return new Date().toISOString()
 }
 
-function sha256Bytes(bytes) {
+function sha256Bytes(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
 }
 
-function nonEmptyString(value) {
+function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
 /** 项目身份哈希只关心「同一个目录」，所以折叠分隔符与大小写（Windows 语义）。 */
-function identityKeyOf(root) {
+function identityKeyOf(root: string): string {
   return String(root).replaceAll('\\', '/').replace(/\/+$/u, '').toLowerCase()
+}
+
+/** JSON 对象的判别谓词（等价于 `parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)` 的取反）。 */
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** `projectIdFor()` 的入参：两个字段都按未知读，运行期逐个收窄。 */
+export interface ProjectIdInput {
+  root?: unknown
+  projectRecord?: unknown
 }
 
 /**
@@ -97,9 +139,9 @@ function identityKeyOf(root) {
  * @param {{ root: string, projectRecord?: object | null }} input
  * @returns {string}
  */
-export function projectIdFor(input = {}) {
+export function projectIdFor(input: ProjectIdInput = {}): string {
   const record = input.projectRecord
-  if (record && typeof record === 'object' && !Array.isArray(record)) {
+  if (isRecord(record) && !Array.isArray(record)) {
     for (const key of ['project_id', 'projectId', 'id', 'project_name', 'name']) {
       const value = record[key]
       if (nonEmptyString(value)) return value.trim()
@@ -125,17 +167,31 @@ export function projectIdFor(input = {}) {
  * @param {{ identity?: object | null, exec?: object | null, config?: object | null }} input
  * @returns {{ session_id: string | null, team_id: string | null, source: string }}
  */
-export function sessionIdentityFrom(input = {}) {
-  const identity = input.identity && typeof input.identity === 'object' ? input.identity : {}
-  const exec = input.exec && typeof input.exec === 'object' ? input.exec : {}
-  const config = input.config && typeof input.config === 'object' ? input.config : {}
+/** `sessionIdentityFrom()` 的入参：三个来源都按未知读（宿主形状不归本包解释）。 */
+export interface SessionIdentityInput {
+  identity?: unknown
+  exec?: unknown
+  config?: unknown
+}
+
+/** 会话身份的三字段结果。 */
+export interface SessionIdentity {
+  session_id: string | null
+  team_id: string | null
+  source: string
+}
+
+export function sessionIdentityFrom(input: SessionIdentityInput = {}): SessionIdentity {
+  const identity = isRecord(input.identity) ? input.identity : {}
+  const exec = isRecord(input.exec) ? input.exec : {}
+  const config = isRecord(input.config) ? input.config : {}
 
   const teamId = nonEmptyString(identity.root) ? identity.root : null
   const candidates = [
     exec.sessionId,
     exec.session_id,
-    exec.session && typeof exec.session === 'object' ? exec.session.id : undefined,
-    exec.agent && typeof exec.agent === 'object' ? exec.agent.sessionId : undefined,
+    isRecord(exec.session) ? exec.session.id : undefined,
+    isRecord(exec.agent) ? exec.agent.sessionId : undefined,
     config.sessionId,
   ]
   const explicit = candidates.find((value) => nonEmptyString(value))
@@ -157,11 +213,24 @@ export function sessionIdentityFrom(input = {}) {
  * @param {{ sessionId?: string | null, teamId?: string | null }} current
  * @returns {{ ok: boolean, reason: string | null }}
  */
-export function checkSessionMatch(bindingValue, current = {}) {
+/** `checkSessionMatch()` 的「当前调用」一侧（两个字段都可缺，缺即未知）。 */
+export interface SessionMatchCurrent {
+  sessionId?: unknown
+  teamId?: unknown
+}
+
+/** 会话一致性结论。 */
+export interface SessionMatchResult {
+  ok: boolean
+  reason: string | null
+}
+
+export function checkSessionMatch(bindingValue: unknown, current: SessionMatchCurrent = {}): SessionMatchResult {
   if (!bindingValue || typeof bindingValue !== 'object') return { ok: true, reason: null }
-  const pairs = [
-    ['team_id', bindingValue.team_id, current.teamId],
-    ['session_id', bindingValue.session_id, current.sessionId],
+  const record = isRecord(bindingValue) ? bindingValue : {}
+  const pairs: Array<[string, unknown, unknown]> = [
+    ['team_id', record.team_id, current.teamId],
+    ['session_id', record.session_id, current.sessionId],
   ]
   for (const [field, stored, live] of pairs) {
     if (!nonEmptyString(stored) || !nonEmptyString(live)) continue
@@ -184,19 +253,27 @@ export function checkSessionMatch(bindingValue, current = {}) {
  * @param {object} [deps]
  * @returns {Promise<{present: boolean, value: object | null, sha256: string | null, reason?: string}>}
  */
-export async function readJsonIfPresent(root, relative, deps) {
+/** `readJsonIfPresent()` 的结果：`present:false` 时 `reason` 说明「没有」还是「坏了」。 */
+export interface JsonPresence {
+  present: boolean
+  value: Record<string, unknown> | null
+  sha256: string | null
+  reason?: string
+}
+
+export async function readJsonIfPresent(root: unknown, relative: unknown, deps?: BindingDeps | null): Promise<JsonPresence> {
   const { fs, paths } = deps0(deps)
-  let target
+  let target: string
   try {
     target = paths.resolveInProject(root, relative)
   } catch (error) {
-    return { present: false, value: null, sha256: null, reason: `${relative}: ${error?.message ?? error}` }
+    return { present: false, value: null, sha256: null, reason: `${relative}: ${thrownMessage(error)}` }
   }
-  let bytes
+  let bytes: Buffer
   try {
     bytes = await fs.readFile(target)
   } catch (error) {
-    const missing = error && typeof error === 'object' && error.code === 'ENOENT'
+    const missing = thrownCode(error) === 'ENOENT'
     return {
       present: false,
       value: null,
@@ -208,7 +285,7 @@ export async function readJsonIfPresent(root, relative, deps) {
   }
   const digest = sha256Bytes(bytes)
   const text = Buffer.isBuffer(bytes) ? bytes.toString('utf8') : String(bytes)
-  let parsed
+  let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch (error) {
@@ -219,13 +296,25 @@ export async function readJsonIfPresent(root, relative, deps) {
       reason: `${relative} 不是合法 JSON：${error instanceof Error ? error.message : String(error)}`,
     }
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (!isPlainJsonObject(parsed)) {
     return { present: false, value: null, sha256: digest, reason: `${relative} 不是 JSON 对象` }
   }
   return { present: true, value: parsed, sha256: digest }
 }
 
-async function writeProjectJson(root, relative, value, deps) {
+/** `writeJsonAtomic` 的产物（`atomic` 模块的契约）。 */
+interface JsonWriteReceipt {
+  path: string
+  sha256: string
+  bytes: number
+}
+
+async function writeProjectJson(
+  root: unknown,
+  relative: string,
+  value: unknown,
+  deps?: BindingDeps | null,
+): Promise<JsonWriteReceipt> {
   const { atomic, paths } = deps0(deps)
   const target = await paths.assertSafeWriteTarget(root, relative)
   return atomic.writeJsonAtomic(target, value)
@@ -235,7 +324,7 @@ async function writeProjectJson(root, relative, value, deps) {
  * 原子写 `re/team/binding.json`。
  * @returns {Promise<{path: string, sha256: string, bytes: number}>}
  */
-export async function writeBinding(root, value, deps) {
+export async function writeBinding(root: unknown, value: unknown, deps?: BindingDeps | null): Promise<JsonWriteReceipt> {
   return writeProjectJson(root, BINDING_PATH, value, deps)
 }
 
@@ -243,19 +332,22 @@ export async function writeBinding(root, value, deps) {
  * 原子写 `re/team/roster.json`。
  * @returns {Promise<{path: string, sha256: string, bytes: number}>}
  */
-export async function writeRoster(root, value, deps) {
+export async function writeRoster(root: unknown, value: unknown, deps?: BindingDeps | null): Promise<JsonWriteReceipt> {
   return writeProjectJson(root, ROSTER_PATH, value, deps)
 }
 
+/** `readIndex()` 的结果：不存在的 INDEX 用 `present:false`（不创建）。判别联合，`present:true` 时 `text` 必为字符串。 */
+type IndexRead = { present: true; text: string } | { present: false; text: null }
+
 /** 读 INDEX.md；不存在返回 null（不创建）。 */
-async function readIndex(root, deps) {
+async function readIndex(root: unknown, deps?: BindingDeps | null): Promise<IndexRead> {
   const { fs, paths } = deps0(deps)
   const target = paths.resolveInProject(root, INDEX_PATH)
   try {
     const bytes = await fs.readFile(target)
     return { present: true, text: Buffer.isBuffer(bytes) ? bytes.toString('utf8') : String(bytes) }
   } catch (error) {
-    if (error && typeof error === 'object' && error.code === 'ENOENT') return { present: false, text: null }
+    if (thrownCode(error) === 'ENOENT') return { present: false, text: null }
     throw new ContractError({
       code: 'PATH_INVALID',
       message: `读不了 INDEX.md：${error instanceof Error ? error.message : String(error)}`,
@@ -277,7 +369,17 @@ async function readIndex(root, deps) {
  * @param {object} [deps]
  * @returns {Promise<{written: boolean, unchanged: boolean, added: string[], path: string, reason?: string, bytes?: number}>}
  */
-export async function linkIndexPointers(root, entries, deps) {
+/** `linkIndexPointers()` 的结果（`written:false` 时用 `unchanged`/`reason` 区分「已齐」与「没写成」）。 */
+export interface IndexLinkResult {
+  written: boolean
+  unchanged: boolean
+  added: string[]
+  path: string
+  reason?: string
+  bytes?: number
+}
+
+export async function linkIndexPointers(root: unknown, entries: unknown, deps?: BindingDeps | null): Promise<IndexLinkResult> {
   const { fs, paths } = deps0(deps)
   const wanted = [...new Set((Array.isArray(entries) ? entries : []).filter(nonEmptyString))]
   for (const entry of wanted) paths.assertProjectRelative(entry)
@@ -332,8 +434,32 @@ export async function linkIndexPointers(root, entries, deps) {
 }
 
 /** `re/team/history/epoch-<n>` 的项目内相对路径。 */
-export function historyEpochDir(epoch) {
+export function historyEpochDir(epoch: number): string {
   return `${HISTORY_DIR}/epoch-${epoch}`
+}
+
+/** 归档的单个文件记录。 */
+export interface ArchivedEpochFile {
+  path: string
+  archived_path: string
+  sha256: string
+  bytes: number
+}
+
+/** `archiveEpoch()` 的入参（三个字段都按未知读，逐个收窄）。 */
+export interface ArchiveEpochInput {
+  epoch?: unknown
+  recoveryRef?: unknown
+  reason?: unknown
+}
+
+/** `archiveEpoch()` 的结果。 */
+export interface ArchiveEpochResult {
+  epoch: number
+  history_dir: string
+  manifest_path: string
+  files: ArchivedEpochFile[]
+  archived_at: string
 }
 
 /**
@@ -346,10 +472,11 @@ export function historyEpochDir(epoch) {
  * @returns {Promise<{epoch: number, history_dir: string, manifest_path: string,
  *   files: Array<{path: string, archived_path: string, sha256: string, bytes: number}>}>}
  */
-export async function archiveEpoch(root, input = {}, deps) {
+export async function archiveEpoch(root: unknown, input: ArchiveEpochInput = {}, deps?: BindingDeps | null): Promise<ArchiveEpochResult> {
   const { atomic, paths } = deps0(deps)
   const epoch = input.epoch
-  if (!Number.isSafeInteger(epoch) || epoch < 1) {
+  // `Number.isSafeInteger()` 对非数字恒为 false，故这里补的类型判断不改变放行/拒绝的边界。
+  if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 1) {
     throw new ContractError({
       code: 'INVALID_ARGUMENT',
       message: `归档 epoch 必须是正整数：${JSON.stringify(epoch)}`,
@@ -357,7 +484,7 @@ export async function archiveEpoch(root, input = {}, deps) {
     })
   }
   const dir = historyEpochDir(epoch)
-  const files = []
+  const files: ArchivedEpochFile[] = []
   for (const relative of [BINDING_PATH, ROSTER_PATH, RESOURCES_PATH]) {
     let exists = true
     try {
@@ -388,6 +515,18 @@ export async function archiveEpoch(root, input = {}, deps) {
   return { epoch, history_dir: dir, manifest_path: manifestPath, files, archived_at: manifest.archived_at }
 }
 
+/** 一条恢复核查缺口。 */
+export interface RecoveryMissing {
+  code: string
+  detail: string
+}
+
+/** `checkRecoveryRecord()` 的结果。 */
+export interface RecoveryRecordCheck {
+  ok: boolean
+  missing: RecoveryMissing[]
+}
+
 /**
  * 检查一份恢复核查记录的内容是否覆盖「停止/隔离」「遗留处置」「剩余风险」。
  *
@@ -397,7 +536,7 @@ export async function archiveEpoch(root, input = {}, deps) {
  * @param {unknown} text
  * @returns {{ ok: boolean, missing: Array<{code: string, detail: string}> }}
  */
-export function checkRecoveryRecord(text) {
+export function checkRecoveryRecord(text: unknown): RecoveryRecordCheck {
   if (typeof text !== 'string' || text.trim().length === 0) {
     return {
       ok: false,
@@ -410,7 +549,7 @@ export function checkRecoveryRecord(text) {
       ],
     }
   }
-  const missing = []
+  const missing: RecoveryMissing[] = []
   if (text.trim().length < RECOVERY_MIN_CHARS) {
     missing.push({
       code: 'RECOVERY_RECORD_TOO_SHORT',
@@ -425,6 +564,22 @@ export function checkRecoveryRecord(text) {
   return { ok: missing.length === 0, missing }
 }
 
+/** `readRecoveryRef()` 的成功分支。 */
+export interface RecoveryRefOk {
+  ok: true
+  recovery_ref: string
+  sha256: string
+  bytes: number
+}
+
+/** `readRecoveryRef()` 的失败分支（`missing` 只在内容不满足核查要求时出现）。 */
+export interface RecoveryRefFailure {
+  ok: false
+  code: string
+  reason: string
+  missing?: RecoveryMissing[]
+}
+
 /**
  * 读并核查 `recovery_ref` 指向的项目内文件。
  *
@@ -437,7 +592,11 @@ export function checkRecoveryRecord(text) {
  * @param {unknown} recoveryRef
  * @param {object} [deps]
  */
-export async function readRecoveryRef(root, recoveryRef, deps) {
+export async function readRecoveryRef(
+  root: unknown,
+  recoveryRef: unknown,
+  deps?: BindingDeps | null,
+): Promise<RecoveryRefOk | RecoveryRefFailure> {
   const { fs, paths } = deps0(deps)
   if (!nonEmptyString(recoveryRef)) {
     return {
@@ -446,17 +605,17 @@ export async function readRecoveryRef(root, recoveryRef, deps) {
       reason: 'takeover 必须提供 recovery_ref（旧 Lead/执行者停止或隔离的真实核查记录）',
     }
   }
-  let target
+  let target: string
   try {
     target = paths.resolveInProject(root, recoveryRef)
   } catch (error) {
-    return { ok: false, code: 'INVALID_ARGUMENT', reason: `${recoveryRef}: ${error?.message ?? error}` }
+    return { ok: false, code: 'INVALID_ARGUMENT', reason: `${recoveryRef}: ${thrownMessage(error)}` }
   }
-  let bytes
+  let bytes: Buffer
   try {
     bytes = await fs.readFile(target)
   } catch (error) {
-    const missing = error && typeof error === 'object' && error.code === 'ENOENT'
+    const missing = thrownCode(error) === 'ENOENT'
     return {
       ok: false,
       code: 'INVALID_ARGUMENT',

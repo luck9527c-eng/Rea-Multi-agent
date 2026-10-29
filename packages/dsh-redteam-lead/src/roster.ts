@@ -20,6 +20,9 @@ import { createHash } from 'node:crypto'
 
 import * as envelopeModule from './envelope.js'
 import * as bindingModule from './binding.js'
+import type { SessionMatchResult } from './binding.js'
+import { isRecord, recordOf, thrownMessage } from './guards.js'
+import type { Deps, Diagnostic, Envelope, HandlerCtx, HandlerResult } from './types.js'
 
 const TOOL = 'rt_roster'
 const SHA256 = /^[0-9a-f]{64}$/u
@@ -47,9 +50,26 @@ const NEXT_STEP_SERVICE =
   '启用 @deepseek-ai/dsh-experimental-agent-team-profile（profile 的 dsh.profile.bundles）后重试；'
   + '缺服务时先跑不依赖插件挂载的只读自检：node <bundle-root>/bin/doctor.mjs --profile <profile-root> --project <project-root>'
 
-function depsOf(ctx) {
-  const value = ctx && typeof ctx === 'object' ? ctx.deps : null
-  const deps = value && typeof value === 'object' ? value : {}
+/** `envelope` 模块的命名空间类型（`deps.envelope` 与真实模块同形状）。 */
+type EnvelopeModule = typeof envelopeModule
+
+/** 本模块装配后的 deps：`envelope`/`binding` 一定是真实现，其余沿用 `Deps` 契约。 */
+type RosterDeps = Deps & { envelope: EnvelopeModule; binding: typeof bindingModule }
+
+/** `resolveCaller()` 的产物（`deps.binding.sessionIdentityFrom()` 的返回）。 */
+type Session = ReturnType<typeof bindingModule.sessionIdentityFrom>
+
+/**
+ * `depsOf()`：取 `ctx.deps` 并补齐本模块的两个必需模块。
+ *
+ * 装配层给的就是 SEAMS §1 的 `Deps`；`recordOf` 保留了原来「不是对象就当空」的降级路径
+ * （`ctx` 缺省时仍能拿到本包的真实 `envelope`/`binding`，handler 才不会 reject）。
+ */
+function depsOf(ctx: unknown): RosterDeps {
+  // 逐字保留「ctx 不是对象就当空」的降级（handler 绝不 reject），再把已收窄的普通记录
+  // 断言回 SEAMS §1 的 `Deps`：装配层给的就是这个形状，少几个键由调用点各自判空。
+  // 两段式断言只因 `Record<string, unknown>` 与 `Deps` 没有索引签名重叠，不能直接 `as Deps`。
+  const deps = recordOf(recordOf(ctx).deps) as unknown as Deps
   return {
     ...deps,
     envelope: deps.envelope ?? envelopeModule,
@@ -57,39 +77,39 @@ function depsOf(ctx) {
   }
 }
 
-function sanitizeOperationId(value) {
+function sanitizeOperationId(value: unknown): string | null {
   return typeof value === 'string' && OPERATION_ID.test(value) ? value : null
 }
 
-function isNonEmptyString(value) {
+function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
-function stringList(value) {
+function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter(isNonEmptyString) : []
 }
 
-function isoNow(deps) {
+function isoNow(deps: RosterDeps): string {
   const clock = deps.clock
   if (clock && typeof clock.isoNow === 'function') return clock.isoNow()
   if (clock && typeof clock.now === 'function') return new Date(clock.now()).toISOString()
   return new Date().toISOString()
 }
 
-function nowMs(deps) {
+function nowMs(deps: RosterDeps): number {
   const clock = deps.clock
   if (clock && typeof clock.now === 'function') return clock.now()
   return Date.now()
 }
 
-function sha256Text(text) {
+function sha256Text(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
 /** 去重（同 code+reason+next_step 只留一条），保持首次出现的顺序。 */
-function dedupeDiagnostics(list) {
-  const seen = new Set()
-  const out = []
+function dedupeDiagnostics(list: readonly Diagnostic[]): Diagnostic[] {
+  const seen = new Set<string>()
+  const out: Diagnostic[] = []
   for (const item of list) {
     if (!item || typeof item !== 'object') continue
     const key = `${item.code}\u0000${item.reason}\u0000${item.next_step}`
@@ -101,12 +121,29 @@ function dedupeDiagnostics(list) {
 }
 
 /** `probe().gaps`（`{code, blocking, detail, nextStep}`）→ 诊断三字段。 */
-function probeGapToDiagnostic(env, gap) {
-  const code = isNonEmptyString(gap?.code) ? gap.code : 'PROJECT_PROBE_GAP'
-  const detail = isNonEmptyString(gap?.detail) ? gap.detail : '项目副本缺口（未提供细节）'
-  const reason = `${detail}${gap?.blocking === true ? '（阻塞）' : '（非阻塞）'}`
-  const nextStep = isNonEmptyString(gap?.nextStep) ? gap.nextStep : '按项目 skill 的接入规则修正后重新 inspect'
+function probeGapToDiagnostic(env: EnvelopeModule, gap: unknown): Diagnostic {
+  const record = recordOf(gap)
+  const code = isNonEmptyString(record.code) ? record.code : 'PROJECT_PROBE_GAP'
+  const detail = isNonEmptyString(record.detail) ? record.detail : '项目副本缺口（未提供细节）'
+  const reason = `${detail}${record.blocking === true ? '（阻塞）' : '（非阻塞）'}`
+  const nextStep = isNonEmptyString(record.nextStep) ? record.nextStep : '按项目 skill 的接入规则修正后重新 inspect'
   return env.diagnostic(code, reason, nextStep)
+}
+
+/** `probeProject()` 的内容摘要（三个摘要都可能是 `null`，值本身按未知对待）。 */
+interface ProjectDigests {
+  ruleDigest: unknown
+  scriptDigest: unknown
+  catalogDigest: unknown
+}
+
+/** `probeProject()` 的结果。 */
+interface ProjectProbe {
+  status: 'compatible' | 'blocked' | 'unknown'
+  gaps: Diagnostic[]
+  digests: ProjectDigests
+  blockedCode: string | null
+  versions: Record<string, unknown>
 }
 
 /**
@@ -116,8 +153,8 @@ function probeGapToDiagnostic(env, gap) {
  *   digests: {ruleDigest: string|null, scriptDigest: string|null, catalogDigest: string|null},
  *   blockedCode: string|null, versions: object}>}
  */
-async function probeProject(deps, root, env) {
-  const emptyDigests = { ruleDigest: null, scriptDigest: null, catalogDigest: null }
+async function probeProject(deps: RosterDeps, root: string, env: EnvelopeModule): Promise<ProjectProbe> {
+  const emptyDigests: ProjectDigests = { ruleDigest: null, scriptDigest: null, catalogDigest: null }
   const adapter = deps.projectAdapter
   if (!adapter || typeof adapter.probe !== 'function') {
     return {
@@ -133,7 +170,7 @@ async function probeProject(deps, root, env) {
     }
   }
 
-  let result
+  let result: unknown
   try {
     result = await adapter.probe({ projectRoot: root })
   } catch (error) {
@@ -150,10 +187,9 @@ async function probeProject(deps, root, env) {
     }
   }
 
-  const compatibility = result?.compatibility && typeof result.compatibility === 'object'
-    ? result.compatibility
-    : null
-  const rawGaps = Array.isArray(result?.gaps) ? result.gaps : []
+  const probe = recordOf(result)
+  const compatibility = isRecord(probe.compatibility) ? probe.compatibility : null
+  const rawGaps: unknown[] = Array.isArray(probe.gaps) ? probe.gaps : []
   const gaps = rawGaps.map((gap) => probeGapToDiagnostic(env, gap))
 
   // 非默认布局：插件 v0 只支持 skill 的默认布局，别静默另建目录。
@@ -169,25 +205,23 @@ async function probeProject(deps, root, env) {
     ))
   }
 
-  const digests = {
+  const digests: ProjectDigests = {
     ruleDigest: compatibility?.ruleDigest ?? null,
     scriptDigest: compatibility?.scriptDigest ?? null,
     catalogDigest: compatibility?.catalogDigest ?? null,
   }
-  const versions = compatibility?.versions && typeof compatibility.versions === 'object'
-    ? compatibility.versions
-    : {}
+  const versions: Record<string, unknown> = isRecord(compatibility?.versions) ? compatibility.versions : {}
 
-  if (result?.ok !== true && gaps.length === 0) {
+  if (probe.ok !== true && gaps.length === 0) {
     // 适配器直接拒绝（例如项目根不是 skill 项目）：保留原始原因，不当作「已核对」。
-    const nextStep = isNonEmptyString(result?.nextStep)
-      ? result.nextStep
+    const nextStep = isNonEmptyString(probe.nextStep)
+      ? probe.nextStep
       : '确认传入的是分析项目根，并按项目 skill 的接入规则补齐后重试；不要用它重 init 覆盖副本'
     return {
       status: 'blocked',
       gaps: [env.diagnostic(
-        isNonEmptyString(result?.code) ? result.code : 'PROJECT_NOT_CONFIGURED',
-        isNonEmptyString(result?.reason) ? result.reason : '项目探测失败（适配器未给出原因）',
+        isNonEmptyString(probe.code) ? probe.code : 'PROJECT_NOT_CONFIGURED',
+        isNonEmptyString(probe.reason) ? probe.reason : '项目探测失败（适配器未给出原因）',
         nextStep,
       )],
       digests,
@@ -196,13 +230,13 @@ async function probeProject(deps, root, env) {
     }
   }
 
-  const blocking = rawGaps.filter((gap) => gap?.blocking === true)
-  if (blocking.length === 0 && !layoutUnsupported && result?.ok === true) {
+  const blocking = rawGaps.filter((gap) => recordOf(gap).blocking === true)
+  if (blocking.length === 0 && !layoutUnsupported && probe.ok === true) {
     return { status: 'compatible', gaps, digests, blockedCode: null, versions }
   }
 
-  const gapCodes = blocking.map((gap) => gap?.code)
-  const blockedCode = gapCodes.some((code) => NOT_CONFIGURED_GAP_CODES.has(code))
+  const gapCodes = blocking.map((gap) => recordOf(gap).code)
+  const blockedCode = gapCodes.some((code) => typeof code === 'string' && NOT_CONFIGURED_GAP_CODES.has(code))
     ? 'PROJECT_NOT_CONFIGURED'
     : 'SKILL_INCOMPATIBLE'
   const hasBlocker = blocking.length > 0 || layoutUnsupported
@@ -215,23 +249,29 @@ async function probeProject(deps, root, env) {
   }
 }
 
+/** `toolsFor()` 的结果：可用时没有缺口，不可用时 `reason` 说明为什么是「未核对」。 */
+type ToolsReport =
+  | { available: true; names: string[]; reason: null }
+  | { available: false; names: string[]; reason: string }
+
 /**
  * 从**实际执行者**取工具可见性（`ctx.services.tools.schemas(exec.agent)` / `get(name, agent)`）。
  *
  * 别的 agent 作用域里可见不算本执行者能调用；宿主不提供注册表时 `available:false`，
  * 由调用方降级成「未核对」的明确缺口，绝不假装已核对。
  */
-function toolsFor(ctx) {
-  const service = ctx?.services?.tools
-  const agent = ctx?.exec?.agent
-  if (!service || typeof service.schemas !== 'function') {
+function toolsFor(ctx: unknown): ToolsReport {
+  const holder = recordOf(ctx)
+  const service = recordOf(recordOf(holder.services).tools)
+  const agent = recordOf(holder.exec).agent
+  if (typeof service.schemas !== 'function') {
     return {
       available: false,
       names: [],
       reason: '宿主未提供 ctx.services.tools（工具注册表），无法核对执行者可见工具',
     }
   }
-  let schemas
+  let schemas: unknown
   try {
     schemas = service.schemas(agent)
   } catch (error) {
@@ -244,10 +284,10 @@ function toolsFor(ctx) {
   if (!schemas || typeof schemas !== 'object' || Array.isArray(schemas)) {
     return { available: false, names: [], reason: '工具注册表没有返回该执行者的 schema 映射' }
   }
-  const names = []
+  const names: string[] = []
   for (const name of Object.keys(schemas).sort()) {
     if (typeof service.get === 'function') {
-      let schema = null
+      let schema: unknown = null
       try {
         schema = service.get(name, agent)
       } catch {
@@ -260,8 +300,33 @@ function toolsFor(ctx) {
   return { available: true, names, reason: null }
 }
 
+/** 目录里的岗位条目（只用这几个键；全部按未知读，逐个收窄）。 */
+interface CatalogPost {
+  readonly id?: unknown
+  readonly priority?: unknown
+  readonly enabled?: unknown
+  readonly disabled_reason?: unknown
+  readonly required?: unknown
+  readonly optional?: unknown
+  readonly anchors_required?: unknown
+}
+
+/** `composeTemplate()` 的原始输出（成功/失败两个分支共有的键）。 */
+interface ComposedOutput {
+  ok?: unknown
+  reason?: unknown
+  next_step?: unknown
+  readonly posts: readonly CatalogPost[]
+  readonly reserved_posts: readonly CatalogPost[]
+}
+
+/** 模板骨架选择结果（`ok:false` 带一条可直接进信封的诊断）。 */
+type TemplateChoice =
+  | { ok: true; templateId: string; composed: ComposedOutput; catalogVersion: unknown }
+  | { ok: false; diagnostic: Diagnostic }
+
 /** 模板骨架：按 target_kinds 选模板（两个以上类别走 mixed）。 */
-function composeTemplateFor(deps, kinds, env) {
+function composeTemplateFor(deps: RosterDeps, kinds: readonly string[], env: EnvelopeModule): TemplateChoice {
   const catalogDef = deps.catalog
   if (!catalogDef || typeof catalogDef.composeTemplate !== 'function') {
     return {
@@ -269,7 +334,7 @@ function composeTemplateFor(deps, kinds, env) {
       diagnostic: env.diagnostic('INVALID_ARGUMENT', '缺少岗位目录模块，无法组合模板', '挂载 catalog 模块后重试'),
     }
   }
-  let catalogValue
+  let catalogValue: unknown
   try {
     catalogValue = typeof catalogDef.defaultCatalog === 'function' ? catalogDef.defaultCatalog() : undefined
   } catch (error) {
@@ -283,7 +348,14 @@ function composeTemplateFor(deps, kinds, env) {
     }
   }
   const templateId = kinds.length > 1 ? 'mixed' : kinds[0]
-  const composed = catalogDef.composeTemplate(templateId, kinds, catalogValue)
+  // `catalog` 模块本次并行类型化中尚未标注参数（`targetKinds = []` 推出 `never[]`、`catalog` 推出
+  // `defaultCatalog()` 的类型），这里按 UPSTREAM-API 的契约签名调用；`never[]` 在标注前后都可赋值。
+  const compose = catalogDef.composeTemplate as unknown as (
+    templateId: unknown,
+    targetKinds: readonly string[],
+    catalog?: unknown,
+  ) => ComposedOutput
+  const composed = compose(templateId, kinds, catalogValue)
   if (!composed || composed.ok !== true) {
     return {
       ok: false,
@@ -294,11 +366,31 @@ function composeTemplateFor(deps, kinds, env) {
       ),
     }
   }
-  return { ok: true, templateId, composed, catalogVersion: catalogValue?.catalog_version ?? null }
+  return { ok: true, templateId, composed, catalogVersion: recordOf(catalogValue).catalog_version ?? null }
+}
+
+/** `planBudget()` 的候选条目（本模块交付给 capacity 模块的形状）。 */
+interface RosterCandidate {
+  post_id: unknown
+  priority: unknown
+  enabled: boolean
+  disabled_reason: unknown
+  required: string[]
+  optional: string[]
+  anchors_required: string[]
+  capability: CapabilityReport
+  running: boolean
+  member: unknown
+}
+
+/** 一个岗位的能力核对结论（`missing` 每条带 capability/code/reason/next_step，投诊断时只取后三个）。 */
+interface CapabilityReport {
+  satisfied: boolean
+  missing: readonly unknown[]
 }
 
 /** 一个岗位的候选条目（`planBudget` 的入参形状）。 */
-function candidateOf(post, { capability, running, member }) {
+function candidateOf(post: CatalogPost, { capability, running, member }: { capability: CapabilityReport; running: unknown; member: unknown }): RosterCandidate {
   return {
     post_id: post.id,
     priority: post.priority,
@@ -318,7 +410,14 @@ function candidateOf(post, { capability, running, member }) {
  *
  * 工具注册表不可用时给出**未核对**（CAPABILITY_NOT_READY），而不是假装缺失或假装满足。
  */
-function capabilityOf(deps, post, toolNames, inventory, bindings, toolsAvailable) {
+function capabilityOf(
+  deps: RosterDeps,
+  post: CatalogPost,
+  toolNames: readonly string[],
+  inventory: unknown,
+  bindings: unknown,
+  toolsAvailable: boolean,
+): CapabilityReport {
   const needs = stringList(post.required)
   if (!toolsAvailable) {
     return {
@@ -346,11 +445,11 @@ function capabilityOf(deps, post, toolNames, inventory, bindings, toolsAvailable
     }
   }
   const matched = matcher.matchCapabilities(needs, toolNames, inventory, bindings)
-  const missing = Array.isArray(matched?.missing) ? matched.missing : []
+  const missing: unknown[] = Array.isArray(matched?.missing) ? matched.missing : []
   return { satisfied: missing.length === 0, missing }
 }
 
-function stablePosts(posts) {
+function stablePosts(posts: readonly CatalogPost[]) {
   return posts.map((post) => ({
     post_id: post.id,
     priority: post.priority,
@@ -362,11 +461,12 @@ function stablePosts(posts) {
 }
 
 /** 比对用的绑定摘要（`readBinding` 的 `{present, binding}` 形状）。 */
-function bindingStateOf(bindingFile) {
-  if (!bindingFile?.present || !bindingFile.binding || typeof bindingFile.binding !== 'object') {
+function bindingStateOf(bindingFile: unknown) {
+  const file = recordOf(bindingFile)
+  if (!file.present || !isRecord(file.binding)) {
     return { present: false }
   }
-  const value = bindingFile.binding
+  const value = file.binding
   return {
     present: true,
     epoch: Number.isSafeInteger(value.epoch) ? value.epoch : null,
@@ -379,11 +479,26 @@ function bindingStateOf(bindingFile) {
   }
 }
 
+/** `proposalFingerprint()` 的入参（每个字段都只是被 JSON 化进哈希，故按未知收）。 */
+interface ProposalFingerprintInput {
+  projectRoot: unknown
+  projectId: unknown
+  targetKinds: readonly string[]
+  templateId: unknown
+  catalogVersion: unknown
+  capabilityVersion: unknown
+  budget: unknown
+  staticPosts: unknown
+  digests: ProjectDigests
+  bindingState: unknown
+  compatibility: unknown
+}
+
 /**
  * 提议指纹：确定性内容，不含宿主计数（计数在 bind 时于锁内重读）。
  * `proposal_hash = sha256(按键排序的 JSON(指纹))`。
  */
-function proposalFingerprint(input) {
+function proposalFingerprint(input: ProposalFingerprintInput) {
   return {
     kind: 'roster_proposal',
     schema_version: 1,
@@ -401,15 +516,30 @@ function proposalFingerprint(input) {
   }
 }
 
-function proposalHashOf(deps, fingerprint) {
+function proposalHashOf(deps: RosterDeps, fingerprint: unknown): string {
   const canonical = deps.validate && typeof deps.validate.canonicalJson === 'function'
     ? deps.validate.canonicalJson
-    : (value) => JSON.stringify(value)
+    : (value: unknown) => JSON.stringify(value)
   return sha256Text(canonical(fingerprint))
 }
 
+/** `rosterDataOf()` 的入参（`$defs.rosterData` 的 12 个字段，按原样透传）。 */
+interface RosterDataInput {
+  action: unknown
+  root: unknown
+  projectId: unknown
+  session: Session
+  compatibility: unknown
+  posts: unknown
+  gaps: unknown
+  capacity: unknown
+  recommendedMembers: unknown
+  proposalHash: unknown
+  bindingRef: unknown
+}
+
 /** `rosterData`（`$defs.rosterData` 的 12 个必备字段，多一个都不行）。 */
-function rosterDataOf(input) {
+function rosterDataOf(input: RosterDataInput) {
   return {
     action: input.action,
     project_root: input.root,
@@ -427,18 +557,20 @@ function rosterDataOf(input) {
 }
 
 /** D19：只有 4 个字段，未知用 null，`known` 不上线。 */
-function projectCapacity(planCapacity) {
+function projectCapacity(planCapacity: unknown) {
+  const capacity = recordOf(planCapacity)
   return {
-    remaining_member_slots: planCapacity?.available_member_slots ?? null,
-    remaining_activations: planCapacity?.available_activations ?? null,
-    reserved_member_slots: planCapacity?.reserved_member_slots ?? 0,
-    reserved_activations: planCapacity?.reserved_activations ?? 0,
+    remaining_member_slots: capacity.available_member_slots ?? null,
+    remaining_activations: capacity.available_activations ?? null,
+    reserved_member_slots: capacity.reserved_member_slots ?? 0,
+    reserved_activations: capacity.reserved_activations ?? 0,
   }
 }
 
 /** 按目录优先级（priority 升序、同值 post_id 升序）输出岗位，便于人读与 diff。 */
-function orderPosts(entries, priorityOf) {
-  return [...entries]
+function orderPosts(entries: unknown, priorityOf: ReadonlyMap<unknown, number>) {
+  const list = Array.isArray(entries) ? entries : []
+  return [...list]
     .map((entry) => ({
       post_id: entry.post_id,
       state: entry.state,
@@ -457,7 +589,17 @@ function orderPosts(entries, priorityOf) {
     })
 }
 
-async function readCapacity(deps, root, env) {
+/** `readCapacity()` 的结果：`ok`/`code`/`diagnostics` 只在失败分支出现（成功分支直接透传适配器的容量对象）。 */
+interface CapacityReport {
+  ok?: boolean
+  code?: string
+  diagnostics?: Diagnostic[]
+  memberSlots: Record<string, unknown>
+  activations: Record<string, unknown>
+  gaps?: unknown[]
+}
+
+async function readCapacity(deps: RosterDeps, root: string, env: EnvelopeModule): Promise<CapacityReport> {
   const adapter = deps.teamAdapter
   if (!adapter || typeof adapter.capacity !== 'function') {
     return {
@@ -473,7 +615,7 @@ async function readCapacity(deps, root, env) {
       gaps: [],
     }
   }
-  const value = await adapter.capacity()
+  const value: CapacityReport = await adapter.capacity()
   if (!value || typeof value !== 'object') {
     return {
       ok: false,
@@ -489,8 +631,8 @@ async function readCapacity(deps, root, env) {
   // 这里只**报告**，不改预算口径 —— 容量仍按适配器给的值走（D1/D25）。
   if (value.memberSlots?.total === null && typeof adapter.readDeclaredCapacity === 'function') {
     try {
-      const declared = await adapter.readDeclaredCapacity(root)
-      if (declared?.known === true) {
+      const declared = recordOf(await adapter.readDeclaredCapacity(root))
+      if (declared.known === true) {
         const gaps = Array.isArray(value.gaps) ? value.gaps : []
         return {
           ...value,
@@ -509,14 +651,105 @@ async function readCapacity(deps, root, env) {
 }
 
 /** `capacity().gaps`（`{code, detail, nextStep}`）→ 诊断。 */
-function capacityGapsToDiagnostics(value) {
-  return (Array.isArray(value) ? value : []).map((gap) => ({
-    code: isNonEmptyString(gap?.code) ? gap.code : 'CAPACITY_UNKNOWN',
-    reason: isNonEmptyString(gap?.detail) ? gap.detail : '容量声明或计数不可用',
-    next_step: isNonEmptyString(gap?.nextStep)
-      ? gap.nextStep
-      : '在 re/team/capacity.json 声明 maxMembers/maxActiveSubagents（含 declared_at/declared_by）后重试',
-  }))
+function capacityGapsToDiagnostics(value: unknown): Diagnostic[] {
+  return (Array.isArray(value) ? value : []).map((raw) => {
+    const gap = recordOf(raw)
+    return {
+      code: isNonEmptyString(gap.code) ? gap.code : 'CAPACITY_UNKNOWN',
+      reason: isNonEmptyString(gap.detail) ? gap.detail : '容量声明或计数不可用',
+      next_step: isNonEmptyString(gap.nextStep)
+        ? gap.nextStep
+        : '在 re/team/capacity.json 声明 maxMembers/maxActiveSubagents（含 declared_at/declared_by）后重试',
+    }
+  })
+}
+
+/** `rt_roster` 的规范化请求（`runRoster` 里由入参算出）。 */
+interface RosterRequest {
+  action: string
+  kinds: readonly string[]
+  operationId: string | null
+  proposalHash: unknown
+  recoveryRef: unknown
+  maxPosts: number
+  reservedMemberSlots: number
+  reservedActivations: number
+  raw: unknown
+}
+
+/** 一次提议的成功形状（inspect 与 bind/takeover 共用；bind 才填的那几个键是可选的）。 */
+interface ProposalSuccess {
+  ok: true
+  templateId: string | null
+  catalogVersion?: unknown
+  targetKinds: readonly string[]
+  posts: readonly unknown[]
+  gaps: Diagnostic[]
+  plan?: unknown
+  capacity: Record<string, unknown>
+  recommendedMembers: unknown
+  capabilityVersion?: CapabilityVersion
+  budget?: ProposalBudget
+  digests?: ProjectDigests
+  bindingFile?: unknown
+  proposalHash: string | null
+}
+
+/** 提议失败形状（`diagnostic` 是单条兜底诊断，`diagnostics` 是完整列表）。 */
+interface ProposalFailure {
+  ok: false
+  code?: string
+  diagnostic?: Diagnostic
+  diagnostics?: Diagnostic[]
+  capacityGaps?: Diagnostic[]
+}
+
+/** 能力映射版本（进提议指纹与 binding）。 */
+interface CapabilityVersion {
+  present: boolean
+  schema_version: unknown
+  revision: unknown
+  registry_sha256: unknown
+  sha256: unknown
+}
+
+/** 预算参数（进提议指纹与 binding）。 */
+interface ProposalBudget {
+  max_posts: number
+  reserved_member_slots: number
+  reserved_activations: number
+}
+
+/** `planBudget()` 的入参（本模块准备好的形状，见 UPSTREAM-API §planBudget）。 */
+interface PlanBudgetInput {
+  candidates: readonly RosterCandidate[]
+  remainingMemberSlots: unknown
+  remainingActivations: unknown
+  maxPosts: number
+  reservedMemberSlots: number
+  reservedActivations: number
+}
+
+/**
+ * 调 `capacity.planBudget`。
+ *
+ * `capacity` 模块本次并行类型化中尚未标注参数（默认值把 `candidates` 收成 `never[]`、
+ * 余额收成 `null | undefined`），这里把本模块准备好的入参对象断言成**该模块自己的参数类型**；
+ * 运行时传的是同一个对象，字段一个不改。
+ */
+function planBudgetOf(deps: RosterDeps, input: PlanBudgetInput) {
+  return deps.capacity.planBudget(input as unknown as Parameters<typeof deps.capacity.planBudget>[0])
+}
+
+/** `assembleProposal()` 的入参。 */
+interface AssembleProposalInput {
+  root: string
+  projectId: string
+  session: Session
+  kinds: readonly string[]
+  request: RosterRequest
+  compatibility: ProjectProbe
+  env: EnvelopeModule
 }
 
 /**
@@ -524,7 +757,11 @@ function capacityGapsToDiagnostics(value) {
  *
  * inspect 与 bind 共用**同一份**计算，保证 `proposal_hash` 在两边一致。
  */
-async function assembleProposal(ctx, deps, { root, projectId, session, kinds, request, compatibility, env }) {
+async function assembleProposal(
+  ctx: unknown,
+  deps: RosterDeps,
+  { root, projectId, session, kinds, request, compatibility, env }: AssembleProposalInput,
+): Promise<ProposalSuccess | ProposalFailure> {
   const template = composeTemplateFor(deps, kinds, env)
   if (template.ok !== true) return { ok: false, diagnostic: template.diagnostic }
 
@@ -560,24 +797,28 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
   }
 
   const memberList = typeof deps.teamAdapter?.listMembers === 'function'
-    ? await deps.teamAdapter.listMembers()
+    ? await deps.teamAdapter.listMembers(undefined)
     : { ok: false, members: [] }
   const liveMembers = new Map()
-  for (const member of Array.isArray(memberList?.members) ? memberList.members : []) {
+  const members = recordOf(memberList).members
+  for (const member of Array.isArray(members) ? members : []) {
     if (member && member.role === 'teammate') liveMembers.set(member.name, member)
   }
 
   const reuseByPost = new Map()
-  if (rosterFile.present && Array.isArray(rosterFile.value.posts)) {
-    for (const post of rosterFile.value.posts) {
+  const rosterPosts = recordOf(rosterFile.value).posts
+  if (rosterFile.present && Array.isArray(rosterPosts)) {
+    for (const post of rosterPosts) {
       if (isNonEmptyString(post?.member)) reuseByPost.set(post.post_id, post.member)
     }
   }
 
-  const priorityOf = new Map()
-  const candidates = []
-  for (const post of [...template.composed.posts, ...template.composed.reserved_posts]) {
-    priorityOf.set(post.id, post.priority)
+  const postList = [...template.composed.posts, ...template.composed.reserved_posts]
+  const priorityOf = new Map<unknown, number>()
+  const candidates: RosterCandidate[] = []
+  for (const post of postList) {
+    // 目录里的 priority 一定是数字（$defs.post）；非数字时按「无优先级」处理（原来是 NaN 比较）。
+    if (typeof post.priority === 'number') priorityOf.set(post.id, post.priority)
     const reusedName = reuseByPost.get(post.id)
     const reused = reusedName === undefined ? undefined : liveMembers.get(reusedName)
     const reusable = reused !== undefined && reused !== null
@@ -608,7 +849,7 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
 
   // D25：上限未声明 → null（defer + CAPACITY_UNKNOWN）；已声明 → 传声明上限，占用不可观测只作 gap。
   const remainingActivations = cap.activations.known === true ? cap.activations.total : null
-  const plan = deps.capacity.planBudget({
+  const plan = planBudgetOf(deps, {
     candidates,
     remainingMemberSlots: cap.memberSlots.remaining,
     remainingActivations,
@@ -671,7 +912,11 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
 }
 
 /** target_kinds 为空时的「只查环境」提议：不猜类别、不给岗位、不给 proposal_hash。 */
-async function assembleEnvironmentOnly(ctx, deps, { root, request, compatibility, env }) {
+async function assembleEnvironmentOnly(
+  ctx: unknown,
+  deps: RosterDeps,
+  { root, request, compatibility, env }: { root: string; request: RosterRequest; compatibility: ProjectProbe; env: EnvelopeModule },
+): Promise<ProposalSuccess | ProposalFailure> {
   const tools = toolsFor(ctx)
   const inventory = await deps.binding.readJsonIfPresent(root, 're/env/tools.json', deps)
   const gaps = [...(compatibility?.gaps ?? [])]
@@ -694,7 +939,7 @@ async function assembleEnvironmentOnly(ctx, deps, { root, request, compatibility
   if (cap.ok === false) return { ok: false, code: cap.code, diagnostics: cap.diagnostics ?? [] }
 
   const remainingActivations = cap.activations.known === true ? cap.activations.total : null
-  const plan = deps.capacity.planBudget({
+  const plan = planBudgetOf(deps, {
     candidates: [],
     remainingMemberSlots: cap.memberSlots.remaining,
     remainingActivations,
@@ -719,25 +964,30 @@ async function assembleEnvironmentOnly(ctx, deps, { root, request, compatibility
 // 操作台账与锁
 // ---------------------------------------------------------------------------
 
-async function ledgerFor(deps, root) {
+async function ledgerFor(deps: RosterDeps, root: string) {
   if (!deps.operation || typeof deps.operation.createOperationLedger !== 'function') return null
   return deps.operation.createOperationLedger({ root, clock: deps.clock })
 }
 
-function operationInputHash(deps, input, { action, root, session, epoch }) {
+function operationInputHash(
+  deps: RosterDeps,
+  input: unknown,
+  { action, root, session, epoch }: { action: string; root: string; session: Session; epoch: unknown },
+): string | null {
   if (!deps.validate || typeof deps.validate.operationInputHash !== 'function') return null
-  const hash = deps.validate.operationInputHash(input, {
+  const hash: unknown = deps.validate.operationInputHash(input, {
     tool: TOOL,
     action,
     project: root,
     session: session.session_id ?? null,
     epoch: Number.isSafeInteger(epoch) ? epoch : null,
   })
-  return SHA256.test(hash) ? hash : null
+  return typeof hash === 'string' && SHA256.test(hash) ? hash : null
 }
 
-function sessionMismatchWithRecord(record, session) {
-  const data = record?.data && typeof record.data === 'object' ? record.data : {}
+function sessionMismatchWithRecord(record: unknown, session: Session): string | null {
+  const holder = recordOf(record)
+  const data = isRecord(holder.data) ? holder.data : {}
   if (!isNonEmptyString(data.session_id) || !isNonEmptyString(session.session_id)) return null
   if (data.session_id === session.session_id) return null
   return `该 operation_id 首次登记时的 session_id=${data.session_id} 与当前 ${session.session_id} 不一致`
@@ -749,7 +999,12 @@ function sessionMismatchWithRecord(record, session) {
  * 锁冲突（`PROJECT_BUSY`）与损坏锁（`RECOVERY_REQUIRED`）原样抛给调用方转成信封；
  * **过期不自作主张夺锁**（lock 模块本身就不抢锁）。
  */
-async function withProjectLock(deps, root, { session, operationId }, body) {
+async function withProjectLock<T>(
+  deps: RosterDeps,
+  root: string,
+  { session, operationId }: { session: Session; operationId: string | null },
+  body: () => Promise<T>,
+): Promise<T> {
   const lockSession = isNonEmptyString(session.session_id)
     ? session.session_id
     : (isNonEmptyString(session.team_id) ? session.team_id : 'rt-roster')
@@ -773,6 +1028,27 @@ async function withProjectLock(deps, root, { session, operationId }, body) {
 // 入口
 // ---------------------------------------------------------------------------
 
+/** 一次审计条目（`kind`/`verdict` 必有，其余按需）。 */
+interface RosterAudit {
+  kind: string
+  verdict: string
+  requester?: string | null
+  member?: string | null
+}
+
+/** `runRoster()` 的结果：知道项目根之后才可能写审计。 */
+interface RosterOutcome {
+  envelope: Envelope
+  root: string | null
+  audit: RosterAudit | null
+}
+
+/** `appendAudit()` 的产物（失败时带 `error` 原文）。 */
+interface AuditWriteOutcome {
+  written: boolean
+  error?: string
+}
+
 /**
  * `rt_roster` handler（SEAMS §1：`input` 已通过 `$defs.rosterInput` 校验，返回 `{envelope}`，绝不 reject）。
  *
@@ -780,13 +1056,13 @@ async function withProjectLock(deps, root, { session, operationId }, body) {
  * @param {object} rawInput 已校验/已填默认值的入参
  * @returns {Promise<{envelope: object}>}
  */
-export async function handleRoster(ctx, rawInput) {
+export async function handleRoster(ctx: HandlerCtx, rawInput: unknown): Promise<HandlerResult> {
   const deps = depsOf(ctx)
   const env = deps.envelope
-  const input = rawInput && typeof rawInput === 'object' ? rawInput : {}
+  const input: Record<string, unknown> = isRecord(rawInput) ? rawInput : {}
   const operationId = sanitizeOperationId(input.operation_id)
 
-  let outcome
+  let outcome: RosterOutcome
   try {
     outcome = await runRoster(ctx, deps, input, env)
   } catch (thrown) {
@@ -812,9 +1088,11 @@ export async function handleRoster(ctx, rawInput) {
   return { envelope: outcome.envelope }
 }
 
-async function appendRosterAudit(deps, outcome) {
+async function appendRosterAudit(deps: RosterDeps, outcome: RosterOutcome): Promise<AuditWriteOutcome | null> {
   const audit = deps.audit
   if (!audit || typeof audit.appendAudit !== 'function') return null
+  // 调用方已确认两者非空；这里的判空只为把类型收窄（不可达分支，不改变输出）。
+  if (outcome.root === null || outcome.audit === null) return null
   try {
     return await audit.appendAudit(outcome.root, {
       kind: outcome.audit.kind,
@@ -830,19 +1108,24 @@ async function appendRosterAudit(deps, outcome) {
 /**
  * 主流程。返回 `{envelope, root, audit}`；只有知道项目根之后才可能写审计。
  */
-async function runRoster(ctx, deps, input, env) {
+async function runRoster(ctx: HandlerCtx, deps: RosterDeps, input: Record<string, unknown>, env: EnvelopeModule): Promise<RosterOutcome> {
   const action = isNonEmptyString(input.action) ? input.action : 'inspect'
   const operationId = sanitizeOperationId(input.operation_id)
   const kinds = stringList(input.target_kinds)
-  const request = {
+  const request: RosterRequest = {
     action,
     kinds,
     operationId,
     proposalHash: input.proposal_hash ?? null,
     recoveryRef: input.recovery_ref ?? null,
-    maxPosts: Number.isInteger(input.max_posts) ? input.max_posts : 6,
-    reservedMemberSlots: Number.isInteger(input.reserved_member_slots) ? input.reserved_member_slots : 1,
-    reservedActivations: Number.isInteger(input.reserved_activations) ? input.reserved_activations : 2,
+    // `Number.isInteger()` 对非数字恒为 false，补的类型判断不改变取默认值的边界。
+    maxPosts: typeof input.max_posts === 'number' && Number.isInteger(input.max_posts) ? input.max_posts : 6,
+    reservedMemberSlots: typeof input.reserved_member_slots === 'number' && Number.isInteger(input.reserved_member_slots)
+      ? input.reserved_member_slots
+      : 1,
+    reservedActivations: typeof input.reserved_activations === 'number' && Number.isInteger(input.reserved_activations)
+      ? input.reserved_activations
+      : 2,
     raw: input,
   }
 
@@ -1001,7 +1284,7 @@ async function runRoster(ctx, deps, input, env) {
 
   if (proposal.ok !== true) {
     const known = typeof deps.errors?.isErrorCode === 'function' && deps.errors.isErrorCode(proposal.code)
-    const code = known ? proposal.code : 'INVALID_ARGUMENT'
+    const code = known && typeof proposal.code === 'string' ? proposal.code : 'INVALID_ARGUMENT'
     const diagnostics = Array.isArray(proposal.diagnostics) && proposal.diagnostics.length > 0
       ? proposal.diagnostics
       : [proposal.diagnostic ?? env.diagnostic(code, '提议计算失败', NEXT_STEP_REPROPOSE)]
@@ -1034,7 +1317,7 @@ async function runRoster(ctx, deps, input, env) {
     return { envelope: env.ok({ operationId: null, data, retryable: false }), root, audit }
   }
 
-  const shared = { env, root, projectId, session, request, proposal, data, audit, deps }
+  const shared: SharedState = { env, root, projectId, session, request, proposal, data, audit, deps }
   if (action === 'bind') return bindProject(ctx, shared)
   return takeoverProject(ctx, shared)
 }
@@ -1043,40 +1326,70 @@ async function runRoster(ctx, deps, input, env) {
 // bind
 // ---------------------------------------------------------------------------
 
-function sessionMismatchResult(env, operationId, bindingValue, session, data) {
+/** `bindProject`/`takeoverProject` 共用的中间状态（`runRoster` 组装一次）。 */
+interface SharedState {
+  env: EnvelopeModule
+  root: string
+  projectId: string
+  session: Session
+  request: RosterRequest
+  proposal: ProposalSuccess
+  data: ReturnType<typeof rosterDataOf>
+  audit: RosterAudit
+  deps: RosterDeps
+}
+
+function sessionMismatchResult(
+  env: EnvelopeModule,
+  operationId: string | null,
+  bindingValue: unknown,
+  session: Session,
+  data: unknown,
+) {
+  const binding = recordOf(bindingValue)
   return {
     envelope: env.blocked({
       code: 'PROJECT_SESSION_MISMATCH',
       operationId,
-      data: data === null ? null : { ...data, binding_ref: null },
+      data: data === null ? null : { ...recordOf(data), binding_ref: null },
       diagnostics: [env.diagnostic(
         'PROJECT_SESSION_MISMATCH',
-        `项目已由 session=${bindingValue?.session_id ?? 'null'} team=${bindingValue?.team_id ?? 'null'} 绑定，当前调用是 session=${session.session_id ?? 'null'} team=${session.team_id ?? 'null'}`,
+        `项目已由 session=${binding.session_id ?? 'null'} team=${binding.team_id ?? 'null'} 绑定，当前调用是 session=${session.session_id ?? 'null'} team=${session.team_id ?? 'null'}`,
         '同一会话内继续；跨 Lead 会话必须走 rt_roster action=takeover（先按 skill 核实旧执行已停止并保存恢复记录）',
       )],
     }),
   }
 }
 
-function checkSessionMatch(deps, bindingValue, session) {
+function checkSessionMatch(deps: RosterDeps, bindingValue: unknown, session: Session): SessionMatchResult {
   const fn = typeof deps.binding?.checkSessionMatch === 'function'
     ? deps.binding.checkSessionMatch
     : bindingModule.checkSessionMatch
   return fn(bindingValue, { sessionId: session.session_id, teamId: session.team_id })
 }
 
-function firstCapacityGap(gaps) {
+/** `linkIndexPointers()` 的结果与它的 `.catch()` 兜底合并后的形状。 */
+interface IndexLinkState {
+  written?: boolean
+  unchanged?: boolean
+  added?: readonly unknown[]
+  reason?: unknown
+}
+
+function firstCapacityGap(gaps: unknown): string | null {
   const list = Array.isArray(gaps) ? gaps : []
   if (list.some((gap) => gap.code === 'CAPACITY_EXHAUSTED')) return 'CAPACITY_EXHAUSTED'
   if (list.some((gap) => gap.code === 'CAPACITY_UNKNOWN')) return 'CAPACITY_UNKNOWN'
   return null
 }
 
-async function bindProject(ctx, shared) {
+async function bindProject(ctx: HandlerCtx, shared: SharedState): Promise<RosterOutcome> {
   const { deps, env, root, projectId, session, request, proposal, data, audit } = shared
   const operationId = request.operationId
   const ledger = await ledgerFor(deps, root)
-  const existing = proposal.bindingFile
+  const bindingSlot = recordOf(proposal.bindingFile)
+  const existingBinding = isRecord(bindingSlot.binding) ? bindingSlot.binding : null
+  const existing = { present: bindingSlot.present, binding: existingBinding }
 
   if (existing?.present && !checkSessionMatch(deps, existing.binding, session).ok) {
     return { ...sessionMismatchResult(env, operationId, existing.binding, session, data), root, audit }
@@ -1137,7 +1450,7 @@ async function bindProject(ctx, shared) {
         data: { ...data, binding_ref: null },
         diagnostics: [env.diagnostic(
           'OPERATION_CONFLICT',
-          `proposal_hash 与当前目录/能力映射/预算/绑定不符（当前目录版本=${String(proposal.catalogVersion)}，能力映射 revision=${String(proposal.capabilityVersion.revision)}，绑定 epoch=${String(existing?.binding?.epoch ?? 'none')}，预算 max_posts=${proposal.budget.max_posts}）`,
+          `proposal_hash 与当前目录/能力映射/预算/绑定不符（当前目录版本=${String(proposal.catalogVersion)}，能力映射 revision=${String(recordOf(proposal.capabilityVersion).revision)}，绑定 epoch=${String(existing?.binding?.epoch ?? 'none')}，预算 max_posts=${String(recordOf(proposal.budget).max_posts)}）`,
           NEXT_STEP_REPROPOSE,
         )],
       }),
@@ -1183,7 +1496,7 @@ async function bindProject(ctx, shared) {
           envelope: env.blocked({
             code: freshProposal.code === 'TEAM_SERVICE_UNAVAILABLE' ? 'TEAM_SERVICE_UNAVAILABLE' : 'RECOVERY_REQUIRED',
             operationId,
-            diagnostics: freshProposal.diagnostics?.length > 0
+            diagnostics: Array.isArray(freshProposal.diagnostics) && freshProposal.diagnostics.length > 0
               ? freshProposal.diagnostics
               : [env.diagnostic('RECOVERY_REQUIRED', '锁内重算提议失败', NEXT_STEP_REPROPOSE)],
           }),
@@ -1237,8 +1550,10 @@ async function bindProject(ctx, shared) {
         })
       }
 
-      const epoch = Number.isSafeInteger(existing?.binding?.epoch) ? existing.binding.epoch : 1
+      const existingEpoch = existingBinding?.epoch
+      const epoch = typeof existingEpoch === 'number' && Number.isSafeInteger(existingEpoch) ? existingEpoch : 1
       const now = isoNow(deps)
+      const freshDigests = recordOf(freshProposal.digests)
       const bindingValue = {
         schema_version: 1,
         project_id: projectId,
@@ -1246,13 +1561,13 @@ async function bindProject(ctx, shared) {
         session_id: session.session_id,
         team_id: session.team_id,
         epoch,
-        ruleDigest: freshProposal.digests.ruleDigest,
-        scriptDigest: freshProposal.digests.scriptDigest,
-        catalogDigest: freshProposal.digests.catalogDigest,
+        ruleDigest: freshDigests.ruleDigest,
+        scriptDigest: freshDigests.scriptDigest,
+        catalogDigest: freshDigests.catalogDigest,
         bindingDigest: proposal.proposalHash,
         adapter: { contract_version: ADAPTER_CONTRACT_VERSION, team: 'team-adapter', project: 'project-adapter' },
         capability: freshProposal.capabilityVersion,
-        catalog: { version: freshProposal.catalogVersion, digest: freshProposal.digests.catalogDigest },
+        catalog: { version: freshProposal.catalogVersion, digest: freshDigests.catalogDigest },
         budget: freshProposal.budget,
         template_id: freshProposal.templateId,
         target_kinds: [...freshProposal.targetKinds],
@@ -1280,9 +1595,9 @@ async function bindProject(ctx, shared) {
 
       const bindingWrite = await deps.binding.writeBinding(root, bindingValue, deps)
       const rosterWrite = await deps.binding.writeRoster(root, rosterValue, deps)
-      const indexLink = await deps.binding
+      const indexLink: IndexLinkState = await deps.binding
         .linkIndexPointers(root, [deps.binding.BINDING_PATH, deps.binding.ROSTER_PATH], deps)
-        .catch((error) => ({ written: false, added: [], reason: error?.message ?? String(error) }))
+        .catch((error: unknown) => ({ written: false, added: [], reason: thrownMessage(error) }))
 
       const diagnostics = [...freshProposal.gaps]
       if (indexLink.written !== true && indexLink.unchanged !== true) {
@@ -1329,7 +1644,7 @@ async function bindProject(ctx, shared) {
 // takeover
 // ---------------------------------------------------------------------------
 
-async function takeoverProject(ctx, shared) {
+async function takeoverProject(ctx: HandlerCtx, shared: SharedState): Promise<RosterOutcome> {
   const { deps, env, root, projectId, session, request, proposal, data, audit } = shared
   const operationId = request.operationId
 
@@ -1365,7 +1680,8 @@ async function takeoverProject(ctx, shared) {
     }
   }
 
-  const existing = proposal.bindingFile
+  const bindingSlot = recordOf(proposal.bindingFile)
+  const existing = { present: bindingSlot.present, binding: isRecord(bindingSlot.binding) ? bindingSlot.binding : null }
   if (!existing?.present || !existing.binding) {
     return {
       envelope: env.blocked({
@@ -1382,7 +1698,8 @@ async function takeoverProject(ctx, shared) {
     }
   }
 
-  const oldEpoch = Number.isSafeInteger(existing.binding.epoch) ? existing.binding.epoch : 1
+  const existingEpoch = existing.binding.epoch
+  const oldEpoch = typeof existingEpoch === 'number' && Number.isSafeInteger(existingEpoch) ? existingEpoch : 1
 
   // 幂等重放先于「提议是否过期」检查：接管已经改过 epoch，同一请求的重放不能被误判成冲突
   // （契约「操作阶段与部分失败」）。同一 ID 改了输入仍在下面报 OPERATION_CONFLICT。
@@ -1505,6 +1822,7 @@ async function takeoverProject(ctx, shared) {
 
       const nextEpoch = oldEpoch + 1
       const now = isoNow(deps)
+      const proposalDigests = recordOf(proposal.digests)
       const bindingValue = {
         schema_version: 1,
         project_id: projectId,
@@ -1512,13 +1830,13 @@ async function takeoverProject(ctx, shared) {
         session_id: session.session_id,
         team_id: session.team_id,
         epoch: nextEpoch,
-        ruleDigest: proposal.digests.ruleDigest,
-        scriptDigest: proposal.digests.scriptDigest,
-        catalogDigest: proposal.digests.catalogDigest,
+        ruleDigest: proposalDigests.ruleDigest,
+        scriptDigest: proposalDigests.scriptDigest,
+        catalogDigest: proposalDigests.catalogDigest,
         bindingDigest: proposal.proposalHash,
         adapter: { contract_version: ADAPTER_CONTRACT_VERSION, team: 'team-adapter', project: 'project-adapter' },
         capability: proposal.capabilityVersion,
-        catalog: { version: proposal.catalogVersion, digest: proposal.digests.catalogDigest },
+        catalog: { version: proposal.catalogVersion, digest: proposalDigests.catalogDigest },
         budget: proposal.budget,
         template_id: proposal.templateId,
         target_kinds: [...proposal.targetKinds],
@@ -1548,9 +1866,9 @@ async function takeoverProject(ctx, shared) {
 
       await deps.binding.writeBinding(root, bindingValue, deps)
       await deps.binding.writeRoster(root, rosterValue, deps)
-      const indexLink = await deps.binding
+      const indexLink: IndexLinkState = await deps.binding
         .linkIndexPointers(root, [deps.binding.BINDING_PATH, deps.binding.ROSTER_PATH], deps)
-        .catch((error) => ({ written: false, added: [], reason: error?.message ?? String(error) }))
+        .catch((error: unknown) => ({ written: false, added: [], reason: thrownMessage(error) }))
 
       const diagnostics = [...proposal.gaps]
       if (indexLink.written !== true && indexLink.unchanged !== true) {
