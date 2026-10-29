@@ -102,6 +102,23 @@ node <仓库根>\packages\dsh-redteam-lead\bin\doctor.mjs `
 > `doctor` 本身也是 A01 的验收对象：它必须在**没有团队服务**的环境里可达、给修复路径、且不假报
 > `runtime_ready`。所以这一步的完整 stdout + 退出码要原样贴进记录。
 
+## L2 用例的运行前提（换机器必读）
+
+L2 用例（`packages/dsh-redteam-lead/test/l2/*.test.mjs`）**不是纯离线的**：它们要真实 `python`，还要一份
+权威 skill 副本（`project.py` + `references/` + `assets/`）。两个环境变量控制它们：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `RPM_SKILL_ROOT` | `C:/Users/Administrator/.agents/skills/reverse-project-management` | 权威 skill 副本根目录（l2/helpers.mjs 的 `SKILL_SOURCE`）。 |
+| `RT_L2_PYTHON` | `python` | 解释器：绝对路径，或 `PATH` 上的名字。 |
+
+**在另一台主机上必须显式设 `RPM_SKILL_ROOT`**（默认值写死了开发机的用户目录）。前提缺失时 L2 用例是
+**skip 而不是 fail**：`environment()` 会给出具体原因（缺 Python / 缺副本 / 副本不完整），`node --test`
+照样全绿。后果是：`acceptance-status.md` 里**证据列点到 `test/l2/*.test.mjs` 的行，在那台机器上没有证据**。
+
+> 换句话说：**门禁全绿 ≠ 本表的 L2 行有证据**。换机器后要么设好变量重跑，要么把这些行按 `not-run`
+> 处理（并在备注里写明「本机缺 L2 前提」）。这也是为什么 L2 行不能只看"测试没红"。
+
 ## 开一次性会话
 
 1. 新建会话，模式选「红队指挥」（preset id `redteam-lead`）。**已有会话保留它启动时的 preset 版本**，
