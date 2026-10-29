@@ -43,32 +43,39 @@
 
 ## 2. 粘进新会话的驱动提示词
 
-> 你负责**执行** L3 真服务验收并**取证**。**你没有判定权**：不要写 pass/fail，不要给自己打分，只执行 + 落证据 + 原样贴原始返回。发现异常就停在原地报回来。
->
-> **环境**
-> - 临时分析项目根：`D:\workSpace\_l3-verify\proj`
-> - 证据目录：`D:\workSpace\_l3-verify\evidence`
-> - 取证脚本：`D:\workSpace\Rea-Multi-agent\packages\dsh-redteam-lead\scripts\l3-verify.mjs`
-> - 判据清单：`D:\workSpace\_l3-verify\l3-checklist.md`（先读它）
->
-> **硬约束**
-> 1. 只用非可执行测试数据；**不要**执行任何样本、不要联网、不要跑 `workflow`（它会绕过 depth 限制并烧掉 activation 名额）。
-> 2. 每一步开始前 `collect --out sN-before.json`，结束后 `collect --out sN-after.json` + `diff`，三个文件都留在证据目录。
-> 3. 每次工具调用的返回**整段原文**存成 `evidence\sN-<tool>.json`，不要在回复里改写成摘要。
-> 4. 某步失败：立即停止，保存当时的完整信封与 `diagnostics[]`、before/after/diff、doctor 输出，然后报回来。**不要重跑同一会话。**
->
-> **执行顺序（严格按这个，不是按编号顺序）** `1 → 2 → 3 → 6 → 4 → 5 → 7`
->
-> - **步 1**：贴 `rt_roster` 的完整返回（先不传 `target_kinds`，应只做环境检查且 `recommended_members = 0`）；再跑 `node D:\workSpace\Rea-Multi-agent\packages\dsh-redteam-lead\bin\doctor.mjs --profile C:\Users\Administrator\.dsh\profiles\desktop --project D:\workSpace\_l3-verify\proj` 贴 stdout 与退出码。用 `list_agents` 与 `team_task_list` 的原始输出证明九个团队工具在位；同名工具用**入参形状**区分（团队版 `send_message` 收 `{target}`，另一版收 `{agent_id}`）。
-> - **步 2**：`rt_roster`（`action="inspect"`，`target_kinds=["binary"]`），把 `compatibility`、每个岗位的 `required`、`gaps`、`recommended_members` 原样贴出。然后改 `re/team/capacity.json` 的 `maxMembers`（8→2）再 inspect 一次，对比岗位数变化，再改回 8。两次的 `proposal_hash` 都要贴。
-> - **步 3**：先按项目 skill 在临时项目里建一条**可执行路线**：`re/targets.json` 加一个目标（非可执行测试文件即可），`re/routes/R-001.json` 用 `status: "active"` 并声明该目标。然后 `rt_dispatch`（`post_id="triage"`、`route_id="R-001"`、`target_ids=[该目标]`、`objective`、`evidence_required=["artifact_locator"]`、`prohibited=[]`）。断言：`phase="delivered"`、task `in_progress`、owner 正确、`started_at=null`、`re/team/dispatches/*.json` 存在且含真实目标哈希与 `rule_digest`。同时确认工兵**没有**在收到信封前就开始跑实验。
-> - **步 6（先做 #1 的收口）**：等工兵交回 `re/team/work/<dispatch>/<attempt>/submission.json`，用 `outcome="blocked"`、`run_ids: []` 调 `rt_conclude`。贴完整返回（含 `checks[]`、`audit_written`）、`re/routes/R-001.json`、`re/team/audit.jsonl` 末尾两行、task 是否 `completed`。
-> - **步 4**：对同一岗位再 `rt_dispatch` 一次（新 `operation_id`）。断言：`list_agents` 里**成员数不变**（没有 `rt-triage-2`）、`task_id` 变了、工兵收到的是**新契约**（新 dispatch/attempt、新 `contract_sha256`）。然后趁 #2 还在执行时再派第三次，记录被拒的错误码（应 `MEMBER_BUSY`），第二次派发的 `post_id` 与前两次相同。
-> - **步 5**：把 `rt_dispatch` 与 `rt_conclude` 的调用交给**真实的** teammate 去做（用 `send_message` 指示它调用），贴它的拒绝返回（应 `ROLE_REQUIRED`），并用 `collect` 的 `digest` 前后一致证明**零副作用**。另让该 teammate 尝试创建下一层 agent（`subagent` / `subagent_fork`），区分"工具不存在"与"depth 拒绝"。**不要**用裸子代理代替这一步。
-> - **步 7**：对某个 teammate 调 `interrupt_agent`，贴 `previousStatus`（只能是 `running` 或 `inactive`）；确认它仍在 `list_agents` 里；再用**带 nonce** 的 `send_message` 唤醒，确认回报里出现该 nonce。记录两次调用之间的时间间隔（"没回 nonce"可能只是还没处理）。
-> - **步 6 的第二轮（真实封存）**：另派一个任务，工兵交回 `finding`，带一个真 RUN、一个已保存产物和 `artifact_locator` 锚点（锚点必须指向该 RUN 的 artifacts）。`rt_conclude` 后确认 `seal` 恰好调用一次、`index` 在 `check` 之前、task `completed`。然后构造一次校验失败（例如收口前手工改掉已封存产物的字节），确认**任务没有被 complete** 且返回 `CHECK_FAILED` / `BASELINE_MISMATCH`。
->
-> **跑完报回来**：七步各自的原始返回文件清单、每步 before/after/diff 的摘要、以及你**观察到的异常**（只描述事实，不判定）。
+下面这段**整段复制**粘进新会话即可（已改成代码块，复制不会带 `>` 前缀）。
+
+```text
+你负责执行 L3 真服务验收并取证。你没有判定权：不要写 pass/fail，不要给自己打分，只执行 + 落证据 + 原样贴原始返回。发现异常就停在原地报回来。
+
+【环境】
+- 临时分析项目根：D:\workSpace\_l3-verify\proj
+- 证据目录：D:\workSpace\_l3-verify\evidence
+- 取证脚本：D:\workSpace\Rea-Multi-agent\packages\dsh-redteam-lead\scripts\l3-verify.mjs
+- 判据清单：D:\workSpace\_l3-verify\l3-checklist.md（先读它）
+
+【硬约束】
+1. 只用非可执行测试数据；不要执行任何样本、不要联网、不要跑 workflow（它会绕过 depth 限制并烧掉 activation 名额）。
+2. 每一步开始前 collect --out sN-before.json，结束后 collect --out sN-after.json 再 diff，三个文件都留在证据目录。
+3. 每次工具调用的返回整段原文存成 evidence\sN-<tool>.json，不要在回复里改写成摘要。
+4. 某步失败：立即停止，保存当时的完整信封与 diagnostics[]、before/after/diff、doctor 输出，然后报回来。不要重跑同一会话。
+
+【执行顺序】严格按 1 → 2 → 3 → 6 → 4 → 5 → 7，不是按编号顺序。
+（原因：第 4 步要求"先完成同岗首个任务的验收"，而验收是第 6 步的内容，所以第 4 步依赖第 6 步。）
+
+- 步 1：先调 rt_roster 但不传 target_kinds，贴完整返回（应只做环境检查、recommended_members = 0）。再跑
+  node D:\workSpace\Rea-Multi-agent\packages\dsh-redteam-lead\bin\doctor.mjs --profile C:\Users\Administrator\.dsh\profiles\desktop --project D:\workSpace\_l3-verify\proj
+  贴 stdout 与退出码。用 list_agents 与 team_task_list 的原始输出证明九个团队工具在位；同名工具用入参形状区分（团队版 send_message 收 {target}，另一版收 {agent_id}）。
+- 步 2：rt_roster（action="inspect"，target_kinds=["binary"]），把 compatibility、每个岗位的 required、gaps、recommended_members 原样贴出。然后把 re/team/capacity.json 的 maxMembers 从 8 改成 2 再 inspect 一次，对比岗位数变化，再改回 8。两次的 proposal_hash 都要贴。
+- 步 3：先按项目 skill 在临时项目里建一条可执行路线：re/targets.json 加一个目标（用非可执行测试文件即可），re/routes/R-001.json 用 status: "active" 并声明该目标。然后 rt_dispatch（post_id="triage"、route_id="R-001"、target_ids=[该目标]、objective、evidence_required=["artifact_locator"]、prohibited=[]）。断言：phase="delivered"、task 为 in_progress、owner 正确、started_at=null、re/team/dispatches/*.json 存在且含真实目标哈希与 rule_digest。同时确认工兵没有在收到信封之前就开始跑实验。
+- 步 6（先做 #1 的收口）：等工兵交回 re/team/work/<dispatch>/<attempt>/submission.json，用 outcome="blocked"、run_ids: [] 调 rt_conclude。贴完整返回（含 checks[]、audit_written）、re/routes/R-001.json、re/team/audit.jsonl 末尾两行、以及 task 是否变成 completed。
+- 步 4：对同一岗位再 rt_dispatch 一次（新的 operation_id）。断言：list_agents 里成员数不变（不应出现 rt-triage-2）、task_id 变了、工兵收到的是新契约（新 dispatch/attempt、新 contract_sha256）。然后趁 #2 还在执行时再派第三次，记录被拒的错误码（应为 MEMBER_BUSY）。
+- 步 5：把 rt_dispatch 与 rt_conclude 的调用交给真实的 teammate 去做（用 send_message 指示它调用），贴它的拒绝返回（应 ROLE_REQUIRED），并用 collect 的 digest 前后一致证明零副作用。另让该 teammate 尝试创建下一层 agent（subagent / subagent_fork），区分"工具不存在"与"depth 拒绝"。不要用裸子代理代替这一步。
+- 步 7：对某个 teammate 调 interrupt_agent，贴 previousStatus（只能是 running 或 inactive）；确认它仍在 list_agents 里；再用带 nonce 的 send_message 唤醒，确认回报里出现该 nonce。记录两次调用之间的时间间隔（没回 nonce 可能只是还没处理）。
+- 步 6 的第二轮（真实封存）：另派一个任务，工兵交回 finding，带一个真 RUN、一个已保存产物和一个 artifact_locator 锚点（锚点必须指向该 RUN 的 artifacts）。rt_conclude 后确认 seal 恰好调用一次、index 在 check 之前、task 变为 completed。然后构造一次校验失败（例如收口前手工改掉已封存产物的字节），确认任务没有被 complete，且返回 CHECK_FAILED 或 BASELINE_MISMATCH。
+
+【跑完报回来】七步各自的原始返回文件清单、每步 before/after/diff 的摘要、以及你观察到的异常（只描述事实，不做判定）。
+```
 
 ## 3. 判据（由**另一个** agent 或人做，不由执行的 agent 做）
 
