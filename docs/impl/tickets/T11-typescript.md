@@ -51,6 +51,7 @@
 
 ### 4. 入口与打包形态
 
+- **顺带修一个装配缺陷（T5 已定位）**：现在 `index.js` 在知道 `input.project_root` **之前**就 `createTeamAdapter(...)`，于是生产环境里 `capacity()` 读不到 `re/team/capacity.json`，永远 `known:false`（T5 只能加一条 `CAPACITY_DECLARATION_UNREAD` 诊断点名）。**修法**：入口顺序改为「解析入参 → `validate` 预校验出 `project_root` 并 `normalizeProjectRoot` → 再建两个适配器 → 交给 handler」。必须新增用例：给一个含 `re/team/capacity.json` 的项目，断言 `rt_roster inspect` 拿到 `declared:re/team/capacity.json` 而不是 `unavailable`。
 - `package.json`：`exports["."]` → `./dist/index.js`；`main` 同步；`files` 改为包含 `dist`（含 `dist/catalog.data.json`）、`bin`、`cordis.patch.yml`、`locale`、`icon.svg`；`dsh.bundle.patch` **不变**。
 - `index.js`（根）删除；真正入口是 `src/index.ts` → `dist/index.js`。
 - **`bin/doctor.mjs` 保留原路径与原文件名**（规格钉死 `node <bundle-root>/bin/doctor.mjs`），内容改为薄壳：只 `import('../dist/doctor.js')` 并转交 argv/退出码。它必须仍然**只依赖 `node:*` 与包内 `dist/`**，在插件未挂载时也能跑。
