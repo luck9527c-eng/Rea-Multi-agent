@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto'
 import * as envelopeModule from './envelope.js'
 import * as bindingModule from './binding.js'
 import type { SessionMatchResult } from './binding.js'
+import type { ActivationSlots, CapacityGap, MemberSlots } from './team-adapter.js'
 import { isRecord, recordOf, thrownMessage } from './guards.js'
 import type { Deps, Diagnostic, Envelope, HandlerCtx, HandlerResult } from './types.js'
 
@@ -589,14 +590,18 @@ function orderPosts(entries: unknown, priorityOf: ReadonlyMap<unknown, number>) 
     })
 }
 
-/** `readCapacity()` 的结果：`ok`/`code`/`diagnostics` 只在失败分支出现（成功分支直接透传适配器的容量对象）。 */
+/**
+ * `readCapacity()` 的结果：成功分支是团队适配器 `capacity()`（`TeamCapacityResult`）的直传，
+ * 失败分支由本模块就地合成（`diagnostics`/`gaps` 只在失败或降级时出现）。因此这里只声明
+ * 两条分支都有的键，适配器多给的 `evidence`/`reason` 不属于本模块的判定口径。
+ */
 interface CapacityReport {
   ok?: boolean
   code?: string
   diagnostics?: Diagnostic[]
-  memberSlots: Record<string, unknown>
-  activations: Record<string, unknown>
-  gaps?: unknown[]
+  memberSlots: MemberSlots
+  activations: ActivationSlots
+  gaps?: CapacityGap[]
 }
 
 async function readCapacity(deps: RosterDeps, root: string, env: EnvelopeModule): Promise<CapacityReport> {
@@ -1317,7 +1322,22 @@ async function runRoster(ctx: HandlerCtx, deps: RosterDeps, input: Record<string
     return { envelope: env.ok({ operationId: null, data, retryable: false }), root, audit }
   }
 
-  const shared: SharedState = { env, root, projectId, session, request, proposal, data, audit, deps }
+  // bind/takeover 都要求 `operation_id`，上面 `action !== 'inspect'` 的前置条件里已经拒过 null
+  // （同码同文的 INVALID_ARGUMENT 信封）。这里显式收窄一次给台账用：既不改写 `request` 里
+  // 的原值，也不把 null 传给 `operation.*`（那会被台账层当成 INVALID_ARGUMENT 抛出）。
+  if (operationId === null) {
+    return {
+      envelope: env.error({
+        code: 'INVALID_ARGUMENT',
+        operationId: null,
+        diagnostics: [env.diagnostic('INVALID_ARGUMENT', `${action} 必须提供合法 operation_id`, '传入 $defs.id 形状的 operation_id（小写字母/数字/下划线/短横线）')],
+      }),
+      root,
+      audit,
+    }
+  }
+
+  const shared: SharedState = { env, root, projectId, session, request, proposal, data, audit, deps, operationId }
   if (action === 'bind') return bindProject(ctx, shared)
   return takeoverProject(ctx, shared)
 }
@@ -1333,6 +1353,8 @@ interface SharedState {
   projectId: string
   session: Session
   request: RosterRequest
+  /** `runRoster` 已收窄的 operation_id（bind/takeover 必填；台账调用一律用它）。 */
+  operationId: string
   proposal: ProposalSuccess
   data: ReturnType<typeof rosterDataOf>
   audit: RosterAudit
@@ -1384,8 +1406,7 @@ function firstCapacityGap(gaps: unknown): string | null {
 }
 
 async function bindProject(ctx: HandlerCtx, shared: SharedState): Promise<RosterOutcome> {
-  const { deps, env, root, projectId, session, request, proposal, data, audit } = shared
-  const operationId = request.operationId
+  const { deps, env, root, projectId, session, request, proposal, data, audit, operationId } = shared
   const ledger = await ledgerFor(deps, root)
   const bindingSlot = recordOf(proposal.bindingFile)
   const existingBinding = isRecord(bindingSlot.binding) ? bindingSlot.binding : null
@@ -1645,8 +1666,7 @@ async function bindProject(ctx: HandlerCtx, shared: SharedState): Promise<Roster
 // ---------------------------------------------------------------------------
 
 async function takeoverProject(ctx: HandlerCtx, shared: SharedState): Promise<RosterOutcome> {
-  const { deps, env, root, projectId, session, request, proposal, data, audit } = shared
-  const operationId = request.operationId
+  const { deps, env, root, projectId, session, request, proposal, data, audit, operationId } = shared
 
   // 1. recovery_ref：必须是项目内真实文件，且内容覆盖「停止/处置/风险」。
   const recovery = await deps.binding.readRecoveryRef(root, request.recoveryRef, deps)

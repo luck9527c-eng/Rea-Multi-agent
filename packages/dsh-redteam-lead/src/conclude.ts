@@ -262,9 +262,9 @@ interface MergedKinds {
   issues: Diagnostic[]
 }
 
-/** `submission.readVerifiedSubmission()` 的结果。 */
+/** `submission.readVerifiedSubmission()` 的结果（`bytes` 按 `submission` 的声明是 `Buffer`）。 */
 type VerifiedSubmissionRead =
-  | { ok: true; submission: SubmissionRecord; bytes: unknown; sha256: string; relative_path: string }
+  | { ok: true; submission: SubmissionRecord; bytes: Buffer; sha256: string; relative_path: string }
   | { ok: false; code: string; issues: Diagnostic[] }
 
 /** `anchors.validateAnchorSet()` 的结果。 */
@@ -1317,11 +1317,13 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
         }
       }
 
+      // `compareBaseline()` 只认「基准里冻结的既有 seal」，并按 `projectAdapter.readSeals()`
+      // 自己重读当前清单（见 baseline.ts）；上面的 `sealList` 是给 `sealRunSet()` 用的，
+      // 不重复传给比对（传了也不参与判定）。
       const compared = resultOf<ComparedBaselineRead>(await modules.baseline.compareBaseline({
         root,
         baseline: loaded.baseline,
         projectAdapter: project,
-        seals: sealList.seals,
         fs: modules.fs,
         paths: modules.paths,
         atomic: modules.atomic,
@@ -2178,7 +2180,8 @@ interface ArchiveAttemptInput {
   attemptId: string
   operationId: string
   submission: SubmissionRecord
-  submissionBytes: unknown
+  /** 提交文件的原始字节（`submission.submit()` 成功分支的 `bytes`，Buffer 即 Uint8Array）。 */
+  submissionBytes: Uint8Array
   submissionSha: string
   submissionRef: string
   runs: RunEntry[]

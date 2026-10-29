@@ -81,15 +81,22 @@ const PATH_NEXT_STEP =
 // 不假设项目记录里一定有某个键。
 // ---------------------------------------------------------------------------
 
-/** 岗位目录条目（`catalog` 的产物；契约只读这几个字段）。 */
+/**
+ * 岗位目录条目 —— **wire shape 的唯一权威**。
+ *
+ * `catalog.ts` 直接 import 这一份（不再自带第二份 `CatalogPost`），派发/契约两侧因此是同一形状。
+ * 字段类型由 `catalog.validateCatalog()` 的 `post.*` 不变量证明：`id` 是 `$defs.id` 形状的字符串，
+ * 四个能力集合是字符串数组；`focus`/`priority` 只透传（契约不解释它们的语义）。
+ */
 export interface CatalogPost {
   id: string
   display_name?: string | null
   focus?: string | null
   priority?: unknown
-  required?: readonly string[]
-  optional?: readonly string[]
-  anchors_required?: readonly string[]
+  required: readonly string[]
+  optional: readonly string[]
+  anchors_required: readonly string[]
+  prohibited: readonly string[]
   enabled?: boolean
   disabled_reason?: string | null
 }

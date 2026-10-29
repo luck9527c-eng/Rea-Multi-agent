@@ -5,6 +5,10 @@
 import { readFileSync } from 'node:fs';
 
 import { isRecord, recordOf } from './guards.js';
+import type { CatalogPost } from './contract.js';
+
+// 岗位条目的形状只有一份：`contract.ts` 的 wire shape。本模块不再自带第二份定义。
+export type { CatalogPost };
 
 /** 合法目标类别；与 rt-tools.schema.json 的 `$defs.kinds` 一致。 */
 export const TARGET_KINDS: readonly string[] = Object.freeze(['binary', 'game', 'webapp']);
@@ -26,25 +30,6 @@ const PROVIDER_REQUIRED = [
   'readiness_ref',
   'resource_needs',
 ];
-
-/**
- * 规范化后的岗位（目录里 `posts[]` 的一项）。
- *
- * `id`/`display_name`/`priority`/`focus`/`disabled_reason` 是**原值透传**：目录来自 JSON，
- * 静态校验（`validateCatalog`）负责证明它们的类型；这里不替数据源编造型。
- */
-export interface CatalogPost {
-  id: unknown;
-  display_name: unknown;
-  priority: unknown;
-  focus: unknown;
-  enabled: boolean;
-  disabled_reason: unknown;
-  required: unknown[];
-  optional: unknown[];
-  anchors_required: unknown[];
-  prohibited: unknown[];
-}
 
 /** 规范化后的能力族定义（目录里 `capabilities[<name>]` 的一项）。 */
 export interface CatalogCapability extends Record<string, unknown> {
@@ -144,6 +129,14 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
+/**
+ * 规范化一条岗位。
+ *
+ * 目录是**包内数据源而不是用户输入**：`loadCatalog()` 与 `composeTemplate()` 都先跑
+ * `validateCatalog()`，由它的 `post.*` 不变量证明 `id` 与四个能力集合的类型；本函数只搬值
+ * 不造型（与迁移前逐字一致）。返回处的断言就建立在这条不变量上：**通过校验的目录**产出的
+ * 就是 `contract.ts` 的 wire shape。
+ */
 function normalizePost(raw: unknown): CatalogPost {
   const post = recordOf(raw);
   const enabled = post.enabled !== false;
@@ -158,7 +151,7 @@ function normalizePost(raw: unknown): CatalogPost {
     optional: copyArray(post.optional),
     anchors_required: copyArray(post.anchors_required),
     prohibited: copyArray(post.prohibited),
-  };
+  } as CatalogPost;
 }
 
 function normalizeCapability(raw: unknown): CatalogCapability {

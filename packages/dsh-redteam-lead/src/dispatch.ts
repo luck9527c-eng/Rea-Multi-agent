@@ -1761,6 +1761,16 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
     nextPhase: string | null | undefined,
     patch: Record<string, unknown> = {},
   ): Promise<Record<string, unknown>> => {
+    // 恢复路径会把台账里的当前阶段原样再写一次（step 4 的 `advance(phase, …)`），运行期这里
+    // 必是 OPERATION_PHASES 之一及非空字符串。显式守卫只为收窄类型：失败仍走台账层同一条
+    // 失败路径（ContractError INVALID_ARGUMENT → 外层 fromError），不静默改写调用方传的值。
+    if (!nonEmpty(nextPhase)) {
+      throw new ContractError({
+        code: 'INVALID_ARGUMENT',
+        message: `派发阶段未确定，不能写台账: ${JSON.stringify(nextPhase)}`,
+        nextStep: '阶段必须取 operation.OPERATION_PHASES 之一（prepared…completed/needs_recovery）',
+      })
+    }
     const updated = await ledger.advance(operationId, nextPhase, patch)
     data = { ...(updated.data ?? {}) }
     phase = updated.phase

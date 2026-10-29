@@ -18,7 +18,7 @@ import { join } from 'node:path'
 
 import { ContractError } from './errors.js'
 import { isRecord, thrownCode } from './guards.js'
-import type { Clock } from './types.js'
+import type { Clock, Envelope } from './types.js'
 import { writeJsonAtomic } from './atomic.js'
 
 /** 项目内台账目录。 */
@@ -108,7 +108,8 @@ export interface OperationLedger {
   findById: (operationId: string) => Promise<OperationRecord | null>
   advance: (operationId: string, phase: string, data?: unknown) => Promise<OperationRecord>
   saveResult: (operationId: string, result: unknown) => Promise<OperationRecord>
-  replayResult: (operationId: string) => Promise<Record<string, unknown> | null>
+  /** 重放的是**信封**（`saveResult()` 存进去的就是 `envelope.ok()` 等构造的 `$defs.result`）。 */
+  replayResult: (operationId: string) => Promise<Envelope | null>
   recordPath: (operationId: string) => string
 }
 
@@ -336,11 +337,15 @@ export function createOperationLedger(options: OperationLedgerOptions = {}): Ope
   /**
    * 重放已保存的结果：返回原信封并标记 `replayed=true`；尚未保存结果时返回 null。
    */
-  async function replayResult(operationId: string): Promise<Record<string, unknown> | null> {
+  async function replayResult(operationId: string): Promise<Envelope | null> {
     assertOperationId(operationId)
     const record = await readRecord(operationId)
     if (record === null || !isPlainObject(record.result)) return null
-    return { ...record.result, replayed: true }
+    // 台账里的 result 只可能由本模块的 saveResult() 写入，而它只接受 envelope.* 构造的信封；
+    // 读回来的 JSON 就是当初那个八字段对象，因此这里按 `$defs.result` 用（不重排、不补字段）。
+    // 双断言是必要的：`OperationRecord.result` 声明为 `unknown`，先收成信封形状再展开。
+    const stored = record.result as unknown as Envelope
+    return { ...stored, replayed: true }
   }
 
   return { prepare, findById, advance, saveResult, replayResult, recordPath }
