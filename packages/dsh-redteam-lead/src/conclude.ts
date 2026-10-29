@@ -995,7 +995,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
     ? raw.operation_id
     : null
   let phase = 'preflight'
-  // 副作用分界线（见步骤 4 的长注释）：归档成功之后，任何失败都不能再报「什么都没发生」。
+  // 副作用分界线（见步骤 5 的长注释）：归档成功之后，任何失败都不能再报「什么都没发生」。
   let archived = false
 
   try {
@@ -1292,7 +1292,43 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
         }
       }
 
-      /* ---- 步骤 4：归档 -------------------------------------------------- */
+      /* ---- 步骤 4：基准比对（必须在任何正式写盘之前） --------------------- */
+      // 契约「锚点与封存绑定」：收口**先与派发时冻结的快照比较**，既存项删除/读取失败/内容变化
+      // 都必须在写盘之前报错。快照里除了目标字节与 seal 文件自身，还有**所依赖既有已封存产物的
+      // 身份**（T17 起真实填充）：篡改已封存 RUN 的产物只有这一步能发现 —— 排在归档之后就只能
+      // 拿到 partial（正式 re/runs/** 与回执目录已有字节），项目停在半整合状态。
+      const loaded = resultOf<LoadedBaselineRead>(await modules.baseline.loadBaseline({
+        root,
+        dispatchId: input.dispatch_id,
+        ref: dispatch.record.baseline_ref,
+        embedded: dispatch.record.baseline,
+        fs: modules.fs,
+        paths: modules.paths,
+      }))
+      if (loaded.ok !== true) {
+        return {
+          envelope: failWithIssues(en, { code: loaded.code, operationId, issues: loaded.issues, data: { phase } }),
+        }
+      }
+
+      // `compareBaseline()` 只认「基准里冻结的既有 seal」，并按 `projectAdapter.readSeals()`
+      // 自己重读当前清单（见 baseline.ts）；步骤 6 的 `sealList` 是给 `sealRunSet()` 用的，
+      // 不重复传给比对（传了也不参与判定）。
+      const compared = resultOf<ComparedBaselineRead>(await modules.baseline.compareBaseline({
+        root,
+        baseline: loaded.baseline,
+        projectAdapter: project,
+        fs: modules.fs,
+        paths: modules.paths,
+        atomic: modules.atomic,
+      }))
+      if (compared.ok !== true) {
+        return {
+          envelope: failWithIssues(en, { code: compared.code, operationId, issues: compared.issues, data: { phase } }),
+        }
+      }
+
+      /* ---- 步骤 5：归档 -------------------------------------------------- */
       // ▲ 副作用分界线（编排契约「操作阶段与部分失败」）：
       //   - 在此之前：前置拒绝 → `status=blocked`，语义是「什么都没发生」——没有新成员、新任务、
       //     正式路线变更，也没有正式证据字节。台账 `re/team/operations/**` 只是本插件的幂等簿记
@@ -1328,21 +1364,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
       // 正式 re/runs/** 与回执目录已经有字节：从这一行之后，失败一律 partial。
       archived = true
 
-      /* ---- 步骤 5：基准比对 + seal ------------------------------------- */
-      const loaded = resultOf<LoadedBaselineRead>(await modules.baseline.loadBaseline({
-        root,
-        dispatchId: input.dispatch_id,
-        ref: dispatch.record.baseline_ref,
-        embedded: dispatch.record.baseline,
-        fs: modules.fs,
-        paths: modules.paths,
-      }))
-      if (loaded.ok !== true) {
-        return {
-          envelope: failWithIssues(en, { code: loaded.code, operationId, issues: loaded.issues, data: { phase }, status: 'partial' }),
-        }
-      }
-
+      /* ---- 步骤 6：seal ------------------------------------------------ */
       const sealList = recordOf(await project.readSeals())
       if (sealList.ok !== true) {
         return {
@@ -1353,23 +1375,6 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
             data: { phase },
             status: 'partial',
           }),
-        }
-      }
-
-      // `compareBaseline()` 只认「基准里冻结的既有 seal」，并按 `projectAdapter.readSeals()`
-      // 自己重读当前清单（见 baseline.ts）；上面的 `sealList` 是给 `sealRunSet()` 用的，
-      // 不重复传给比对（传了也不参与判定）。
-      const compared = resultOf<ComparedBaselineRead>(await modules.baseline.compareBaseline({
-        root,
-        baseline: loaded.baseline,
-        projectAdapter: project,
-        fs: modules.fs,
-        paths: modules.paths,
-        atomic: modules.atomic,
-      }))
-      if (compared.ok !== true) {
-        return {
-          envelope: failWithIssues(en, { code: compared.code, operationId, issues: compared.issues, data: { phase }, status: 'partial' }),
         }
       }
 
@@ -1418,7 +1423,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
         }))
       }
 
-      /* ---- 步骤 6：更新事实 → impact → index → check ------------------- */
+      /* ---- 步骤 7：更新事实 → impact → index → check ------------------- */
       const at = modules.clock.isoNow?.() ?? new Date().toISOString()
       const routeUpdate = buildRouteUpdate({
         route,
@@ -1816,7 +1821,7 @@ interface FailWithIssuesOptions {
  * 把「问题清单」折成一个信封：默认 blocked，`status` 为 partial/error 时改用对应状态。
  *
  * `status` 不是装饰：编排契约要求「前置拒绝 → blocked；已持久化或触及宿主后失败 → partial」。
- * 分界线见步骤 4 `archiveAttempt()` 处的长注释——归档之后的每个失败点都必须显式传 `partial`。
+ * 分界线见步骤 5 `archiveAttempt()` 处的长注释——归档之后的每个失败点都必须显式传 `partial`。
  */
 function failWithIssues(envelope: EnvelopeModule, options: FailWithIssuesOptions): Envelope {
   const { code, operationId, issues, data, status, diagnostics: extra = [] } = options
