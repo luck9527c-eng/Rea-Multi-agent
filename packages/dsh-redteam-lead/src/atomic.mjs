@@ -160,8 +160,8 @@ export async function writeJsonAtomic(filePath, value, options = {}) {
  * 已存在且内容完全一致 → 幂等成功（`created=false`）；内容不同 → `OPERATION_CONFLICT`，
  * 且**不覆盖**原文件。
  *
- * `open(wx)` 命中瞬时 `EPERM`/`EACCES`/`EBUSY` 时有界重试；`EEXIST` **绝不**重试
- * （它是幂等/冲突信号，不是抖动）。
+ * `writeFile(..., {flag:'wx'})`（即 `O_EXCL`）命中瞬时 `EPERM`/`EACCES`/`EBUSY` 时有界重试；
+ * `EEXIST` **绝不**重试（它是幂等/冲突信号，不是抖动）。
  *
  * @param {string} filePath 目标绝对路径
  * @param {string | Uint8Array} contents
