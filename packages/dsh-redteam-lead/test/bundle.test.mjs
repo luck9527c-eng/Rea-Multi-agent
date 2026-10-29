@@ -662,6 +662,20 @@ test('handler 抛异常或返回不合规信封时，注册表只看到合法信
   assert.match(throwing.diagnostics[0].reason, /boom/)
   assert.ok(!String(throwing.diagnostics[0].reason).includes('\n    at '), '不得把栈写进信封')
 
+  // operation_id 必须被回显（信封构造器的参数名在文档与实现之间有差异，两个键都传）
+  const withOperation = await index.invokeTool({
+    tool: 'rt_dispatch',
+    args: {
+      project_root: 'D:\\p', operation_id: 'op-echo', post_id: 'binary-static', route_id: 'R-001',
+      target_ids: ['T-001'], objective: 'x', evidence_required: ['binary_location'], prohibited: [],
+    },
+    exec: {},
+    ctx,
+    handlers: { dispatch: async () => { throw new Error('boom') } },
+  })
+  assertResultEnvelope(withOperation, errorCodes)
+  assert.equal(withOperation.operation_id, 'op-echo', '失败信封也要回显 operation_id')
+
   const garbage = await index.invokeTool({
     tool: 'rt_dispatch',
     args: {

@@ -128,12 +128,11 @@ cd $env:USERPROFILE\.dsh\profiles\desktop
 
 ```powershell
 cd packages/dsh-redteam-lead
-node --test            # 从仓库根也可以用：node --test packages/dsh-redteam-lead/test/**/*.test.mjs
+node --test "test/**/*.test.mjs"     # 仓库根：node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"
 ```
 
-> 注意：本机 Node v24 把 `node --test <目录>` 当成「测试文件」去加载，会报
-> `Cannot find module …\test`；等价写法是不带参数的 `node --test`（等价于在包根递归发现测试）
-> 或显式 glob `node --test "test/**/*.test.mjs"`。
+> 门禁命令必须写成显式 glob（DECISIONS D20）：裸 `node --test` 会把 `test/helpers/*.mjs` 也当测试文件跑；
+> `node --test test` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
 
 `test/bundle.test.mjs` 里三条「工具注册/路由」用例在 T1/T3/T4 模块尚未合入时会
 `t.skip('waiting for sibling modules …')`——这是**故意**的：不为了跑绿而造假 stub。

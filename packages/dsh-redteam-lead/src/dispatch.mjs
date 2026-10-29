@@ -32,6 +32,7 @@ export async function handleDispatch(ctx, input) {
     envelope: envelope.blocked({
       code: 'TEAM_SERVICE_UNAVAILABLE',
       operationId,
+      operation_id: operationId, // T1 的实现用 operationId、UPSTREAM-API 文档写 operation_id：两个都传，避免 operation id 被丢成 null
       reason:
         'rt_dispatch 尚未实现：派发契约、成员复用与任务板指派随 T6 合入；' +
         '此时没有团队服务（ctx.agentTeams），也没有可写的 re/team 契约目录。',
@@ -42,3 +43,4 @@ export async function handleDispatch(ctx, input) {
     }),
   }
 }
+

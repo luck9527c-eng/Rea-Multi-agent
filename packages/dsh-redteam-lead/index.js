@@ -126,6 +126,16 @@ const TOOL_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]))
 const OPERATION_ID = /^[a-z0-9][a-z0-9_-]{0,95}$/
 
 /**
+ * 信封构造器的 operation id 参数名，在 `docs/impl/UPSTREAM-API.md`（`operation_id`）与
+ * `src/envelope.mjs` 当前实现（`operationId`）之间不一致。这里两个键都传：
+ * 任一形状都能取到，**不会把 operation id 悄悄丢成 null**。等 T1 统一成一处后可以收成一个键。
+ * @param {string | null} operationId
+ */
+function envelopeIds(operationId) {
+  return { operationId, operation_id: operationId }
+}
+
+/**
  * 从入参里取一个**可以放进信封**的 operation id：形状不合法就当没有，
  * 免得「入参非法」这个分支自己再抛异常。
  * @param {unknown} args
@@ -164,10 +174,13 @@ function fileSystem() {
  * `binding` / `contract` / `resources` / `submission` / `anchors` / `baseline` 属于 T5/T6/T7，
  * 本 ticket 只给 `null`：那六个模块尚未存在，提前静态 import 会让本文件整体加载失败。
  *
- * @param {{ services: object, exec: unknown, config: object }} options
+ * 适配器工厂的入参形状由 T4 最终确定；这里把当次调用能拿到的上下文**原样**给出
+ * （`services` / `exec` / `config` / `ctx` / `deps`），工厂取自己需要的字段即可。
+ *
+ * @param {{ services: object, exec: unknown, config: object, ctx?: unknown }} options
  * @returns {object} `ctx.deps`
  */
-export function createDeps({ services, exec, config }) {
+export function createDeps({ services, exec, config, ctx = undefined }) {
   const clock = {
     now: () => Date.now(),
     isoNow: () => new Date(clock.now()).toISOString(),
@@ -188,8 +201,9 @@ export function createDeps({ services, exec, config }) {
     fs: fileSystem(),
   }
   // 适配器是薄封装宿主服务的有状态对象：每次调用按当次的 exec/config 装配一次。
-  deps.teamAdapter = createTeamAdapter({ services, exec, config, deps })
-  deps.projectAdapter = createProjectAdapter({ services, exec, config, deps })
+  const adapterOptions = { services, exec, config, ctx, deps }
+  deps.teamAdapter = createTeamAdapter(adapterOptions)
+  deps.projectAdapter = createProjectAdapter(adapterOptions)
   return deps
 }
 
@@ -248,7 +262,7 @@ export async function invokeTool(options) {
   // 先装配 deps：handler 需要它，INVALID_ARGUMENT 分支也需要用它造信封。
   let deps
   try {
-    deps = createDeps({ services, exec, config })
+    deps = createDeps({ services, exec, config, ctx })
   } catch (thrown) {
     // 适配器工厂炸了：仍然要给注册表一个合法信封。
     return errorEnvelopeWithoutDeps(LOCAL_FALLBACK_CODES.adapter, thrown)
@@ -257,7 +271,7 @@ export async function invokeTool(options) {
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     return deps.envelope.error({
       code: 'INVALID_ARGUMENT',
-      operationId: null,
+      ...envelopeIds(null),
       reason: `${spec.name} 的入参必须是对象，实际是 ${args === null ? 'null' : Array.isArray(args) ? 'array' : typeof args}`,
       nextStep: `按 docs/specs/rt-tools.schema.json 的 $defs.${spec.defName} 传对象；本包在产生任何副作用前完成校验`,
       data: null,
@@ -272,7 +286,7 @@ export async function invokeTool(options) {
   if (!checked.ok) {
     return deps.envelope.error({
       code: 'INVALID_ARGUMENT',
-      operationId: null,
+      ...envelopeIds(null),
       reason: describeIssues(checked.issues),
       nextStep: `按 docs/specs/rt-tools.schema.json 的 $defs.${spec.defName} 修正入参（字段形状、必填项与枚举以该 schema 为准）；本次调用未产生任何副作用`,
       data: null,
@@ -284,7 +298,7 @@ export async function invokeTool(options) {
   if (typeof handler !== 'function') {
     return deps.envelope.error({
       code: 'INVALID_ARGUMENT',
-      operationId,
+      ...envelopeIds(operationId),
       reason: `${spec.name} 的 handler 未装配（${spec.handler}）`,
       nextStep: '这是本包的装配错误：检查 index.js 的 DEFAULT_HANDLERS 是否包含该 handler',
       data: null,
@@ -299,7 +313,7 @@ export async function invokeTool(options) {
     if (!verdict.ok) {
       return deps.envelope.error({
         code: 'RECOVERY_REQUIRED',
-        operationId,
+        ...envelopeIds(operationId),
         reason: `${spec.name} 的 handler 返回的信封不符合 $defs.result：${describeIssues(verdict.issues)}`,
         nextStep: '按 docs/specs/rt-tools.schema.json 的 $defs.result 构造信封（八字段齐全；ok 的 code 必须是 null）',
         data: null,
@@ -307,8 +321,8 @@ export async function invokeTool(options) {
     }
     return shell
   } catch (thrown) {
-    // ContractError 沿用其码；未知异常 → RECOVERY_REQUIRED，且不把栈写进信封。
-    return deps.envelope.fromError(thrown, { operationId })
+    // ContractError 沿用其码；未知异常 → RECOVERY_REQUIRED + status=error（DECISIONS D22），且不把栈写进信封。
+    return deps.envelope.fromError(thrown, { ...envelopeIds(operationId) })
   }
 }
 

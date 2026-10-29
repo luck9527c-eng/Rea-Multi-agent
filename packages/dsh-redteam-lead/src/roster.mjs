@@ -35,6 +35,7 @@ export async function handleRoster(ctx, input) {
     envelope: envelope.blocked({
       code: 'TEAM_SERVICE_UNAVAILABLE',
       operationId,
+      operation_id: operationId, // T1 的实现用 operationId、UPSTREAM-API 文档写 operation_id：两个都传，避免 operation id 被丢成 null
       reason:
         `rt_roster(action=${action}) 尚未实现：本包当前交付的是入口、preset 与工具注册，` +
         '班底/能力/预算与 binding 逻辑随 T5 合入；此时没有可用的团队服务快照可读。',
@@ -46,3 +47,4 @@ export async function handleRoster(ctx, input) {
     }),
   }
 }
+

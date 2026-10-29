@@ -33,6 +33,7 @@ export async function handleConclude(ctx, input) {
     envelope: envelope.blocked({
       code: 'TEAM_SERVICE_UNAVAILABLE',
       operationId,
+      operation_id: operationId, // T1 的实现用 operationId、UPSTREAM-API 文档写 operation_id：两个都传，避免 operation id 被丢成 null
       reason:
         'rt_conclude 尚未实现：提交校验、锚点闭集、基准比对与项目 skill 的 seal/check 顺序随 T7 合入；' +
         '任何完成判定都不会在没有校验的情况下冒充成功。',
@@ -43,3 +44,4 @@ export async function handleConclude(ctx, input) {
     }),
   }
 }
+
