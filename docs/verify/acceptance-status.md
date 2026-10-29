@@ -13,8 +13,8 @@
 
 | 状态 | 含义 |
 |---|---|
-| `pass` | 该行要求的观察有**可复跑的自动用例**证明。`层`列给出规格要求的层；`证据`列注明证据来自哪一层。 |
-| `not-run` | 需要真实 DSH 团队会话（L3）或故障注入才能判定，且**尚未执行**。`备注`写清缺什么。 |
+| `pass` | 该行要求的观察有**可复跑的自动用例**证明，且用例所在的层**就是矩阵该行要求的最高层**（`L1/L2` 的行必须点到 `test/l2/*.test.mjs`，只有 L1 证据的行按 `not-run`）。`层`列给出规格要求的层；`证据`列注明证据来自哪一层。 |
+| `not-run` | 需要真实 DSH 团队会话（L3）、真实项目 CLI（L2）或故障注入才能判定，且**尚未执行**。`备注`写清缺什么。 |
 | `out-of-scope` | 该行要求的观察**全部**落在规格明确划给 skill 工作流/平台的部分，插件侧没有可执行实现；`备注`附出处。 |
 | `fail` | 实现或证据明确不成立。**当前没有 `fail` 行。** |
 
@@ -24,23 +24,28 @@
   算进去，所以判 `pass`，L3 半未执行写在备注里。
 - **门禁命令**（本表所有 `pass` 都能被它复跑，在仓库根执行）：
   `npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"`
-  当前结果：**543 用例 / 543 pass / 0 fail / 0 skipped**（含本表自身的文档契约用例
+  当前结果：**550 用例 / 550 pass / 0 fail / 0 skipped**（含本表自身的文档契约用例
   [acceptance-status.test.mjs](../../packages/dsh-redteam-lead/test/acceptance-status.test.mjs)）。
 - 用例名与文件路径都相对于 `packages/dsh-redteam-lead/test/`；测试跑的是 **`dist/` 里的发货字节**。
+- **L2 用例有环境前提**：`test/l2/*.test.mjs` 要真实 `python` 和一份权威 skill 副本
+  （`RPM_SKILL_ROOT`，默认值是开发机的 `C:/Users/Administrator/.agents/skills/reverse-project-management`；
+  解释器用 `RT_L2_PYTHON`）。**换一台机器不设这些变量时，L2 用例是 skip 而不是 fail**：门禁照样全绿，
+  但本表证据列点到 `test/l2/...` 的行在那台机器上**没有证据**。详见
+  [README「L2 用例的运行前提」](README.md#l2-用例的运行前提换机器必读)。
 
 ## 分布
 
 | 状态 | 行数 | 编号 |
 |---|---|---|
-| `pass` | **24** | A04、A05、A06、A07、A14、A16、A17、A18、A19、A20、A21、A23、A24、A27、A28、A29、A30、A32、A33、A35、A36、A39、A41、A42 |
-| `not-run` | **19** | A01、A02、A03、A08、A09、A10、A11、A12、A13、A15、A22、A25、A26、A31、A34、A38、A40、A43、A44 |
+| `pass` | **21** | A04、A05、A06、A07、A14、A16、A18、A19、A20、A21、A23、A24、A28、A29、A30、A32、A35、A36、A39、A41、A42 |
+| `not-run` | **22** | A01、A02、A03、A08、A09、A10、A11、A12、A13、A15、A17、A22、A25、A26、A27、A31、A33、A34、A38、A40、A43、A44 |
 | `out-of-scope` | **1** | A37 |
 | `fail` | **0** | — |
 | 合计 | **44** | A01–A44 |
 
-- `not-run` 的 19 行里，**18 行是 L3 会话项**（A01、A02、A03、A08、A09、A10、A11、A12、A13、A15、A22、
-  A25、A26、A31、A34、A38、A40、A44），**1 行是 L1/L2 缺口**（A43：工具清单刷新后的"旧契约不变 / 新派发复验"
-  没有自动化用例）。
+- `not-run` 的 22 行按缺口分类：**18 行是 L3 会话项**（A01、A02、A03、A08、A09、A10、A11、A12、A13、A15、A22、
+  A25、A26、A31、A34、A38、A40、A44）；**3 行 L1 已通过但 L2 没构造**（A17、A27、A33，原先误判为 `pass`，
+  已按"`L1/L2` 的行必须有 L2 证据"的口径降级）；**1 行 L1/L2 都缺**（A43）。
 - A39 的 `层` 也含 L3，但它的四条观察全部由 L1 的能力匹配用例覆盖（不需要会话），因此判 `pass`，
   L3 半未执行的事实写在 `备注` 里。
 
@@ -52,7 +57,7 @@
 | A02 | L3 | `not-run` | — | 需真实会话：同名对照组（`tool-subagent-control` / `list-agents`）已被 patch 删除，只能证明"留下的是团队版"。清单第 1 步。 |
 | A03 | L1/L3 | `not-run` | L1 半：[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 允许真实 teammate；裸子代理被拒且零副作用」「inspect 作为 Lead：给出可核对提议，且不创建成员/任务、不写 binding 与 roster」 | 缺 L3：真实 teammate 的原始返回 + 身份拒绝时的空 `collect` diff。清单第 5 步。 |
 | A04 | L1/L2 | `pass` | [roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 作为 Lead：给出可核对提议，且不创建成员/任务、不写 binding 与 roster」「bind：proposal_hash 匹配时写 binding + roster，成员仍为 0，INDEX 有指针」「bind 拒绝篡改/过期的 proposal_hash，并且不写盘」「bind 用别的 target_kinds 的旧提议 → 拒绝且不写盘」「bind 重放同一 operation_id：返回原结果 replayed=true，不重复追加历史/审计」「bind 在锁内重读宿主计数：容量在 inspect 之后变紧 → blocked 且不写 binding」 | inspect 不落盘、bind 不建成员、重放不重复历史、过期提议不超配，四条都有断言（L1）。 |
-| A05 | L1/L2 | `pass` | [l2/compat.test.mjs](../../packages/dsh-redteam-lead/test/l2/compat.test.mjs) 7 例（含「非默认布局：probe 分类布局、给出 blocking 缺口与可读下一步，且不静默另建 re/（A05）」「旧副本缺团队规则：blocking 缺口 + 具体下一步，且不覆盖副本/INDEX/历史（A05 / D8）」「缺 Python：PYTHON_MISSING（blocking）点名解释器…」）；[project-adapter.test.mjs](../../packages/dsh-redteam-lead/test/project-adapter.test.mjs)「probe：缺团队规则/缺 INDEX/缺 Python 各自给出具体 gap 与下一步」 | 缺配置 / 缺 Python / 旧副本无团队规则 / 非默认布局四类缺口都报实际差异；不重 init、不覆盖副本/INDEX/历史（用哈希对比断言）。**非默认布局是 T10 补的实现缺口**（原 `layoutKind` 恒为 `'default'`）。 |
+| A05 | L1/L2 | `pass` | [l2/compat.test.mjs](../../packages/dsh-redteam-lead/test/l2/compat.test.mjs) 7 例（含「非默认布局：probe 分类布局、给出 blocking 缺口与可读下一步，且不静默另建 re/（A05）」「旧副本缺团队规则：blocking 缺口 + 具体下一步，且不覆盖副本/INDEX/历史（A05 / D8）」「缺 Python：PYTHON_MISSING（blocking）点名解释器，check 明确失败而不是假装成功（A05）」）；[project-adapter.test.mjs](../../packages/dsh-redteam-lead/test/project-adapter.test.mjs)「probe：缺团队规则/缺 INDEX/缺 Python 各自给出具体 gap 与下一步」 | 缺配置 / 缺 Python / 旧副本无团队规则 / 非默认布局四类缺口都报实际差异；不重 init、不覆盖副本/INDEX/历史（用哈希对比断言）。**非默认布局是 T10 补的实现缺口**（原 `layoutKind` 恒为 `'default'`）。L2 用例依赖本机的 `RPM_SKILL_ROOT`/`RT_L2_PYTHON`（见 [README](README.md)）。 |
 | A06 | L1 | `pass` | [capacity.test.mjs](../../packages/dsh-redteam-lead/test/capacity.test.mjs)「A06 场景：mixed 并集、缺工具、预算只够两岗时稳定裁剪且保留专岗缺口」「vacant / deferred / disabled 三类分开返回，缺口码可区分」；[catalog.test.mjs](../../packages/dsh-redteam-lead/test/catalog.test.mjs)「mixed 给 game+webapp 得到按 post_id 去重的并集，各自专岗都在」 | 并集去重 + 稳定裁剪 + 三类分开 + 不强凑四岗，L1 断言齐全。 |
 | A07 | L1 | `pass` | [capability.test.mjs](../../packages/dsh-redteam-lead/test/capability.test.mjs)「族名本身、插件 ID、子串与前缀都不算命中」「web-recon 组合必须 web、fs、search 全部满足」「binary-static 没有任何默认工具名：存在 REA/MCP 名也不放行」「mcp:<server> 未绑定即缺口，不能凭工具名猜归属」；[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 的 gaps 区分：缺工具、未就绪 provider、预算延后、disabled」；[catalog.test.mjs](../../packages/dsh-redteam-lead/test/catalog.test.mjs)「模板不含 disabled 岗位，web-attack 只出现在 reserved_posts」 | 不凭 REA 名字推定能力、模板需求不可删（[contract.test.mjs](../../packages/dsh-redteam-lead/test/contract.test.mjs)「prohibited / evidence_required 只追加：传空数组不会删掉岗位默认要求」）、disabled 岗不派。 |
 | A08 | L1/L3 | `not-run` | L1 半：[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 工具可见性取自实际执行者：Lead 与 teammate 的 vacant 不同」；[host.test.mjs](../../packages/dsh-redteam-lead/test/host.test.mjs)「工具可见性按 agent 名字区分」；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「缺必需能力 → CAPABILITY_MISSING，且不建成员/任务」 | 缺 L3：其他作用域可见/已卸载/后端 fail、bootstrap 失败保留席位返回 partial——需要真实成员与真实工具注册表。 |
@@ -64,7 +69,7 @@
 | A14 | L1/L2 | `pass` | [dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「depends_on_tasks：未完成 → DEPENDENCY_BLOCKED；已完成 → 任务带 blockedBy」「依赖任务不存在 → DEPENDENCY_BLOCKED；跨团队任务 ID → PROJECT_SESSION_MISMATCH」「impact 报告 open 争议 → blocked 且不建半条路线」；[l2/impact.test.mjs](../../packages/dsh-redteam-lead/test/l2/impact.test.mjs)「open 争议影响活动路线：真实 check 拒绝；impact 给出 dispute_impacts；处置后放行（A30）」；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「更新事实后的 impact 仍有待复查/争议且路线保持 active/validated → CHECK_FAILED，任务不完成」 | 前置拒绝零新增（成员/任务/路线）、不建等待队列、不只看 `task completed`。 |
 | A15 | L1/L2/L3 | `not-run` | L1 半：[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「原生提前 complete（无回执）→ UNREVIEWED_COMPLETION：全部检查照跑、不再调 complete」「原生提前 complete 但补验失败 → 失败码，不放行且不改任务」 | 缺 L2/L3：没有"成员先自行 complete"的真实场景用例（L2 未构造，L3 会话未跑）。 |
 | A16 | L1/L2 | `pass` | [l2/outcomes.test.mjs](../../packages/dsh-redteam-lead/test/l2/outcomes.test.mjs) 8 例（finding / no_finding / budget_exhausted / refuted / failed / interrupted / blocked / cancelled，真实 `check`+`seal`）；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「七类 outcome：路线允许变化符合七行表；failed 不自动证死；未开始即阻塞可 run_ids=[]」 | 交付已处理 ≠ validated；失败不自动证死；两处（L1 表 + L2 真实 CLI）都覆盖。 |
-| A17 | L1/L2 | `pass` | [anchors.test.mjs](../../packages/dsh-redteam-lead/test/anchors.test.mjs) 20 例（六类锚点各一例 + 逐类缺必要定位字段被拒 + 闭集）；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「锚点缺必要类型 → SUBMISSION_INVALID（缺 sha256 的地址锚点 / 无导出路径的 evidence_id 都不成立）」 | 函数名/URL/evidence ID 单独无效；锚点必须在本次 RUN 的 artifacts 里。 |
+| A17 | L1/L2 | `not-run` | L1 半：[anchors.test.mjs](../../packages/dsh-redteam-lead/test/anchors.test.mjs) 20 例（六类锚点各一例 + 逐类缺必要定位字段被拒 + 闭集）；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「锚点缺必要类型 → SUBMISSION_INVALID（缺 sha256 的地址锚点 / 无导出路径的 evidence_id 都不成立）」 | **缺 L2**：没有用真实项目 CLI（`project.py check`）跑一次"锚点缺失 / 锚点类型无效 → 拒绝"的用例；现有证据全部在 L1（纯函数 + fake adapter），按矩阵这行要 L1/L2，故不能判 `pass`。函数名/URL/evidence ID 单独无效、锚点必须在本次 RUN 的 artifacts 里，这两条 L1 已覆盖。 |
 | A18 | L1/L2 | `pass` | [l2/outcomes.test.mjs](../../packages/dsh-redteam-lead/test/l2/outcomes.test.mjs)「failed（中断）：interrupted 必须有恢复评估，否则 check 给出具体拒绝（A18）」「blocked（未开始）：没有 RUN 也可以成立，缺 resume_when 才拒绝（A18）」；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「blocked 且 run_ids=[] 可以在没有 RUN 的情况下收口（须有保存的就绪/中断核查）」 | 前者可无 RUN 但有核查记录；后者保留 interrupted RUN 与诊断产物，不造采集。 |
 | A19 | L1/L2 | `pass` | [baseline.test.mjs](../../packages/dsh-redteam-lead/test/baseline.test.mjs)「compareBaseline：既有 seal 被删除 → BASELINE_MISMATCH（不能因为“没找到”就漏过）」「compareBaseline：既有 seal 内容被改 → BASELINE_MISMATCH」「compareBaseline：目标字节被改动 → BASELINE_MISMATCH」；[l2/seal-check.test.mjs](../../packages/dsh-redteam-lead/test/l2/seal-check.test.mjs)「已封存 RUN：重复 seal 被拒绝，基线字节不变（只校验复用，不重封存）」「同时改写目标与清单：目标封存仍拒绝（旧项变化不允许）」；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「基准失效：既有 seal 被删除 → BASELINE_MISMATCH」 | 首派冻结真实目标哈希；旧项变化/删除拒绝；不重封存。 |
 | A20 | L1/L2 | `pass` | [paths.test.mjs](../../packages/dsh-redteam-lead/test/paths.test.mjs) 18 例（绝对路径/UNC/`..`/ADS/控制字符/junction 写入）；[l2/paths.test.mjs](../../packages/dsh-redteam-lead/test/l2/paths.test.mjs) 5 例（越界产物、junction、ADS、大小写碰撞、检查后改提交） | Windows 专属项**在本机 Windows 上实际跑过**（不是 mock）。 |
@@ -74,13 +79,13 @@
 | A24 | L1/L2 | `pass` | [l2/recovery.test.mjs](../../packages/dsh-redteam-lead/test/l2/recovery.test.mjs)「seal 的响应丢失后重放：被拒绝、基线不变、history 不重复（A24）」「阶段失败不留半成品：seal 校验失败后不写基线，修正记录后同一 RUN 前向恢复（A24）」「封存后补写恢复评估：state.recovery 可更新，execution_sha256 不变（A24）」；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「member_ready 之后、task_created 之前失败 → 重入复用同一成员，只建一个任务」；[operation.test.mjs](../../packages/dsh-redteam-lead/test/operation.test.mjs)「prepare 同 ID 同哈希：恢复既有台账，不重复追加历史」 | 回执说明已有身份与阶段；同 ID 前向恢复；不重复成员/task/seal/history；不删证据"回滚"。 |
 | A25 | L1/L3 | `not-run` | L1 半：[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「spawnTeammate 生效但响应丢失 → 按确定名字唯一关联，不重复 spawn」「createTask 生效但响应丢失 → 按摘要标记唯一关联，不建第二个任务」 | 缺 L3：故障注入（杀进程/断连接）在一次性会话里不可靠复现（`docs/verify/README.md` 已知边界 5）；`RECOVERY_REQUIRED` 的"无法唯一关联"分支只有单测覆盖。 |
 | A26 | L1/L3 | `not-run` | L1 半：[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「expected_revision 过期 → REVISION_CONFLICT 并带实际 revision，不覆盖他人决定」；[team-adapter.test.mjs](../../packages/dsh-redteam-lead/test/team-adapter.test.mjs)「CAS 失败 → REVISION_CONFLICT + 实际 revision；非法 action 不触达宿主」 | 缺 L3：真实两人并发改 owner/revision、恢复时又变。 |
-| A27 | L1/L2 | `pass` | [conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「审计写失败 → ok + audit_written=false 且有诊断」「回执写失败 → partial（不伪称成功，也不完成任务）」；[audit.test.mjs](../../packages/dsh-redteam-lead/test/audit.test.mjs)「写失败返回 written=false 且不抛（审计 best-effort）」 | 两者处理**不同**：审计可 ok、必需回执失败必须 partial。 |
+| A27 | L1/L2 | `not-run` | L1 半：[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「审计写失败 → ok + audit_written=false 且有诊断」「回执写失败 → partial（不伪称成功，也不完成任务）」；[audit.test.mjs](../../packages/dsh-redteam-lead/test/audit.test.mjs)「写失败返回 written=false 且不抛（审计 best-effort）」 | **缺 L2**：没有在真实项目 CLI 上构造"审计可写 / 必需回执不可写"的对照（现有两例都在 L1：fake adapter + 临时目录）。两者处理确实不同（审计可 ok、必需回执失败必须 partial），但按矩阵这行要 L1/L2，只有 L1 不能判 `pass`。 |
 | A28 | L2 | `pass` | [l2/archive.test.mjs](../../packages/dsh-redteam-lead/test/l2/archive.test.mjs)「两个工兵并行写独立暂存区，Lead 串行归档：正式产物与暂存字节一致、执行事实原样保留（A28）」 | 原提交与映射保留、正式引用同字节、命令/cwd/时间/来源保持真实（不因移动改写执行事实）。 |
 | A29 | L2 | `pass` | [l2/archive.test.mjs](../../packages/dsh-redteam-lead/test/l2/archive.test.mjs)「工兵继续写隔离区时，Lead 对另一提交执行 seal/index/check：正式记录稳定、隔离区不被索引（A29）」「未核对哈希的提交：真实 seal 拒绝且不写任何基线（不降门槛，A29）」 | 真实 CLI 验证；已有缺口保留失败；不降门槛。 |
 | A30 | L1/L2 | `pass` | [l2/impact.test.mjs](../../packages/dsh-redteam-lead/test/l2/impact.test.mjs)「B 的 RUN 更新 C：真实 impact 报出 B（direct）与 A（downstream），旧 closure 原样保留（A30）」「未复核的影响不阻止 check --hashes，但阻止 check --hashes --complete（A30/A35）」「open 争议影响活动路线：真实 check 拒绝；impact 给出 dispute_impacts；处置后放行（A30）」 | 不等整条 B 完成；impact + 人工处置覆盖 A/下游；保留旧 closure。 |
 | A31 | L1/L2/L3 | `not-run` | L1/L2 半：[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「新会话接管：takeover 换 session 并增 epoch，旧会话的变更操作随后被拒」「takeover 成功：epoch+1、旧 binding/roster 归档、dispatch 与事实层保留」「takeover 之后旧 epoch 的提议不能再用（必须重新提议）」；[binding.test.mjs](../../packages/dsh-redteam-lead/test/binding.test.mjs)「接管归档：旧 binding/roster/resources 复制到 history/epoch-N 并保留原文件字节」 | 缺 L3：真实"第二个会话打开旧项目"与旧句柄混用；重载不重复建岗需会话。 |
 | A32 | L1/L2 | `pass` | [operation.test.mjs](../../packages/dsh-redteam-lead/test/operation.test.mjs)「prepare 同 ID 不同哈希：OPERATION_CONFLICT 且不改写台账」「replayResult 返回原结果并标记 replayed=true」；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「同一 operation_id 重放 → 原回执 replayed=true，不重复 seal/完成/审计」「不同 operation_id 指向同一 attempt → 业务身份去重，不重复 seal/history/审计」「同一 operation_id 改内容 → OPERATION_CONFLICT（不覆盖既有台账）」；[l2/recovery.test.mjs](../../packages/dsh-redteam-lead/test/l2/recovery.test.mjs)「同一条路线变更应用两次：真实 check 拒绝 broken history chain（A32）」 | 原结果返回、改内容冲突、不同 ID 也不重复 closure/history/seal。 |
-| A33 | L1/L2 | `pass` | [resources.test.mjs](../../packages/dsh-redteam-lead/test/resources.test.mjs)「quarantined 资源不可再分配（RESOURCE_BUSY），恢复依据后才回到 released」「默认独占：未登记为不可变读取的 shared_read 降级为独占并记 gap」「releaseResources：只释放自己的租约，不碰别人的」；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「资源冲突 → RESOURCE_BUSY，不改资源记录也不建成员」 | 保留事实 + 隔离继续 + 未核实前不准后继占用（L1 故障注入即判据）。**L2 未单独构造真实端口/进程残留**——真实残留属环境侧，不是插件可判定项。 |
+| A33 | L1/L2 | `not-run` | L1 半：[resources.test.mjs](../../packages/dsh-redteam-lead/test/resources.test.mjs)「quarantined 资源不可再分配（RESOURCE_BUSY），恢复依据后才回到 released」「默认独占：未登记为不可变读取的 shared_read 降级为独占并记 gap」「releaseResources：只释放自己的租约，不碰别人的」；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「资源冲突 → RESOURCE_BUSY，不改资源记录也不建成员」 | **缺 L2**：真实端口/进程残留没有构造（原先这行自己就写着"L2 未单独构造"，却仍标 `pass`，已改正）。保留事实 + 隔离继续 + 未核实前不准后继占用目前只有 L1 故障注入判据；真实残留属环境侧，不是插件可判定项。 |
 | A34 | L1/L3 | `not-run` | — | 缺 L3：三动作 / 30 秒控制点回读、空闲有界 wait 都是 Lead 活跃循环行为，插件侧没有可断言代码；"不承诺自动唤醒"只能旁证。清单第 7 步。 |
 | A35 | L2 | `pass` | [l2/seal-check.test.mjs](../../packages/dsh-redteam-lead/test/l2/seal-check.test.mjs)「验收缺口存在时 check --hashes --complete 失败（A35）」「任务全部完成但仍有活动路线：check --hashes --complete 仍失败（A35 语义）」；[l2/impact.test.mjs](../../packages/dsh-redteam-lead/test/l2/impact.test.mjs)「未复核的影响不阻止 check --hashes，但阻止 check --hashes --complete（A30/A35）」 | 真实 CLI 拒绝；通过也不省略人工逐目标证据审阅（人工审阅属 L3 记录）。 |
 | A36 | L1/L2 | `pass` | [l2/compat.test.mjs](../../packages/dsh-redteam-lead/test/l2/compat.test.mjs)「克隆到新根：摘要与路径无关；改规则/脚本后要求重新做兼容检查，旧绑定保留（A36）」「重做兼容检查的最小闭环：修正记录后 probe/check 仍能给出确定结论（A36）」；[compatibility.test.mjs](../../packages/dsh-redteam-lead/test/compatibility.test.mjs)「binding 摘要一致 → 不需要复查；不一致 → REBIND_REQUIRED 且列出差异」；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「派发把规则/脚本/目录摘要冻结进契约，且一次派发只探测一次兼容性」 | 重做兼容检查；旧尝试绑定原规则或显式重派；不静默改根/session、不覆盖副本。 |
@@ -106,7 +111,7 @@
 | 缺派发字段 | `pass` | [validate.test.mjs](../../packages/dsh-redteam-lead/test/validate.test.mjs)「dispatchInput：缺必填 objective 被拒」「dispatchInput：target_ids 为空、重复或格式非法都被拒」「dispatchInput：正整数下界与空白文本被拒」 | — |
 | 非法角色字段 / 旧 `context` | `pass` | [validate.test.mjs](../../packages/dsh-redteam-lead/test/validate.test.mjs)「rosterInput：未知字段被拒（additionalProperties=false）」（`role`）「dispatchInput：未知字段被拒」（`context`） | `additionalProperties:false` 直接拒绝，不是"忽略"。 |
 | 收口身份与 review | `pass` | [validate.test.mjs](../../packages/dsh-redteam-lead/test/validate.test.mjs)「concludeInput：缺必填 review 被拒」「concludeInput：review 条件约束按 outcome 生效」；[conclude.test.mjs](../../packages/dsh-redteam-lead/test/conclude.test.mjs)「submission_ref 指向别的 attempt → PATH_INVALID」「submission_ref 越界（绝对路径）→ PATH_INVALID」「submission_sha256 不符 → SUBMISSION_INVALID，不完成」 | 身份（dispatch/attempt/task/revision/submission）与 review 条件同时覆盖。 |
-| 成功 / 失败信封 | `pass` | [envelope.test.mjs](../../packages/dsh-redteam-lead/test/envelope.test.mjs) 18 例（含「所有四态构造结果都能通过规格 result 定义…」「三种非 ok 态都要求已登记稳定码」）；[errors.test.mjs](../../packages/dsh-redteam-lead/test/errors.test.mjs)「错误码集合与 rt-tools.schema.json 的 errorCode 枚举完全一致」 | 四态信封都过 `$defs.result`；码只取稳定表（表外码构造即抛）。 |
+| 成功 / 失败信封 | `pass` | [envelope.test.mjs](../../packages/dsh-redteam-lead/test/envelope.test.mjs) 18 例（含「所有四态构造结果都能通过规格 result 定义（含诊断与 data 约束）」「三种非 ok 态都要求已登记稳定码」）；[errors.test.mjs](../../packages/dsh-redteam-lead/test/errors.test.mjs)「错误码集合与 rt-tools.schema.json 的 errorCode 枚举完全一致」 | 四态信封都过 `$defs.result`；码只取稳定表（表外码构造即抛）。 |
 | 三工具成功 data | `pass` | [roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect/bind/takeover 的 ok 与拒绝信封都能通过 $defs.result 校验」；[bundle.test.mjs](../../packages/dsh-redteam-lead/test/bundle.test.mjs)「output.schema 投影与 $defs.result 对齐，且在宿主支持子集内」 | 注册投影与校验用字分离（D26），两边都有断言。 |
 | 工具清单示例：四层未知不冒充验证成功、MD 的源哈希与快照字节一致 | `pass` | [examples-static.test.mjs](../../packages/dsh-redteam-lead/test/examples-static.test.mjs) 3 例 | 除 `discovered` 外任何 `pass` 必须有同层 `checks`；MD 状态行逐入口等于 JSON；`registry_ref` 为 `null` 而不是空数组。 |
 | 能力映射用完整工具名（族名/插件 ID 不算已注册）、组合不可被单个读工具满足 | `pass` | [capability.test.mjs](../../packages/dsh-redteam-lead/test/capability.test.mjs)「族名本身、插件 ID、子串与前缀都不算命中」「只有 read 时 fs 缺失，且缺口指向组合里没满足的子能力」「web-recon 组合必须 web、fs、search 全部满足」「工具名区分大小写」 | 同时覆盖 `any_tool` 的 OR 语义与 `all_capabilities` 的 AND 语义。 |
@@ -159,6 +164,16 @@
 | 两套阶段枚举不得混用（D24） | `FAILURE_PHASES` / `OPERATION_PHASES` 各自逐字 | A24 / A32 |
 | `re/env/tools.json` 没有生产者（D11） | 插件容忍缺失、报 unknown/gap，绝不自己生成 | A41 / A42 / A43 |
 | 版本漂移：安装目标 rc.3、checkout 0.2.2-alpha.2（D6/D13） | 基线取 rc.3；删两行同名冲突插件 | A02（L3） |
+
+## 矩阵外的已知缺口（`not-run`，记录项）
+
+`docs/specs/acceptance-matrix.md` 的 A01–A44 **没有覆盖**下面两条：它们出自规格正文/用户故事，而实现里
+**没有载体**。按"未实现就标待验收、不填占位通过"的口径记在这里；它们不计入上面 44 行的分布。
+
+| 编号 | 出处 | 状态 | 备注 |
+|---|---|---|---|
+| G1 | 编排契约 §167「bootstrap 就绪预检」 | `not-run` | `bootstrap` 目前只是 `contract.ts` 里的一段 prompt 字符串；`spawnTeammate` 之后直接 createTask→reassign，**没有**"先做一次无害预检、失败返回 `partial`"的步骤。裁决与理由见 [DECISIONS D33](../impl/DECISIONS.md)：加预检要改派发阶段机，本次不实现。 |
+| G2 | 用户故事 14「派发后必须立刻找到下一件可独立推进的事」；用户故事 15「只有真的无路可走时才允许 `wait_agent`」 | `not-run` | 插件侧没有载体：`rt_dispatch` 只投递契约并回一段 `next_step` 建议文本，没有"待办清单"事实层，也不校验 `wait_agent` 的时机；这是 Lead 活跃循环行为，代码里没有可断言判据。裁决见 [DECISIONS D34](../impl/DECISIONS.md)。 |
 
 ## 记录在哪
 

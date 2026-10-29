@@ -1,4 +1,4 @@
-/**
+﻿/**
  * T6 资源租用与隔离：`re/team/resources.json`。
  *
  * 契约（编排契约「路径、锁与资源」，验收 A22/A33）：
@@ -30,10 +30,10 @@
  */
 
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 
 import { ContractError } from './errors.js'
 import { thrownCode } from './guards.js'
+import { resolveInProject } from './paths.js'
 import type { Diagnostic } from './types.js'
 
 /** 一条资源租约（`resources.json` 的权威形状）。 */
@@ -409,7 +409,7 @@ export function planReservations({ registry, needs, dispatchId, attemptId, now }
  * @returns {Promise<object>}
  */
 export async function readRegistry(root: string): Promise<ResourceRegistry> {
-  const file = join(root, ...RESOURCES_PATH.split('/'))
+  const file = resolveInProject(root, RESOURCES_PATH)
   let text: string
   try {
     text = await readFile(file, 'utf8')
@@ -445,7 +445,7 @@ export async function readRegistry(root: string): Promise<ResourceRegistry> {
 }
 
 async function writeRegistry(root: string, registry: ResourceRegistry, atomic: typeof import('./atomic.js')) {
-  const file = join(root, ...RESOURCES_PATH.split('/'))
+  const file = resolveInProject(root, RESOURCES_PATH)
   const payload = {
     schema_version: 1,
     revision: registry.revision,

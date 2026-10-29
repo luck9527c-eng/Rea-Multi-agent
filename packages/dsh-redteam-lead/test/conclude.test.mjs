@@ -374,14 +374,15 @@ test('正常 finding 交付：readRoute→probe→impact→readRun→readSeals�
   assert.equal(ledger.data.receipt_ref, RECEIPT_REF)
 })
 
-test('check --hashes 失败 → CHECK_FAILED，任务不完成，保留 stdout/stderr/exitCode/阶段', async (t) => {
+test('check --hashes 失败 → CHECK_FAILED + partial，任务不完成，保留 stdout/stderr/exitCode/阶段', async (t) => {
   const fx = await setup(t, {
     projectResponses: {
       check: { exitCode: 1, stdout: '{"targets":1}', stderr: 'ERROR: R-001: history/status mismatch', code: 'CHECK_FAILED' },
     },
   })
   const { envelope } = await handleConclude(fx.ctx, fx.input)
-  assert.equal(envelope.status, 'blocked')
+  // 走到 check 时归档/seal/index 都已完成：按编排契约这是「已持久化后失败」，必须报 partial。
+  assert.equal(envelope.status, 'partial', JSON.stringify(envelope))
   assert.equal(envelope.code, 'CHECK_FAILED')
   assert.equal(envelope.data.phase, 'integrating')
   assert.deepEqual(validate.validateInput(schemaDefs, 'result', envelope).issues, [], '失败信封也必须通过 $defs.result')
@@ -396,23 +397,26 @@ test('check --hashes 失败 → CHECK_FAILED，任务不完成，保留 stdout/s
   assert.equal(exists, false, '失败不得写最终回执')
 })
 
-test('index 失败 → CHECK_FAILED，且不调用 check', async (t) => {
+test('index 失败 → CHECK_FAILED + partial，且不调用 check', async (t) => {
   const fx = await setup(t, {
     projectResponses: { index: { exitCode: 1, stdout: '', stderr: 'ERROR: INDEX nav write failed' } },
   })
   const { envelope } = await handleConclude(fx.ctx, fx.input)
   assert.equal(envelope.code, 'CHECK_FAILED')
+  assert.equal(envelope.status, 'partial', JSON.stringify(envelope))
+  assert.equal(envelope.data.phase, 'integrating')
   assert.match(envelope.diagnostics[0].reason, /INDEX nav write failed/u)
   assert.equal(fx.fakeProject.callsFor('check').length, 0)
   assert.equal(fx.team.snapshot().tasks.find((task) => task.id === TASK).status, 'in_progress')
 })
 
-test('seal 失败 → CHECK_FAILED，且不再继续 impact/index/check', async (t) => {
+test('seal 失败 → CHECK_FAILED + partial，且不再继续 impact/index/check', async (t) => {
   const fx = await setup(t, {
     projectResponses: { seal: { exitCode: 1, stdout: '', stderr: 'ERROR: RUN-1: target hash mismatch' } },
   })
   const { envelope } = await handleConclude(fx.ctx, fx.input)
   assert.equal(envelope.code, 'CHECK_FAILED')
+  assert.equal(envelope.status, 'partial', JSON.stringify(envelope))
   assert.equal(envelope.data.phase, 'integrating')
   assert.match(envelope.diagnostics[0].reason, /target hash mismatch/u)
   assert.equal(fx.fakeProject.callsFor('index').length, 0)
@@ -431,12 +435,13 @@ test('已有封存只校验复用：不调用 seal', async (t) => {
   assert.deepEqual(receipt.seals, [{ run_id: RUN, action: 'reused', path: `re/seals/runs/${RUN}.json` }])
 })
 
-test('基准失效：目标字节被改动 → BASELINE_MISMATCH，且不封存', async (t) => {
+test('基准失效：目标字节被改动 → BASELINE_MISMATCH（归档后才发现副作用 → partial），且不封存', async (t) => {
   const fx = await setup(t)
   fx.project.write('re/samples/app.exe', '被换掉的目标')
   const { envelope } = await handleConclude(fx.ctx, fx.input)
   assert.equal(envelope.code, 'BASELINE_MISMATCH')
-  assert.equal(envelope.status, 'blocked')
+  // 基准比对排在步骤 4 归档之后：正式 re/runs 字节可能已经落盘，所以不是「什么都没发生」。
+  assert.equal(envelope.status, 'partial', JSON.stringify(envelope))
   assert.equal(fx.fakeProject.callsFor('seal').length, 0)
   assert.equal(fx.team.snapshot().tasks.find((task) => task.id === TASK).status, 'in_progress')
 })
@@ -875,6 +880,68 @@ test('更新事实后的 impact 仍有待复查/争议且路线保持 active/val
   assert.equal(envelope.code, 'CHECK_FAILED')
   assert.match(envelope.diagnostics[0].reason, /待复查|争议/u)
   assert.equal(fx.fakeProject.callsFor('index').length, 0)
+  assert.equal(fx.team.snapshot().tasks.find((task) => task.id === TASK).status, 'in_progress')
+})
+
+test('F1 分界线之后：未捕获异常也不报 blocked（归档已发生 → partial）', async (t) => {
+  const fx = await setup(t)
+  const original = fx.ctx.deps.baseline
+  fx.ctx.deps.baseline = {
+    ...original,
+    loadBaseline() {
+      throw new Error('boom after archive')
+    },
+  }
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.status, 'partial', JSON.stringify(envelope))
+  assert.equal(envelope.code, 'RECOVERY_REQUIRED')
+  assert.match(envelope.diagnostics[0].reason, /boom after archive/u)
+  // 归档先于这次抛错，所以正式映射已经在盘上。
+  const mapping = JSON.parse(await fx.project.read(`${RECEIPT_DIR}/mapping.json`))
+  assert.equal(mapping.operation_id, 'op-conclude-1')
+})
+
+// ---------------------------------------------------------------------------
+// F1：`blocked` 只给「前置拒绝」，第一个持久副作用之后一律 `partial`
+//
+// 编排契约：前置拒绝 status=blocked 且无新成员/任务/正式路线变更；
+// 已持久化或触及宿主后失败 status=partial。
+// 分界线就是步骤 4 的 `archiveAttempt()`（它把核对过的产物复制进正式 re/runs/**，
+// 并在回执目录写下 submission.json/mapping.json）。
+// 台账记录（re/team/operations/**）是插件自己的幂等簿记，不算「正式事实」。
+// ---------------------------------------------------------------------------
+
+test('F1 分界线之前：归档前拒绝 → blocked（尚未写任何正式证据）', async (t) => {
+  const fx = await setup(t)
+  // 提交哈希对不上：在步骤 4 归档之前就被拒。
+  const { envelope } = await handleConclude(fx.ctx, { ...fx.input, submission_sha256: SHA('9') })
+
+  assert.equal(envelope.status, 'blocked', JSON.stringify(envelope))
+  assert.equal(envelope.code, 'SUBMISSION_INVALID')
+  assert.equal(envelope.data.phase, 'integrating')
+  assert.equal(fx.fakeProject.callsFor('seal').length, 0)
+  const archived = await fsp
+    .stat(path.join(fx.project.root, 're', 'team', 'receipts', `${DISPATCH}-${ATTEMPT}`, 'mapping.json'))
+    .then(() => true)
+    .catch(() => false)
+  assert.equal(archived, false, '归档前失败不得留下归档映射')
+})
+
+test('F1 分界线之后：归档完成、seal 之前失败 → partial（正式 re/runs/** 字节已落）', async (t) => {
+  const fx = await setup(t)
+  // 归档是步骤 4；删掉派发时冻结的基准快照，让紧随其后的 loadBaseline 失败。
+  fx.project.remove(fx.baselineRef)
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.code, 'RECOVERY_REQUIRED', JSON.stringify(envelope))
+  assert.equal(envelope.status, 'partial', JSON.stringify(envelope))
+  assert.equal(envelope.data.phase, 'integrating')
+  // 归档确实已经发生——这正是不能报 blocked 的理由。
+  const mapping = JSON.parse(await fx.project.read(`${RECEIPT_DIR}/mapping.json`))
+  assert.equal(mapping.dispatch_id, DISPATCH)
+  assert.equal(mapping.attempt_id, ATTEMPT)
+  assert.equal(fx.fakeProject.callsFor('seal').length, 0, '失败发生在 seal 之前')
   assert.equal(fx.team.snapshot().tasks.find((task) => task.id === TASK).status, 'in_progress')
 })
 

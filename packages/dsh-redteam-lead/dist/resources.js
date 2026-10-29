@@ -29,9 +29,9 @@
  * ```
  */
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { ContractError } from './errors.js';
 import { thrownCode } from './guards.js';
+import { resolveInProject } from './paths.js';
 /** 项目内资源记录路径（统一 `/`）。 */
 export const RESOURCES_PATH = 're/team/resources.json';
 /** 资源模式闭集（`$defs.resource.mode`）。 */
@@ -326,7 +326,7 @@ export function planReservations({ registry, needs, dispatchId, attemptId, now }
  * @returns {Promise<object>}
  */
 export async function readRegistry(root) {
-    const file = join(root, ...RESOURCES_PATH.split('/'));
+    const file = resolveInProject(root, RESOURCES_PATH);
     let text;
     try {
         text = await readFile(file, 'utf8');
@@ -365,7 +365,7 @@ export async function readRegistry(root) {
     return normalizeRegistry(parsed);
 }
 async function writeRegistry(root, registry, atomic) {
-    const file = join(root, ...RESOURCES_PATH.split('/'));
+    const file = resolveInProject(root, RESOURCES_PATH);
     const payload = {
         schema_version: 1,
         revision: registry.revision,

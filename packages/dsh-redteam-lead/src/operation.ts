@@ -14,10 +14,10 @@
  */
 
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 
 import { ContractError } from './errors.js'
 import { isRecord, thrownCode } from './guards.js'
+import { resolveInProject } from './paths.js'
 import type { Clock, Envelope } from './types.js'
 import { writeJsonAtomic } from './atomic.js'
 
@@ -170,7 +170,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 export function operationRecordPath(root: string, operationId: string): string {
   assertOperationId(operationId)
-  return join(root, ...OPERATIONS_DIR.split('/'), `${operationId}.json`)
+  return resolveInProject(root, `${OPERATIONS_DIR}/${operationId}.json`)
 }
 
 /**

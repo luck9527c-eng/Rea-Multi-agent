@@ -738,12 +738,12 @@ interface PlanBudgetInput {
 /**
  * 调 `capacity.planBudget`。
  *
- * `capacity` 模块本次并行类型化中尚未标注参数（默认值把 `candidates` 收成 `never[]`、
- * 余额收成 `null | undefined`），这里把本模块准备好的入参对象断言成**该模块自己的参数类型**；
- * 运行时传的是同一个对象，字段一个不改。
+ * 入参形状由本模块的 `PlanBudgetInput` 给出；`capacity.PlanBudgetInput` 把每个字段都声明成
+ * 可选 `unknown`（调用方给什么就收什么，非法值由它自己兜底），所以这里**不需要断言**——
+ * 本模块的对象逐字可赋值给那个形状。运行时传的是同一个对象，字段一个不改。
  */
 function planBudgetOf(deps: RosterDeps, input: PlanBudgetInput) {
-  return deps.capacity.planBudget(input as unknown as Parameters<typeof deps.capacity.planBudget>[0])
+  return deps.capacity.planBudget(input)
 }
 
 /** `assembleProposal()` 的入参。 */

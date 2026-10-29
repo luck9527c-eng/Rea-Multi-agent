@@ -22,7 +22,6 @@
 
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, stat } from 'node:fs/promises'
-import { join } from 'node:path'
 
 import { ContractError } from './errors.js'
 import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js'
@@ -816,9 +815,9 @@ export async function ensureWorkDir({
   paths = defaultPaths,
 }: EnsureWorkDirInput): Promise<string> {
   const dir = workDirFor(dispatchId, attemptId)
-  await paths.assertSafeWriteTarget(root, dir)
+  const absolute = await paths.assertSafeWriteTarget(root, dir)
   await paths.assertNoCaseCollision(root, dir)
-  await mkdir(join(root, ...dir.split('/')), { recursive: true })
+  await mkdir(absolute, { recursive: true })
   return dir
 }
 
@@ -968,7 +967,7 @@ export async function readStartAck({ root, dispatchId, attemptId }: StartAckInpu
   const relative = `${workDirFor(dispatchId, attemptId)}/start.json`
   let parsed: unknown
   try {
-    const text = await readFile(join(root, ...relative.split('/')), 'utf8')
+    const text = await readFile(defaultPaths.resolveInProject(root, relative), 'utf8')
     parsed = JSON.parse(text)
   } catch {
     return null
@@ -1026,7 +1025,7 @@ export async function persistContract({
 
 async function readProjectJson(root: string, relative: string): Promise<unknown> {
   try {
-    const text = await readFile(join(root, ...relative.split('/')), 'utf8')
+    const text = await readFile(defaultPaths.resolveInProject(root, relative), 'utf8')
     return JSON.parse(text)
   } catch (error) {
     if (thrownCode(error) === 'ENOENT') return null

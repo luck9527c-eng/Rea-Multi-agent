@@ -9,9 +9,9 @@
  *
  * 需要「必需回执写失败」时走 `partial` 信封，那不是审计的职责（审计失败仍可以 ok）。
  */
-import { appendFile, mkdir } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { appendLine } from './atomic.js';
 import { recordOf, thrownMessage } from './guards.js';
+import { resolveInProject } from './paths.js';
 /** 项目内审计文件路径（统一 `/`）。 */
 export const AUDIT_PATH = 're/team/audit.jsonl';
 /**
@@ -66,9 +66,10 @@ export async function appendAudit(root, entry, options = {}) {
             record[field] = field === 'at' ? at : column(source[field]);
         }
         const line = `${JSON.stringify(record)}\n`;
-        const filePath = join(root, ...AUDIT_PATH.split('/'));
-        await mkdir(dirname(filePath), { recursive: true });
-        await appendFile(filePath, line, 'utf8');
+        // 追加走 `atomic.appendLine()`：append-only 与「原子替换」是两种语义，例外写在
+        // CONVENTIONS「原子写与追加」里，这里是唯一的追加入口（业务模块不得自己 import appendFile）。
+        const filePath = resolveInProject(root, AUDIT_PATH);
+        await appendLine(filePath, line);
         return { written: true, line };
     }
     catch (error) {

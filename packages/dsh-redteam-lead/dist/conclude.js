@@ -56,6 +56,7 @@ import { isRecord, recordOf, thrownMessage } from './guards.js';
  * 因此不改变任何字节，只把同一个对象贴回它本来的形状。
  */
 function resultOf(value) {
+    // 断言：T 由调用点按被调模块的真实返回形状给出，本函数只把同一个对象贴回它本来的形状。
     return value;
 }
 /** 七类结果允许的路线变化与成功依赖（编排契约的七行表，数据驱动）。 */
@@ -176,6 +177,7 @@ function replayEnvelope(stored) {
  * 转换反而会改变 `audit.jsonl` 的字节，而写入方接受未知值。
  */
 function auditColumn(value) {
+    // 断言：写入方（audit.column）接受未知值并自己转文本；这里保持原值，不改变 audit.jsonl 字节。
     return value;
 }
 /** 依赖解析：deps 里给了就用，没给（或为 null）就用本包真实模块。 */
@@ -574,6 +576,8 @@ export async function handleConclude(ctx, rawInput) {
         ? raw.operation_id
         : null;
     let phase = 'preflight';
+    // 副作用分界线（见步骤 4 的长注释）：归档成功之后，任何失败都不能再报「什么都没发生」。
+    let archived = false;
     try {
         const modules = resolveModules(ctx);
         const shape = checkInputShape(rawInput);
@@ -855,6 +859,13 @@ export async function handleConclude(ctx, rawInput) {
                 };
             }
             /* ---- 步骤 4：归档 -------------------------------------------------- */
+            // ▲ 副作用分界线（编排契约「操作阶段与部分失败」）：
+            //   - 在此之前：前置拒绝 → `status=blocked`，语义是「什么都没发生」——没有新成员、新任务、
+            //     正式路线变更，也没有正式证据字节。台账 `re/team/operations/**` 只是本插件的幂等簿记
+            //     （每次 conclude 都会写），不算「正式事实」，不推进这条分界线。
+            //   - `archiveAttempt()` 成功之后：正式 `re/runs/**` 与回执目录里已经有字节，此后**任何**失败
+            //     一律 `status=partial`，并在 `data.phase` 带上阶段。Lead 读到 blocked 会以为可以原地重派；
+            //     读到 partial 才知道必须按「已有字节」处置（保留证据、同 operation ID 前移恢复）。
             phase = 'integrating';
             const archive = await archiveAttempt({
                 modules,
@@ -880,6 +891,8 @@ export async function handleConclude(ctx, rawInput) {
                     }),
                 };
             }
+            // 正式 re/runs/** 与回执目录已经有字节：从这一行之后，失败一律 partial。
+            archived = true;
             /* ---- 步骤 5：基准比对 + seal ------------------------------------- */
             const loaded = resultOf(await modules.baseline.loadBaseline({
                 root,
@@ -890,7 +903,9 @@ export async function handleConclude(ctx, rawInput) {
                 paths: modules.paths,
             }));
             if (loaded.ok !== true) {
-                return { envelope: failWithIssues(en, { code: loaded.code, operationId, issues: loaded.issues, data: { phase } }) };
+                return {
+                    envelope: failWithIssues(en, { code: loaded.code, operationId, issues: loaded.issues, data: { phase }, status: 'partial' }),
+                };
             }
             const sealList = recordOf(await project.readSeals());
             if (sealList.ok !== true) {
@@ -900,6 +915,7 @@ export async function handleConclude(ctx, rawInput) {
                         operationId,
                         issues: [diag('RECOVERY_REQUIRED', `读不了 re/seals 清单：${sealList.reason ?? sealList.code ?? 'unknown'}`, '确认 re/seals 可读；读失败不能当作没有封存')],
                         data: { phase },
+                        status: 'partial',
                     }),
                 };
             }
@@ -916,7 +932,7 @@ export async function handleConclude(ctx, rawInput) {
             }));
             if (compared.ok !== true) {
                 return {
-                    envelope: failWithIssues(en, { code: compared.code, operationId, issues: compared.issues, data: { phase } }),
+                    envelope: failWithIssues(en, { code: compared.code, operationId, issues: compared.issues, data: { phase }, status: 'partial' }),
                 };
             }
             const sealed = resultOf(await modules.baseline.sealRunSet({
@@ -942,6 +958,7 @@ export async function handleConclude(ctx, rawInput) {
                         diagnostics: [
                             diag('CHECK_FAILED', `seal 阶段失败（RUN ${sealed.run_id ?? 'unknown'}）：${sealed.stderr || sealed.code}`, '保留 stdout/stderr/exitCode 与阶段；修正项目记录后以同一 operation ID 重入，不完成任务'),
                         ],
+                        status: 'partial',
                     }),
                 };
             }
@@ -1016,6 +1033,7 @@ export async function handleConclude(ctx, rawInput) {
                             diag('CHECK_FAILED', `impact 失败：${stageFailureText(impact)}`, '保留原始 stdout/stderr/exitCode 与阶段；修正项目记录后以同一 operation ID 重入，不完成任务'),
                         ],
                         data: { phase, route_id: route.id },
+                        status: 'partial',
                     }),
                 };
             }
@@ -1031,6 +1049,7 @@ export async function handleConclude(ctx, rawInput) {
                                 + impacted.items.map((item) => JSON.stringify(recordOf(item).route_id ?? item)).join('；'), '先按 skill 处置复查/争议并记录原因，再把路线改为 blocked/paused（或撤销争议）后收口'),
                         ],
                         data: { phase, route_id: route.id },
+                        status: 'partial',
                     }),
                 };
             }
@@ -1058,6 +1077,7 @@ export async function handleConclude(ctx, rawInput) {
                             diag('CHECK_FAILED', `index 失败：${stageFailureText(indexed)}`, '保留原始 stdout/stderr/exitCode 与阶段；修正后以同一 operation ID 重入，不完成任务'),
                         ],
                         data: { phase, route_id: route.id },
+                        status: 'partial',
                     }),
                 };
             }
@@ -1085,6 +1105,7 @@ export async function handleConclude(ctx, rawInput) {
                             diag('CHECK_FAILED', `check --hashes 失败（fail-fast，只报第一条）：${stageFailureText(checked)}`, '保留原始 stdout/stderr/exitCode 与阶段；按 skill 修正项目记录后以同一 operation ID 重入，不完成任务、不降门槛'),
                         ],
                         data: { phase, route_id: route.id },
+                        status: 'partial',
                     }),
                 };
             }
@@ -1152,6 +1173,7 @@ export async function handleConclude(ctx, rawInput) {
                                 task_id: input.task_id,
                                 ...(actualRevision === undefined ? {} : { actual_revision: actualRevision }),
                             },
+                            status: 'partial',
                         }),
                     };
                 }
@@ -1268,7 +1290,14 @@ export async function handleConclude(ctx, rawInput) {
         }
     }
     catch (error) {
-        return { envelope: en.fromError(error, { operationId, data: { phase } }) };
+        // 归档之后才冒出来的未捕获异常同样不能报「什么都没发生」：显式把状态压成 partial。
+        return {
+            envelope: en.fromError(error, {
+                operationId,
+                data: { phase },
+                ...(archived ? { status: 'partial' } : {}),
+            }),
+        };
     }
 }
 /* -------------------------------------------------------------------------- */
@@ -1279,7 +1308,12 @@ function failurePhaseOf(operationPhase) {
     const phases = envelopeModule.FAILURE_PHASES;
     return typeof operationPhase === 'string' && phases.includes(operationPhase) ? operationPhase : 'integrating';
 }
-/** 把「问题清单」折成一个信封：默认 blocked，`status` 为 partial/error 时改用对应状态。 */
+/**
+ * 把「问题清单」折成一个信封：默认 blocked，`status` 为 partial/error 时改用对应状态。
+ *
+ * `status` 不是装饰：编排契约要求「前置拒绝 → blocked；已持久化或触及宿主后失败 → partial」。
+ * 分界线见步骤 4 `archiveAttempt()` 处的长注释——归档之后的每个失败点都必须显式传 `partial`。
+ */
 function failWithIssues(envelope, options) {
     const { code, operationId, issues, data, status, diagnostics: extra = [] } = options;
     const diagnostics = [
@@ -1717,6 +1751,11 @@ async function archiveAttempt(input) {
                 runArtifacts.set(view.sha256, view.path);
         }
     }
+    // 循环内的失败状态：已经确认过**至少一个**产物的正式字节（复制或校验复用）→ partial。
+    // 这是 `archiveAttempt()` 内部那条「本函数自己写过的字节」的分界线：第一个产物落盘之前
+    // 失败仍然可以报 blocked（什么都没发生），之后就必须报 partial。
+    let formalized = 0;
+    const failureStatus = () => (formalized > 0 ? 'partial' : 'blocked');
     for (const artifact of submission.artifacts) {
         let source;
         try {
@@ -1726,7 +1765,7 @@ async function archiveAttempt(input) {
             return {
                 ok: false,
                 code: 'SUBMISSION_INVALID',
-                status: 'blocked',
+                status: failureStatus(),
                 issues: [diag('SUBMISSION_INVALID', `产物路径越界：${artifact.path}（${thrownMessage(error)}）`, 'artifacts 只能指向本 attempt 分配目录')],
             };
         }
@@ -1737,7 +1776,7 @@ async function archiveAttempt(input) {
             return {
                 ok: false,
                 code: 'SUBMISSION_INVALID',
-                status: 'blocked',
+                status: failureStatus(),
                 issues: [diag('SUBMISSION_INVALID', `产物缺失或哈希不符：${artifact.path}（${thrownMessage(error)}）`, '重新核对原始产物；提交后不得改写该版本')],
             };
         }
@@ -1746,7 +1785,7 @@ async function archiveAttempt(input) {
             return {
                 ok: false,
                 code: 'SUBMISSION_INVALID',
-                status: 'blocked',
+                status: failureStatus(),
                 issues: [
                     diag('SUBMISSION_INVALID', `产物未在该 RUN 的 artifacts 登记：${artifact.path}`, '先在 RUN 记录（re/runs/<RUN>/run.json）的 artifacts 里登记 path/sha256（正式证据位置），再收口；编排目录不能代替正式证据'),
                 ],
@@ -1762,12 +1801,13 @@ async function archiveAttempt(input) {
                 await modules.atomic.copyVerify(source, destination, { expectedSha256: artifact.sha256 });
             }
             mappingArtifacts.push({ source_path: artifact.path, archived_path: formal, sha256: artifact.sha256 });
+            formalized += 1;
         }
         catch (error) {
             return {
                 ok: false,
                 code: 'BASELINE_MISMATCH',
-                status: 'blocked',
+                status: failureStatus(),
                 issues: [diag('BASELINE_MISMATCH', `归档目标已存在且内容不一致：${formal}（${thrownMessage(error)}）`, '正式记录不得覆盖：保留既有字节，按新 RUN 归档新证据')],
             };
         }

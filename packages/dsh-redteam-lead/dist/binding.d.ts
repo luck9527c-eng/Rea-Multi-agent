@@ -12,14 +12,12 @@ export declare const BINDING_SCHEMA_VERSION = 1;
 /** INDEX 手写区里标记本插件条目的标题（已存在时不重复加）。 */
 export declare const INDEX_HEADING = "## \u7F16\u6392\u8BB0\u5F55\uFF08redteam-lead\uFF09";
 /**
- * 本模块用到的 `deps.fs` 子集：`fs/promises` 的薄封装，外加**可选**的 `rm`
- * （追加 INDEX 失败时要清临时文件；旧的/测试替身 fs 没有 `rm`，故保持可选调用 `fs.rm?.()`）。
+ * 本模块用到的 `deps.fs` 子集：`fs/promises` 的薄封装。
+ *
+ * 写盘一律走 `deps.atomic`（含临时文件清理），所以这里**不需要** `rm`：以前那版把它声明成
+ * 可选并写成 `fs.rm?.()`，可选调用在替身 fs 上静默跳过，会留下临时文件。
  */
-export interface BindingFs extends FsLike {
-    rm?: (target: string, options?: {
-        force?: boolean;
-    }) => Promise<void>;
-}
+export type BindingFs = FsLike;
 /**
  * 本模块接受的 `deps`（`ctx.deps` 的一个子集）。
  *

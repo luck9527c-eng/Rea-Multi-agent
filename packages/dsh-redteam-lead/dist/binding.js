@@ -232,7 +232,7 @@ async function readIndex(root, deps) {
     }
 }
 export async function linkIndexPointers(root, entries, deps) {
-    const { fs, paths } = deps0(deps);
+    const { atomic, fs, paths } = deps0(deps);
     const wanted = [...new Set((Array.isArray(entries) ? entries : []).filter(nonEmptyString))];
     for (const entry of wanted)
         paths.assertProjectRelative(entry);
@@ -254,15 +254,13 @@ export async function linkIndexPointers(root, entries, deps) {
     const bullets = added.map((entry) => `- [${path.basename(entry, '.json')}](${entry})`).join('\n');
     const heading = index.text.includes(INDEX_HEADING) ? '' : `\n${INDEX_HEADING}\n`;
     const next = `${base}${heading}\n${bullets}\n`;
-    // 原子替换：同目录临时文件 + rename（atomic 模块只提供 JSON 写入，INDEX 是 Markdown）。
+    // 原子替换走 `atomic.writeTextAtomic()`：同目录临时文件 + rename，并统一负责失败清理。
+    // INDEX 是 Markdown，不是 JSON —— 所以用纯文本原子写而不是 `writeJsonAtomic`。
     const target = await paths.assertSafeWriteTarget(root, INDEX_PATH);
-    const temp = path.join(path.dirname(target), `.${process.pid}-${Date.now().toString(16)}.index.tmp`);
     try {
-        await fs.writeFile(temp, Buffer.from(next, 'utf8'));
-        await fs.rename(temp, target);
+        await atomic.writeTextAtomic(target, next);
     }
     catch (error) {
-        await fs.rm?.(temp, { force: true });
         throw new ContractError({
             code: 'PATH_INVALID',
             message: `追加 INDEX 指针失败：${error instanceof Error ? error.message : String(error)}`,

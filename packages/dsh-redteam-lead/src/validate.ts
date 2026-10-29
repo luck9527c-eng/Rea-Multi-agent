@@ -121,6 +121,7 @@ export interface OperationHashContext {
  * 「先做 `isRecord` 判断、原样放行」，所以类型上记作节点不会改变任何运行期行为。
  */
 function asSchemaNode(value: unknown): SchemaNode {
+  // 断言：入参一定来自 `$defs` 条目或 `$ref` 解析结果；布尔 schema 由 isRecord 分支先放行。
   return value as SchemaNode
 }
 
@@ -225,7 +226,9 @@ function patternOf(source: string): RegExp {
  * （只有 `undefined`/函数/Symbol 才返回 `undefined`，那不是本模块的入参）。
  */
 export function canonicalJson(value: unknown): string {
-  return JSON.stringify(sortKeysDeep(value)) as string
+  // 不需要断言：`JSON.stringify(value: any): string` 的签名本来就返回 string，
+  // 而 sortKeysDeep 的输出仍是 JSON 值（对象/数组/原始值），不存在 undefined/函数。
+  return JSON.stringify(sortKeysDeep(value))
 }
 
 function sortKeysDeep(value: unknown): unknown {

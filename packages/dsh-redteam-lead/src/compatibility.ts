@@ -25,6 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isRecord, thrownCode } from './guards.js';
+import { resolveInProject } from './paths.js';
 
 /** 适配器契约版本（binding.json 的 `adapter.contract_version`）。 */
 export const CONTRACT_VERSION = 1;
@@ -156,7 +157,8 @@ async function walk(
 ): Promise<string[]> {
   let entries;
   try {
-    entries = await readdir(path.join(root, ...prefix.split('/').filter(Boolean)), { withFileTypes: true });
+    // 空前缀就是根本身；其余一律走 `paths.resolveInProject`（项目内相对路径的唯一解析器）。
+    entries = await readdir(prefix === '' ? root : resolveInProject(root, prefix), { withFileTypes: true });
   } catch {
     return [];
   }
@@ -177,7 +179,7 @@ async function walk(
 async function hashFiles(root: string, relatives: string[]): Promise<DigestFile[]> {
   const rows: DigestFile[] = [];
   for (const relative of [...relatives].sort()) {
-    const absolute = path.join(root, ...relative.split('/'));
+    const absolute = resolveInProject(root, relative);
     try {
       rows.push({ path: relative, sha256: sha256(await readFile(absolute)) });
     } catch {
@@ -213,7 +215,7 @@ export async function computeDigests(input: ComputeDigestsInput = {}): Promise<D
   const gaps: CompatibilityGap[] = [];
   const skillRoot = input.skillRoot ?? (projectRoot === undefined
     ? undefined
-    : path.join(projectRoot, ...SKILL_COPY_RELATIVE.split('/')));
+    : resolveInProject(projectRoot, SKILL_COPY_RELATIVE));
 
   let ruleFiles: DigestFile[] = [];
   let scriptFiles: DigestFile[] = [];

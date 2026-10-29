@@ -60,12 +60,12 @@ const RECOVERY_SIGNALS = Object.freeze([
 ])
 
 /**
- * 本模块用到的 `deps.fs` 子集：`fs/promises` 的薄封装，外加**可选**的 `rm`
- * （追加 INDEX 失败时要清临时文件；旧的/测试替身 fs 没有 `rm`，故保持可选调用 `fs.rm?.()`）。
+ * 本模块用到的 `deps.fs` 子集：`fs/promises` 的薄封装。
+ *
+ * 写盘一律走 `deps.atomic`（含临时文件清理），所以这里**不需要** `rm`：以前那版把它声明成
+ * 可选并写成 `fs.rm?.()`，可选调用在替身 fs 上静默跳过，会留下临时文件。
  */
-export interface BindingFs extends FsLike {
-  rm?: (target: string, options?: { force?: boolean }) => Promise<void>
-}
+export type BindingFs = FsLike
 
 /**
  * 本模块接受的 `deps`（`ctx.deps` 的一个子集）。
@@ -380,7 +380,7 @@ export interface IndexLinkResult {
 }
 
 export async function linkIndexPointers(root: unknown, entries: unknown, deps?: BindingDeps | null): Promise<IndexLinkResult> {
-  const { fs, paths } = deps0(deps)
+  const { atomic, fs, paths } = deps0(deps)
   const wanted = [...new Set((Array.isArray(entries) ? entries : []).filter(nonEmptyString))]
   for (const entry of wanted) paths.assertProjectRelative(entry)
 
@@ -405,14 +405,12 @@ export async function linkIndexPointers(root: unknown, entries: unknown, deps?: 
   const heading = index.text.includes(INDEX_HEADING) ? '' : `\n${INDEX_HEADING}\n`
   const next = `${base}${heading}\n${bullets}\n`
 
-  // 原子替换：同目录临时文件 + rename（atomic 模块只提供 JSON 写入，INDEX 是 Markdown）。
+  // 原子替换走 `atomic.writeTextAtomic()`：同目录临时文件 + rename，并统一负责失败清理。
+  // INDEX 是 Markdown，不是 JSON —— 所以用纯文本原子写而不是 `writeJsonAtomic`。
   const target = await paths.assertSafeWriteTarget(root, INDEX_PATH)
-  const temp = path.join(path.dirname(target), `.${process.pid}-${Date.now().toString(16)}.index.tmp`)
   try {
-    await fs.writeFile(temp, Buffer.from(next, 'utf8'))
-    await fs.rename(temp, target)
+    await atomic.writeTextAtomic(target, next)
   } catch (error) {
-    await fs.rm?.(temp, { force: true })
     throw new ContractError({
       code: 'PATH_INVALID',
       message: `追加 INDEX 指针失败：${error instanceof Error ? error.message : String(error)}`,

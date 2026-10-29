@@ -448,6 +448,7 @@ function isPositiveInteger(value: unknown): value is number {
  * `isPositiveInteger()` 校验之后，且只有 `problems` 为空才会走到返回值。
  */
 function provenPositive(value: unknown): number {
+  // 断言：调用点紧跟 isPositiveInteger() 校验，且只有 problems 为空才走到这里。
   return value as number;
 }
 
