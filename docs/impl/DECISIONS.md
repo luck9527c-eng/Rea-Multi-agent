@@ -197,3 +197,9 @@ ctx.tools.register() 会用 host 的 ssertSupportedJsonSchema 校验，**支持
 **迁移顺序**：等 T5/T6/T7 的 `.mjs` 实现落地合并后再做（现在是 278 绿用例的安全网在托底），迁移是机械的、不得改行为；T8/T9/T10 直接按 TS 做。
 
 **不得**：不得为了让 TS 编译通过而放宽 `strict` 或加 `any` 兜底；不得在 `src/` 里引入任何运行时依赖。
+
+## D29 — seal 顺序：保持「先 seal 再更新事实」
+
+编排契约 §135 提到「seal 前先按事实解除会令全项目校验失败的旧状态」，而 T7 的实现顺序是 写记录 → seal → 更新事实 → impact → index → check。
+
+**裁决：保持 T7 的顺序。** 把 seal 挪到「更新事实」之后会让**封存的是尚未更新的旧事实**，比它想解决的问题更严重。若旧路线状态本身会让 seal 的全项目校验失败，t_conclude 如实返回 CHECK_FAILED，由 Lead 先按 skill 修正记录再以同一 operation ID 重入 —— **不降门槛、不静默改序**。
