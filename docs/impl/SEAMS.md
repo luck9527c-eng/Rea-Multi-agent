@@ -32,6 +32,15 @@ export async function handleConclude(ctx, input)
 
 `deps.clock`：`{ now(), isoNow() }`；测试可注入假时钟。`deps.fs`：`fs/promises` 的薄封装（测试可注入内存实现），至少含 `readFile/writeFile/rename/mkdir/stat/lstat/readdir/unlink/open`。
 
+### `deps` 的两种形状（已定，别再猜）
+
+| 键 | 形状 |
+|---|---|
+| `envelope`, `errors`, `validate`, `paths`, `atomic`, `lock`, `identity`, `operation`, `audit`, `catalog`, `capability`, `capacity`, `compatibility`, `binding`, `contract`, `resources`, `submission`, `anchors`, `baseline` | **模块命名空间**（`import * as envelope from './envelope.mjs'`），直接用其导出函数 |
+| `teamAdapter`, `projectAdapter` | **工厂函数**：`createTeamAdapter({ services, exec, config, deps })` / `createProjectAdapter({ services, exec, config, deps })`。**每次工具调用新建一次**，把当次的 exec/services/config 绑进去；不跨调用复用实例 |
+
+`identity.resolveCaller(ctx)` 内部用 `ctx.deps.teamAdapter.membership(ctx.exec.agent)` —— 下面 §3 的 `membership(agent)` 是**带 agent 参数**的，§2 里不重复写。
+
 ## 2. `identity`（T1 提供）
 
 ```js
@@ -132,4 +141,6 @@ readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
 |---|---|
 | 成员/任务/名册 | 宿主（`teamAdapter`）；本地只做恢复关联 |
 | `re/team/binding.json`、`roster.json`、`dispatches/`、`receipts/`、`audit.jsonl`、`capabilities.json`、`resources.json`、`lock` | 本插件（`atomic` + `lock`） |
+| `re/team/operations/<operation_id>.json` | 本插件（T1 的 `operation` 台账落盘位置；`$defs.id` 保证文件名安全） |
+| `re/team/capacity.json` | **项目/操作者显式声明**，插件只读（T4 `readDeclaredCapacity`）；插件**不写**它 |
 | `re/targets.json`、`re/routes/`、`re/runs/`、`re/conditions/`、`re/project.json`、`re/env/`、`re/seals/`、`INDEX.md` | 项目 skill（本插件只经 `projectAdapter` 调用，不自己重写算法） |

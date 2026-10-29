@@ -111,3 +111,29 @@ E1 发现：`@deepseek-ai/dsh-tool-subagent-control/list-agents` 这个子路径
 ## D18 — 基线文件的编码
 
 `docs/impl/baseline/*.yml` 必须是 **UTF-8 无 BOM**。最初用 PowerShell 重定向抓的版本是 UTF-16LE，会污染 T2 的手抄副本与任何 `readFileSync(..., 'utf8')`。已修正；T2 若重新生成基线快照，必须显式指定编码。
+
+## D19 — `$defs.rosterData.capacity` 只有 4 个字段，**没有** `known`
+
+schema 是 `additionalProperties:false`，`capacity` 恰好 4 个属性：`remaining_member_slots` / `remaining_activations` / `reserved_member_slots` / `reserved_activations`。T5 的 ticket 里「`capacity`（带 known 标记）」是错的。
+
+**裁决**：**不改 schema**（它是规格数据源）。T5 只投影这 4 个字段，未知用 `null`；`known` 只能在**内部**从 `remaining_* === null` 推导，**不得**写进 `rosterData.capacity`。`planBudget().capacity` 可以带 `known`/`available_*` 供内部与诊断使用，但那是插件内部形状，不是 wire shape。
+
+## D20 — 门禁命令用显式 glob
+
+`cd packages/dsh-redteam-lead; node --test "test/**/*.test.mjs"`。裸 `node --test` 会把 `test/helpers/*.mjs` 当测试文件执行（虚增计数、将来可能产生副作用）；`node --test test` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
+
+## D21 — `ContractError.details` 不可上线
+
+`$defs.diagnostic` 是 `additionalProperties:false` 且恰好 `code/reason/next_step` 三字段。所以 `details` 只作进程内机读用途；**具体对象与 ID 必须写进 `reason`/`next_step` 文本**，否则模型看不到。
+
+## D22 — 未知异常映射
+
+契约表没有 `INTERNAL_ERROR`。`envelope.fromError(非契约错误)` → `code='RECOVERY_REQUIRED'`、`status='error'`（`RECOVERY_REQUIRED` 的默认状态是 `partial`，此处显式覆盖），并允许调用方用 `options.code/status` 覆盖。**不得**把宿主异常字符串当 `code`。
+
+## D23 — 文件级冲突的码
+
+契约表没有「文件已存在且内容不同」。独占创建冲突、`copyVerify`/`verifyFileHash` 哈希不一致，统一用 `OPERATION_CONFLICT`，并在 `next_step` 说明是哪个文件。
+
+## D24 — 两套阶段枚举，不得混用
+
+`$defs.failureData` 的阶段是 `preflight…needs_recovery`（无 `completed`）；编排契约的操作阶段是 `prepared…completed` + `needs_recovery`（无 `preflight`）。两者各留逐字常量（`envelope.FAILURE_PHASES` / `operation.OPERATION_PHASES`），不要互相翻译。

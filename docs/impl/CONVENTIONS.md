@@ -46,7 +46,10 @@
 ## 测试
 
 - 位置：`packages/dsh-redteam-lead/test/<topic>.test.mjs`。
-- 运行：`node --test packages/dsh-redteam-lead/test`（从仓库根）或包内 `node --test test`。
+- **运行（唯一门禁命令）**：`cd packages/dsh-redteam-lead; node --test "test/**/*.test.mjs"`
+  - **不要写 `node --test test`** —— 本机 Node v24.22.1 把位置参数当 glob，不展开目录，会报 `Cannot find module '…\test'`。
+  - **也不要用裸 `node --test`** —— 默认发现规则会连 `test/helpers/*.mjs` 一起当测试文件执行，虚增计数并可能在将来产生副作用。显式 glob 只跑 `*.test.mjs`。
+  - 只跑一层时同理：`node --test "test/l2/*.test.mjs"`。
 - 接缝替身：团队服务用**契约级替身**（`test/helpers/fake-team.mjs`），项目 skill 用**真实 CLI**（L2）或 fake adapter（L1）。替身必须实现已核实的对外契约，不得简化状态机。
 - 临时目录搭项目状态；不在测试里读写真实分析项目。
 - 每个 ticket 交付的测试必须能在**干净 checkout** 上 `node --test` 全绿。
