@@ -928,6 +928,83 @@ test('F1 分界线之前：归档前拒绝 → blocked（尚未写任何正式�
   assert.equal(archived, false, '归档前失败不得留下归档映射')
 })
 
+// ---------------------------------------------------------------------------
+// 路线回写的判据：`changed` = 「受管字段与磁盘上的路线不同」，不是「状态变了」。
+//
+// L3 实测暴露的缺陷（见 docs/verify/records/20261029-session-040cb6df.md 第 6 步第二轮）：
+// finding 落在已经是 active 的路线上时状态不变，但 `evidence` 仍要补进本 RUN。
+// 早期实现按 `from === nextStatus` 判 `changed=false`，调用方于是不写文件 ——
+// 内存里合并好的 evidence 永远不落盘，路线停在 `evidence: []`，而 RUN 已经 seal 并回了回执。
+// 反过来，把 `changed` 一律改成 true 会让每次收口都给路线打戳，所以第三条用例守着「无变化不写」。
+// ---------------------------------------------------------------------------
+
+/** `reviewFixture()` 的默认 reason：用来造一条「除 evidence 外没有任何字段会变」的路线。 */
+const REVIEW_REASON = '观测到 S_OK，并有对照实验'
+
+test('finding 落在已是 active 的路线上 → 已落盘路线补上该 RUN，history 不增长', async (t) => {
+  // 除了 `evidence` 之外，路线的受管字段都与本次 review 一致：
+  // 于是这条用例唯一能变的就是「把 RUN 追加进 evidence」。
+  const route = { ...routeFixture({ status: 'active', evidence: [] }), state_reason: REVIEW_REASON }
+  const fx = await setup(t, {
+    routeOverride: route,
+    proposed: 'active',
+    reviewOverrides: { reason: REVIEW_REASON },
+  })
+  // L3 现场就是「磁盘上已有一条 active + evidence: [] 的路线」。
+  fx.project.write(`re/routes/${ROUTE}.json`, route)
+
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+  assert.equal(envelope.status, 'ok', JSON.stringify(envelope))
+  assert.equal(envelope.data.route_status, 'active')
+
+  const persisted = JSON.parse(await fx.project.read(`re/routes/${ROUTE}.json`))
+  assert.equal(persisted.status, 'active')
+  assert.deepEqual(persisted.evidence, [RUN], '状态没变也必须把本 RUN 落进路线证据')
+  assert.equal(persisted.history.length, route.history.length, '状态没变不得追加 history')
+})
+
+test('真实状态迁移 → 证据与 history 都落盘', async (t) => {
+  const route = routeFixture({ status: 'active', evidence: [] })
+  const fx = await setup(t, { routeOverride: route })
+  fx.project.write(`re/routes/${ROUTE}.json`, route)
+
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+  assert.equal(envelope.status, 'ok', JSON.stringify(envelope))
+
+  const persisted = JSON.parse(await fx.project.read(`re/routes/${ROUTE}.json`))
+  assert.equal(persisted.status, 'validated')
+  assert.deepEqual(persisted.evidence, [RUN])
+  assert.equal(persisted.history.length, route.history.length + 1, '状态真的变了才追加 history')
+  assert.deepEqual(
+    {
+      from: persisted.history.at(-1).from,
+      to: persisted.history.at(-1).to,
+      evidence: persisted.history.at(-1).evidence,
+    },
+    { from: 'active', to: 'validated', evidence: [RUN] },
+  )
+})
+
+test('无变化的收口不重写路线文件（不无条件打戳）', async (t) => {
+  const route = { ...routeFixture({ status: 'active', evidence: [RUN] }), state_reason: REVIEW_REASON }
+  const fx = await setup(t, {
+    routeOverride: route,
+    proposed: 'active',
+    reviewOverrides: { reason: REVIEW_REASON },
+  })
+  // `writeJsonAtomic()` 落盘时会在末尾补一个换行；这里故意写成**没有**结尾换行，
+  // 于是「字节没变且仍然没有结尾换行」就是「这一次没有重写路线」的判据。
+  fx.project.write(`re/routes/${ROUTE}.json`, route)
+  const before = await fx.project.read(`re/routes/${ROUTE}.json`)
+
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+  assert.equal(envelope.status, 'ok', JSON.stringify(envelope))
+
+  const after = await fx.project.read(`re/routes/${ROUTE}.json`)
+  assert.equal(after, before, '没有任何受管字段变化时不得重写路线文件')
+  assert.equal(JSON.parse(after).history.length, route.history.length)
+})
+
 test('F1 分界线之后：归档完成、seal 之前失败 → partial（正式 re/runs/** 字节已落）', async (t) => {
   const fx = await setup(t)
   // 归档是步骤 4；删掉派发时冻结的基准快照，让紧随其后的 loadBaseline 失败。

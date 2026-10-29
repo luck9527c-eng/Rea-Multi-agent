@@ -856,9 +856,22 @@ type RouteUpdateResult =
   | { ok: false; code: 'CHECK_FAILED'; issues: Diagnostic[] }
 
 /**
+ * 收口**受管**的路线字段：本模块只会改这些键，`changed` 也只看这些键。
+ *
+ * 其余键（`id`/`question`/`experiment`/`budget`/…）靠 `{...route}` 原样带回，不参与判定。
+ */
+const MANAGED_ROUTE_FIELDS = Object.freeze(['status', 'evidence', 'state_reason', 'resume_when', 'closure'] as const)
+
+/**
  * 依据 review 生成路线更新（history / closure / evidence / state_reason）。
  *
  * 只写 review 有依据的判定：不臆造 closure 里的实验事实（缺就拒绝，见 `closureForStatus`）。
+ *
+ * 两个返回位分得很开，调用方不要混用：
+ * - `historyAppended`：**只**随真实状态迁移为真（`from !== nextStatus`）；
+ * - `changed`：任一受管字段（`MANAGED_ROUTE_FIELDS`）与入参路线不同即为真 ——
+ *   状态没变但 `evidence`/`state_reason`/`resume_when`/`closure` 变了，也必须落盘。
+ *   也不得恒为真：那样每次收口都会给路线文件打一次戳（有专门用例守着）。
  *
  * @returns {{ok:true, route:object, changed:boolean, historyAppended:boolean}
  *   | {ok:false, code:'CHECK_FAILED', issues:object[]}}
@@ -905,8 +918,17 @@ export function buildRouteUpdate({ route, review, nextStatus, at }: RouteUpdateI
     closure: closureResult.closure,
   }
 
+  /* ---- 「改了什么」与「要不要落盘」是两件事 ------------------------------ */
   if (from === nextStatus) {
-    return { ok: true, route: updated, changed: false, historyAppended: false }
+    // 状态没变 → 不追加 history（history 只记真实的 status 迁移）。
+    // 但「history 要不要长」与「文件要不要写」是两个问题：任一**受管字段**与磁盘上的路线不同就得写 ——
+    // finding 落在已经是 active 的路线上时状态不变，`evidence` 却要补进本 RUN。
+    // 早期版本在这里直接返回 `changed:false`，于是内存里合并好的证据永远不落盘
+    //（L3 实测：路线 `active` + `evidence: []`，而 RUN 已 seal 并回执）。
+    const managedChanged = MANAGED_ROUTE_FIELDS.some(
+      (key) => validateModule.canonicalJson(route[key]) !== validateModule.canonicalJson(updated[key]),
+    )
+    return { ok: true, route: updated, changed: managedChanged, historyAppended: false }
   }
 
   const history: unknown[] = Array.isArray(route.history) ? [...route.history] : []
