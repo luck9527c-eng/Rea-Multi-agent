@@ -1,18 +1,21 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { ContractError } from '../dist/errors.js'
 import {
   DEFAULT_REPLACE_ATTEMPTS,
   TRANSIENT_REPLACE_CODES,
+  appendLine,
   copyVerify,
   createExclusive,
   sha256Bytes,
   sha256File,
+  tryCreateExclusive,
   verifyFileHash,
   writeJsonAtomic,
+  writeTextAtomic,
 } from '../dist/atomic.js'
 import { makeTempProject } from './helpers/tmp.mjs'
 
@@ -73,8 +76,84 @@ test('writeJsonAtomic 原子替换旧内容且不残留临时文件', async () =
   }
 })
 
-test('createExclusive 首次创建成功，相同内容再次创建不覆盖', async () => {
+test('writeTextAtomic 原子写纯文本：字节原样、不留临时文件、可整体替换旧内容', async () => {
   const project = await makeTempProject()
+  try {
+    const dir = join(project.root, 're', 'team')
+    const file = join(dir, 'INDEX.md')
+    const text = '# INDEX\n\n- 手写区：不要动我\n- [binding](re/team/binding.json)\n'
+
+    const result = await writeTextAtomic(file, text)
+    assert.equal(await readFile(file, 'utf8'), text, '写入的字节必须与入参逐字一致')
+    assert.equal(result.path, file)
+    assert.equal(result.sha256, sha256Bytes(Buffer.from(text, 'utf8')))
+    assert.equal(result.bytes, Buffer.byteLength(text))
+    assert.deepEqual(await readdir(dir), ['INDEX.md'], '不应残留临时文件')
+
+    // 第二次写入必须整体替换（不是追加），且旧内容不残留。
+    await writeTextAtomic(file, '# INDEX\n')
+    assert.equal(await readFile(file, 'utf8'), '# INDEX\n')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('writeTextAtomic 失败时用真实的 rm 清掉临时文件（不能 await 一个不存在的可选方法）', async () => {
+  const project = await makeTempProject()
+  try {
+    const dir = join(project.root, 're', 'team')
+    const file = join(dir, 'INDEX.md')
+    const boom = transientError('EPERM')
+    const { io } = countingIo({ rename: async () => { throw boom } })
+
+    await assert.rejects(() => writeTextAtomic(file, 'x\n', { io, sleep: async () => {} }), (error) => error === boom)
+    assert.deepEqual(await readdir(dir), [], '失败后不得残留临时文件')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('appendLine 追加到末尾：不重写既有字节，自动补换行与父目录', async () => {
+  const project = await makeTempProject({ segments: [] })
+  try {
+    const file = join(project.root, 're', 'team', 'audit.jsonl')
+    await appendLine(file, '{"n":1}')
+
+    const second = await appendLine(file, '{"n":2}\n')
+    assert.equal(await readFile(file, 'utf8'), '{"n":1}\n{"n":2}\n', '每行恰好一个换行，既有字节不动')
+    assert.equal(second.bytes, Buffer.byteLength('{"n":2}\n'))
+    assert.deepEqual(await readdir(join(project.root, 're', 'team')), ['audit.jsonl'], 'append 不产生临时文件')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('tryCreateExclusive 已存在即 false：不读取、不比较、不覆盖（锁用的原语）', async () => {
+  const project = await makeTempProject()
+  try {
+    const dir = join(project.root, 're', 'team')
+    const file = join(dir, 'lock')
+    assert.equal(await tryCreateExclusive(file, '{"owner_nonce":"a"}\n'), true, '首次应创建成功')
+
+    // 已存在 → false，而且**不应该**为了比较内容去读那个文件（读会抛）。
+    const io = {
+      appendFile,
+      mkdir,
+      rename,
+      rm,
+      writeFile,
+      readFile: async () => {
+        throw new Error('已存在时不得读取锁文件')
+      },
+    }
+    assert.equal(await tryCreateExclusive(file, '{"owner_nonce":"b"}\n', { io }), false)
+    assert.equal(await readFile(file, 'utf8'), '{"owner_nonce":"a"}\n', '已存在的字节不得被覆盖')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('createExclusive 首次创建成功，相同内容再次创建不覆盖', async () => {  const project = await makeTempProject()
   try {
     const file = join(project.root, 're', 'team', 'seals', 'RUN-1.json')
     const first = await createExclusive(file, '{"sealed":true}\n')

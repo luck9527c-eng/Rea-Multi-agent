@@ -11,10 +11,12 @@
  * 崩溃后未完成操作先恢复；损坏的锁内容视为 `RECOVERY_REQUIRED`，不能当「没锁」继续。
  */
 import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join } from 'node:path';
+import { readFile, unlink } from 'node:fs/promises';
+import { isAbsolute } from 'node:path';
+import { tryCreateExclusive } from './atomic.js';
 import { ContractError } from './errors.js';
 import { isRecord, thrownCode } from './guards.js';
+import { resolveInProject } from './paths.js';
 /** 项目内锁路径（统一 `/`）。 */
 export const LOCK_PATH = 're/team/lock';
 /** 进程启动身份允许的抖动（毫秒）：不同平台读取精度不同。 */
@@ -22,7 +24,7 @@ const START_TOLERANCE_MS = 1000;
 /** `$defs.id` */
 const OPERATION_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,95}$/;
 function lockPathOf(root) {
-    return join(root, ...LOCK_PATH.split('/'));
+    return resolveInProject(root, LOCK_PATH);
 }
 function invalid(message, nextStep) {
     return new ContractError({ code: 'INVALID_ARGUMENT', message, nextStep });
@@ -193,13 +195,10 @@ export async function acquire(root, options = {}) {
         expires_at: typeof ttlMs === 'number' ? new Date(nowMs + ttlMs).toISOString() : null,
     };
     const lockPath = lockPathOf(root);
-    await mkdir(dirname(lockPath), { recursive: true });
-    try {
-        await writeFile(lockPath, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
-    }
-    catch (error) {
-        if (thrownCode(error) !== 'EEXIST')
-            throw error;
+    // 独占创建走 `atomic.tryCreateExclusive()`（`O_EXCL` + 瞬时错误有界重试，EEXIST 不重试）。
+    // 锁的「已存在」永远是冲突信号：不读回内容比较，直接按 PROJECT_BUSY 报告持有者。
+    const created = await tryCreateExclusive(lockPath, `${JSON.stringify(record, null, 2)}\n`);
+    if (!created) {
         const holder = await readLock(root); // 损坏时抛出 RECOVERY_REQUIRED：绝不当成没锁
         throw new ContractError({
             code: 'PROJECT_BUSY',
