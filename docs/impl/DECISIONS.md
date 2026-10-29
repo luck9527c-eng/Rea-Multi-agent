@@ -79,3 +79,61 @@ skill 侧**没有**生成命令，本机**零个真实实例**；唯一具体样
 ## D12 — 失败成员的席位语义
 
 一次失败 spawn 会烧掉名字 + 席位。因此 `rt_dispatch`：**先**查名字唯一性与已用席位、**再** spawn；spawn 失败后必须把该成员记成 `failed` 并计入已用席位，**不得**用同名重试。
+
+## D13 — 目标构建 = 已安装的 rc.3，E1 报的「fatal difference」对我们是无操作
+
+E1 发现：`@deepseek-ai/dsh-tool-subagent-control/list-agents` 这个子路径在 rc.3 存在、在 0.2.2 已移除；`mountPreset()` 会因**任何一行**起不来而把**整个 preset** 标成 broken。所以「保留 `tool-subagent-list-agents` 行」是致命的。
+
+**对本设计无影响**：规格本来就要求**删掉这两行**（`tool-subagent-control` 与 `tool-subagent-list-agents`），因为它们提供的 `send_message`/`interrupt_agent`/`list_agents` 与团队服务按 Agent 注册的同名工具冲突。删掉之后我们**不引用任何 `.../list-agents` 子路径**，两种构建都不会因为这一行炸掉。
+
+同理 `modelSelectionSettings: true`（rc.3）vs `modelSelection/modelDiscovery`（0.2.2）：我们基线取自 **rc.3**，保留 rc.3 的写法。目标构建是已安装的 rc.3，不追主线。
+
+## D14 — patch 失败是**静默的**，所以必须有 id 清单测试
+
+`applyEntryPatches` 对 name 不匹配、目标行缺失都是 **WARN + SKIP**，不报错。因此「patch 写错一个插件名」的表现是**什么都没发生**，不是挂载失败。
+
+**强制**：`test/bundle.test.mjs` 必须解析出 preset 的最终 plugin id 列表，并断言它 **等于** `docs/impl/baseline/standard.patch.rc3.yml` 的列表 − `{tool-subagent-control, tool-subagent-list-agents}` + `{redteam-lead-tools}`。不能只断言"文件里有这些行"。
+
+## D15 — `output` 是强制的，且返回值就是规范的 JSON 值
+
+`ctx.tools.register()` 缺 `output` 直接抛 `TypeError`。`execute` 返回**一个**符合 `output.schema` 的 JSON 值（不是 `{ok}`、不是 content block）：宿主无损快照 → 校验 → 冻结 → 交给 `render(args, value)`。所以我们的 `result` 信封**就是**那个返回值；`render` 必须纯、必须全能、必须返回 `[{type:'text',text}]` 且绝不抛。
+
+原始 JSON Schema 的工具**没有**入参自动校验（那是 `defineTool` 的能力，我们 import 不到），所以入参校验完全由本包负责。
+
+## D16 — locale / icon 的硬要求
+
+`<specifier>/locale/en.json` 锚定目录，随后**每个**同名 `*.json` 都会通过 `exports` 解析——所以 `exports` 必须包含 `"./locale/*.json"`，且 `locale/` 下每个文件都要能被解析。只读 `meta.title` / `meta.description`（必须非空）。`icon` 经 `"./icon"` 导出或 `package.json` 的 `icon` 字段，**≤ 256 KiB** 且在包内。**工具描述不做本地化**——不要为工具名/描述写 locale 条目。
+
+## D17 — 插件入口只允许具名导出
+
+`export const name`、`export const inject = ['tools']`、`export function apply(ctx, config)`，**没有 default export**；`ctx.tools.register(...)` 必须在 `apply` 内调用，让 fiber 拥有 disposer。`inject` 只放**硬依赖**（`tools`）；`agentTeams`/`agentPresets`/`subagents` 一律用 `ctx.get('x')` 探针 + 降级——本 Cordis **没有** `inject: { optional }` 这种形态。
+
+## D18 — 基线文件的编码
+
+`docs/impl/baseline/*.yml` 必须是 **UTF-8 无 BOM**。最初用 PowerShell 重定向抓的版本是 UTF-16LE，会污染 T2 的手抄副本与任何 `readFileSync(..., 'utf8')`。已修正；T2 若重新生成基线快照，必须显式指定编码。
+
+## D19 — `$defs.rosterData.capacity` 只有 4 个字段，**没有** `known`
+
+schema 是 `additionalProperties:false`，`capacity` 恰好 4 个属性：`remaining_member_slots` / `remaining_activations` / `reserved_member_slots` / `reserved_activations`。T5 的 ticket 里「`capacity`（带 known 标记）」是错的。
+
+**裁决**：**不改 schema**（它是规格数据源）。T5 只投影这 4 个字段，未知用 `null`；`known` 只能在**内部**从 `remaining_* === null` 推导，**不得**写进 `rosterData.capacity`。`planBudget().capacity` 可以带 `known`/`available_*` 供内部与诊断使用，但那是插件内部形状，不是 wire shape。
+
+## D20 — 门禁命令用显式 glob
+
+`cd packages/dsh-redteam-lead; node --test "test/**/*.test.mjs"`。裸 `node --test` 会把 `test/helpers/*.mjs` 当测试文件执行（虚增计数、将来可能产生副作用）；`node --test test` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
+
+## D21 — `ContractError.details` 不可上线
+
+`$defs.diagnostic` 是 `additionalProperties:false` 且恰好 `code/reason/next_step` 三字段。所以 `details` 只作进程内机读用途；**具体对象与 ID 必须写进 `reason`/`next_step` 文本**，否则模型看不到。
+
+## D22 — 未知异常映射
+
+契约表没有 `INTERNAL_ERROR`。`envelope.fromError(非契约错误)` → `code='RECOVERY_REQUIRED'`、`status='error'`（`RECOVERY_REQUIRED` 的默认状态是 `partial`，此处显式覆盖），并允许调用方用 `options.code/status` 覆盖。**不得**把宿主异常字符串当 `code`。
+
+## D23 — 文件级冲突的码
+
+契约表没有「文件已存在且内容不同」。独占创建冲突、`copyVerify`/`verifyFileHash` 哈希不一致，统一用 `OPERATION_CONFLICT`，并在 `next_step` 说明是哪个文件。
+
+## D24 — 两套阶段枚举，不得混用
+
+`$defs.failureData` 的阶段是 `preflight…needs_recovery`（无 `completed`）；编排契约的操作阶段是 `prepared…completed` + `needs_recovery`（无 `preflight`）。两者各留逐字常量（`envelope.FAILURE_PHASES` / `operation.OPERATION_PHASES`），不要互相翻译。
