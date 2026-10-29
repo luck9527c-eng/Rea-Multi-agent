@@ -296,6 +296,35 @@ test('缺 --profile：退出码 1，报 INVALID_ARGUMENT 并给出用法', async
   assert.ok(run.envelope.diagnostics[0].next_step.includes('--profile'))
 })
 
+test('--help 退出 0 并打印用法；未知参数退出 1 且不静默忽略', () => {
+  const help = runDoctor(['--help'])
+  assert.equal(help.status, 0, help.stdout)
+  assertEnvelopeShape(help.envelope)
+  assert.equal(help.envelope.status, 'ok')
+  assert.match(help.envelope.data.usage, /--profile/)
+
+  const bogus = runDoctor(['--nonsense'])
+  assert.equal(bogus.status, 1)
+  assertEnvelopeShape(bogus.envelope)
+  assert.equal(bogus.envelope.status, 'error')
+  assert.equal(bogus.envelope.code, 'INVALID_ARGUMENT')
+  assert.match(bogus.envelope.diagnostics[0].reason, /--nonsense/)
+})
+
+test('--bundle 指向不存在的目录：退出码 1，诊断点名路径', async () => {
+  await withTemp('doctor-nobundle-', async (root) => {
+    const profile = await makeProfile(join(root, 'profile'))
+    const project = await makeProject(join(root, 'project'))
+    const missing = join(root, 'no-such-bundle')
+
+    const run = runDoctor(['--bundle', missing, '--profile', profile, '--project', project])
+    assert.equal(run.status, 1, run.stdout)
+    assertEnvelopeShape(run.envelope)
+    assert.equal(run.envelope.data.bundle.manifest_ok, false)
+    assert.ok(textOf(run.envelope).includes(missing), '诊断必须点名不存在的 bundle 路径')
+  })
+})
+
 test('doctor 只依赖 node 内建与 T2 自己的 doctor 模块（不 import index.js / 适配器）', async () => {
   for (const relative of [join('bin', 'doctor.mjs'), join('src', 'doctor.mjs')]) {
     const text = await readFile(join(PACKAGE_ROOT, relative), 'utf8')

@@ -60,11 +60,15 @@ function scalar(text) {
 
 /**
  * 解析块序列 / 块映射 / 标量 / 块标量的 YAML 子集。
+ *
+ * 块标量的内容在**分词阶段**就整段收进 token，所以块标量里的空行与以 `#` 开头的行
+ * （例如人设里的 `## 共同准则`）不会被误当成注释丢掉。
+ *
  * @param {string} text patch 文件内容
  * @returns {unknown} 顶层节点
  */
 export function parsePatchYaml(text) {
-  /** @type {Array<{indent: number, body: string, line: number}>} */
+  /** @type {Array<{indent: number, body: string, line: number, block?: string[]}>} */
   const lines = []
   const raw = text.replace(/^\uFEFF/, '').split(/\r?\n/)
   for (let index = 0; index < raw.length; index += 1) {
@@ -73,7 +77,29 @@ export function parsePatchYaml(text) {
     if (line.trimStart().startsWith('#')) continue
     const indent = line.length - line.trimStart().length
     if (line.slice(0, indent).includes('\t')) throw new Error(`第 ${index + 1} 行含制表符缩进`)
-    lines.push({ indent, body: line.slice(indent), line: index + 1 })
+    const token = { indent, body: line.slice(indent), line: index + 1 }
+    // 块标量指示符（`|` / `|-` / `>`）：把后续更深缩进的行原样收进本 token。
+    if (BLOCK_SCALAR.test(token.body.slice(token.body.indexOf(':') + 1).trim())) {
+      const block = []
+      let contentIndent
+      let cursor = index + 1
+      while (cursor < raw.length) {
+        const next = raw[cursor]
+        if (next.trim().length === 0) {
+          block.push('')
+          cursor += 1
+          continue
+        }
+        const nextIndent = next.length - next.trimStart().length
+        if (nextIndent <= indent) break
+        if (contentIndent === undefined) contentIndent = nextIndent
+        block.push(next.slice(contentIndent))
+        cursor += 1
+      }
+      token.block = block
+      index = cursor - 1
+    }
+    lines.push(token)
   }
 
   let cursor = 0
@@ -81,16 +107,6 @@ export function parsePatchYaml(text) {
   const fail = (message) => {
     const line = peek()
     throw new Error(`YAML 子集解析失败（第 ${line?.line ?? 'EOF'} 行）：${message}`)
-  }
-
-  /** 消费一个块标量：后续缩进更深的行原样拼接。 */
-  const blockScalar = (indent) => {
-    const parts = []
-    while (cursor < lines.length && lines[cursor].indent > indent) {
-      parts.push(lines[cursor].body)
-      cursor += 1
-    }
-    return parts.join('\n')
   }
 
   const assign = (map, key, rest, keyIndent) => {
@@ -102,7 +118,9 @@ export function parsePatchYaml(text) {
       return
     }
     if (BLOCK_SCALAR.test(rest.trim())) {
-      map[key] = blockScalar(keyIndent)
+      // 块标量的内容已在分词阶段挂在 token.block 上；这里只取出来。
+      const owner = lines[cursor - 1]
+      map[key] = Array.isArray(owner?.block) ? owner.block.join('\n') : ''
       return
     }
     map[key] = scalar(rest)
@@ -368,6 +386,8 @@ test('persona 行：complete=false（否则吃掉 team:policy 段）、带 runti
   for (const phrase of ['锚点', '未验证推测', '缺']) {
     assert.ok(persona.config.prefix.includes(phrase), `人设必须包含共同准则关键词：${phrase}`)
   }
+  // 块标量里的标题行不能被当成 YAML 注释吃掉（解析器的回归点）
+  assert.ok(persona.config.prefix.includes('## 共同准则'), 'persona 的块标量内容必须完整解析')
 })
 
 test('patch 里没有 sandbox / approval 声明（服务泄漏会让整棵 preset broken）', () => {
