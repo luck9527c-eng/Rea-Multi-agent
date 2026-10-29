@@ -88,7 +88,7 @@ test('容量只来自显式声明：project 文件 / profile config / 都没有'
   assert.equal(unknown.evidence.source, 'unavailable');
 });
 
-test('工具可见性按 agent 名字区分（T5 的 vacant 判定要用）', (t) => {
+test('工具可见性按 agent 名字区分（T5 的 vacant 判定要用），且返回宿主真实形状', (t) => {
   const ctx = makeCtx({
     t,
     tools: {
@@ -96,8 +96,12 @@ test('工具可见性按 agent 名字区分（T5 的 vacant 判定要用）', (t
       'rt-scout': { rea_inspect: { type: 'object' } },
     },
   });
+  // 宿主 `schemas(scope)` 返回的是 schema 对象数组，工具名在元素的 `.name` 上（不是按名字为键的对象）。
+  const schemas = ctx.services.tools.schemas(ctx.exec.agent);
+  assert.ok(Array.isArray(schemas), '替身的 schemas() 必须返回数组（宿主真实形状）');
+  assert.deepEqual(schemas.map((schema) => schema.name).sort(), ['rea_inspect', 'rt_roster']);
   assert.deepEqual(ctx.services.tools.names(ctx.exec.agent).sort(), ['rea_inspect', 'rt_roster']);
-  assert.equal(ctx.services.tools.get('rt_roster', ctx.exec.agent).type, 'object');
+  assert.equal(ctx.services.tools.get('rt_roster', ctx.exec.agent).name, 'rt_roster');
   assert.equal(ctx.services.tools.get('rt_roster', { name: 'rt-scout' }), null);
 });
 
@@ -140,6 +144,7 @@ test('makeTempProject 写出 index/config/skill 副本，files:null 可删默认
 
 test('makeFakeTools 默认空集，get 不到就是 null', (t) => {
   const tools = makeFakeTools();
-  assert.deepEqual(tools.schemas({ name: 'lead' }), {});
+  // 空集必须是空**数组**：宿主 `schemas()` 的形状就是数组，`{}` 会把错的契约再教一遍。
+  assert.deepEqual(tools.schemas({ name: 'lead' }), []);
   assert.equal(tools.get('rt_roster', { name: 'lead' }), null);
 });

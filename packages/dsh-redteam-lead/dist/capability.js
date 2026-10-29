@@ -198,6 +198,70 @@ function checkProvider(provider, toolNames, inventory) {
     return { ok: true, provider: cloneProvider(provider) };
 }
 /**
+ * 从一个条目里读工具名：`{name}`（宿主 schema 的真实形状）或 `{function:{name}}` 变体。
+ * 认不出来 → null（调用方丢弃这一项；字符串元素不算条目）。
+ */
+function toolNameOfEntry(entry) {
+    if (!isRecord(entry) || Array.isArray(entry))
+        return null;
+    if (isNonEmptyString(entry.name))
+        return entry.name;
+    const fn = entry.function;
+    if (isRecord(fn) && !Array.isArray(fn) && isNonEmptyString(fn.name))
+        return fn.name;
+    return null;
+}
+/** 去重 + 排序，作为 `toolNamesFromSchemas()` 的稳定输出。 */
+function sortedNames(candidates) {
+    const names = new Set();
+    for (const candidate of candidates) {
+        if (candidate !== null)
+            names.add(candidate);
+    }
+    return [...names].sort();
+}
+/**
+ * 是否实现了迭代协议（`Set`/generator/自定义可迭代）。
+ *
+ * 用 `Reflect.get` 读 `Symbol.iterator`：`Record<string, unknown>` 没有符号索引签名，
+ * 直接 `value[Symbol.iterator]` 在 strict 下读不出来。
+ */
+function isIterable(value) {
+    return isRecord(value) && typeof Reflect.get(value, Symbol.iterator) === 'function';
+}
+/**
+ * `tools.schemas(agent)` 的返回值 → 完整工具名集合（去重、排序）。
+ *
+ * 宿主真实形状是**schema 对象数组**（`_dsh-tools.js` 的 `schemas(scope)` 对每个可见定义
+ * 调 `schemaOf()`，名字在元素的 `.name` 上）。旧实现对这个返回值做 `Object.keys()`，
+ * 数组上只会得到 `["0","1",…]`：能力族永远判缺失，真会话里任何派发都被 `CAPABILITY_MISSING`
+ * 拒（T15）。因此这里的规则是「先按条目取名字，再谈容器」：
+ *
+ * 1. 值本身就是一个条目（`{name}` / `{function:{name}}`，即单个 schema）→ 单个名字；
+ * 2. 数组 → 逐个元素取 `.name`（**绝不** `Object.keys` 数组）；
+ * 3. 任意可迭代（`Set`/generator…）→ 逐项取 `.name`；
+ * 4. 按名字为键的对象（测试替身与旧形状）→ 键；
+ * 5. 其余（null/数字/字符串/没有名字的条目）→ 空集：保持「未核对」降级语义，**不抛**。
+ *
+ * 空集有两种含义（零个可见工具 / 认不出来的形状），由调用方按容器形状区分，见
+ * `roster.ts` 的 `toolsFor()`。
+ *
+ * @param schemas `ctx.services.tools.schemas(agent)` 的原始返回值（未知形状）
+ * @returns 去重并排序的完整工具名
+ */
+export function toolNamesFromSchemas(schemas) {
+    const direct = toolNameOfEntry(schemas);
+    if (direct !== null)
+        return [direct];
+    if (Array.isArray(schemas))
+        return sortedNames(schemas.map((entry) => toolNameOfEntry(entry)));
+    if (isIterable(schemas))
+        return sortedNames([...schemas].map((entry) => toolNameOfEntry(entry)));
+    if (isRecord(schemas))
+        return sortedNames(Object.keys(schemas));
+    return [];
+}
+/**
  * 能力匹配纯函数。
  *
  * @param needs 岗位 required 与任务 capability_needs 的并集（可含 mcp:<server>）
