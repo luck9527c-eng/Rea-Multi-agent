@@ -141,4 +141,6 @@ readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
 |---|---|
 | 成员/任务/名册 | 宿主（`teamAdapter`）；本地只做恢复关联 |
 | `re/team/binding.json`、`roster.json`、`dispatches/`、`receipts/`、`audit.jsonl`、`capabilities.json`、`resources.json`、`lock` | 本插件（`atomic` + `lock`） |
+| `re/team/operations/<operation_id>.json` | 本插件（T1 的 `operation` 台账落盘位置；`$defs.id` 保证文件名安全） |
+| `re/team/capacity.json` | **项目/操作者显式声明**，插件只读（T4 `readDeclaredCapacity`）；插件**不写**它 |
 | `re/targets.json`、`re/routes/`、`re/runs/`、`re/conditions/`、`re/project.json`、`re/env/`、`re/seals/`、`INDEX.md` | 项目 skill（本插件只经 `projectAdapter` 调用，不自己重写算法） |
