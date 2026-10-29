@@ -32,6 +32,23 @@ export async function handleConclude(ctx, input)
 
 `deps.clock`：`{ now(), isoNow() }`；测试可注入假时钟。`deps.fs`：`fs/promises` 的薄封装（测试可注入内存实现），至少含 `readFile/writeFile/rename/mkdir/stat/lstat/readdir/unlink/open`。
 
+### `ctx.services.tools`（宿主可选注入；T5/T6 只用来核对「执行者实际可见的工具名」）
+
+```js
+const tools = {
+  schemas(agent),   // → [{ name, description, parameters }, …]（**数组**，工具名在元素的 .name 上）
+  get(name, agent), // → 该工具的定义（含 name/parameters/execute）；不可见时 undefined
+}
+```
+
+`schemas()` 返回的是 **schema 对象数组**，**不是**「按名字为键的对象」：宿主 `dsh-tools` 的实现是
+`schemas(scope) { return [...visible.values()].map((d) => this.schemaOf(d, true)) }`，而 `schemaOf()`
+投影出 `{name, description, parameters}`（`run_code` 绑定循环也印证：`for (const schema of registry.schemas(exec.agent)) { … schema.name … }`）。
+对数组做 `Object.keys()` 只会得到 `["0","1",…]` —— T15 的 P0 就是替身按错的形状建模、真会话里
+每个能力族都判缺失、任何派发都被 `CAPABILITY_MISSING` 拒。名字解析**统一**走
+`capability.toolNamesFromSchemas()`（数组／`{function:{name}}` 变体／按名字为键的旧形状／任意可迭代；
+认不出一律给空集，不抛），不要在调用点再自己读一遍形状。
+
 ### `deps` 的两种形状（已定，别再猜）
 
 | 键 | 形状 |
