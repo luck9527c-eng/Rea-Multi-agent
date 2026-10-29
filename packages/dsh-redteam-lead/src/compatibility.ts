@@ -24,6 +24,8 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isRecord, thrownCode } from './guards.js';
+
 /** 适配器契约版本（binding.json 的 `adapter.contract_version`）。 */
 export const CONTRACT_VERSION = 1;
 
@@ -35,11 +37,97 @@ const REPO_ROOT = path.resolve(PACKAGE_ROOT, '..', '..');
 
 const SKIP_DIRECTORIES = new Set(['__pycache__', '.git', 'node_modules']);
 
-function sha256(buffer) {
+/** 摘要覆盖不到的地方（缺副本、缺目录、缺岗位目录）。 */
+export interface CompatibilityGap {
+  code: string;
+  detail: string;
+  nextStep: string;
+}
+
+/** 被摘要覆盖的一个文件：项目内相对路径（`/` 分隔）+ 小写 sha256。 */
+export interface DigestFile {
+  path: string;
+  sha256: string;
+}
+
+/** 岗位目录文件的物理身份（绝对路径 + 摘要）。 */
+export interface CatalogIdentity {
+  path: string;
+  sha256: string;
+}
+
+/** `computeDigests()` 的产物：三个摘要 + 覆盖清单 + 缺口。 */
+export interface Digests {
+  ruleDigest: string | null;
+  scriptDigest: string | null;
+  catalogDigest: string | null;
+  files: { rule: DigestFile[]; script: DigestFile[]; catalog: CatalogIdentity | null };
+  gaps: CompatibilityGap[];
+}
+
+/** `computeDigests()` 的入参（三个都可缺；缺 projectRoot 时只会留下缺口）。 */
+export interface ComputeDigestsInput {
+  projectRoot?: string;
+  catalogPath?: string;
+  skillRoot?: string;
+}
+
+/** 摘要键（与 `digests[key]` 的三字段一一对应）。 */
+export type DigestKey = 'ruleDigest' | 'scriptDigest' | 'catalogDigest';
+
+/** 三个摘要键的固定顺序（原来用 `Object.keys(BINDING_KEYS)`，顺序必须一致）。 */
+const DIGEST_KEYS: readonly DigestKey[] = ['ruleDigest', 'scriptDigest', 'catalogDigest'];
+
+/** `re/team/binding.json` 的读取结果：要么有对象，要么明说为什么没有。 */
+export type BindingRead =
+  | { present: true; binding: Record<string, unknown>; path: string; reason?: string }
+  | { present: false; binding: null; path: string; reason?: string };
+
+/** 一个摘要键的 declared/actual 对照。 */
+export interface DigestDifference {
+  key: DigestKey;
+  declared: unknown;
+  actual: string | null;
+}
+
+/** `binding` 投影（`checkCompatibility()` 的 `binding` 字段）。 */
+export interface BindingProjection {
+  present: boolean;
+  path: string;
+  matched: boolean;
+  differences: DigestDifference[];
+  reason?: string;
+  adapter_contract_version: unknown;
+}
+
+/** 兼容性信号闭集（只报告，不静默替换副本）。 */
+export type BindingSignal = 'BINDING_MISSING' | 'BINDING_MATCH' | 'REBIND_REQUIRED';
+
+/** `checkCompatibility()` 的产物。 */
+export interface CompatibilityReport {
+  contract_version: number;
+  digests: Digests;
+  gaps: CompatibilityGap[];
+  binding: BindingProjection;
+  needsReview: boolean;
+  signal: BindingSignal;
+  nextStep?: string;
+  differences?: DigestDifference[];
+}
+
+/** `checkCompatibility()` 的入参：显式传入的 `binding` 优先于读文件。 */
+export interface CheckCompatibilityInput {
+  projectRoot?: string;
+  binding?: Record<string, unknown>;
+  catalogPath?: string;
+}
+
+/** @param {Buffer} buffer 字节 */
+function sha256(buffer: Uint8Array): string {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
-async function isDirectory(target) {
+async function isDirectory(target: string): Promise<boolean> {
   try {
     return (await stat(target)).isDirectory();
   } catch {
@@ -47,7 +135,7 @@ async function isDirectory(target) {
   }
 }
 
-async function isFile(target) {
+async function isFile(target: string): Promise<boolean> {
   try {
     return (await stat(target)).isFile();
   } catch {
@@ -61,14 +149,18 @@ async function isFile(target) {
  * @param {string} [prefix] 相对前缀
  * @param {(relative: string) => boolean} [accept] 过滤
  */
-async function walk(root, prefix = '', accept = () => true) {
+async function walk(
+  root: string,
+  prefix = '',
+  accept: (relative: string) => boolean = () => true,
+): Promise<string[]> {
   let entries;
   try {
     entries = await readdir(path.join(root, ...prefix.split('/').filter(Boolean)), { withFileTypes: true });
   } catch {
     return [];
   }
-  const files = [];
+  const files: string[] = [];
   for (const entry of entries) {
     if (entry.isDirectory()) {
       if (SKIP_DIRECTORIES.has(entry.name)) continue;
@@ -82,8 +174,8 @@ async function walk(root, prefix = '', accept = () => true) {
   return files;
 }
 
-async function hashFiles(root, relatives) {
-  const rows = [];
+async function hashFiles(root: string, relatives: string[]): Promise<DigestFile[]> {
+  const rows: DigestFile[] = [];
   for (const relative of [...relatives].sort()) {
     const absolute = path.join(root, ...relative.split('/'));
     try {
@@ -95,14 +187,14 @@ async function hashFiles(root, relatives) {
   return rows;
 }
 
-function digestOfRows(rows) {
+function digestOfRows(rows: DigestFile[]): string | null {
   if (rows.length === 0) return null;
   const text = rows.map((row) => `${row.path}\t${row.sha256}\n`).join('');
   return sha256(Buffer.from(text, 'utf8'));
 }
 
-async function resolveCatalog(catalogPath) {
-  const candidates = [];
+async function resolveCatalog(catalogPath: unknown): Promise<string | null> {
+  const candidates: string[] = [];
   if (typeof catalogPath === 'string' && catalogPath.length > 0) candidates.push(catalogPath);
   candidates.push(path.join(PACKAGE_ROOT, 'src', 'catalog.data.json'));
   candidates.push(path.join(REPO_ROOT, 'docs', 'specs', 'roster-catalog.json'));
@@ -116,15 +208,15 @@ async function resolveCatalog(catalogPath) {
  * 计算三个内容摘要。缺文件不抛：摘要置 null 并给出 gap。
  * @param {{projectRoot: string, catalogPath?: string, skillRoot?: string}} input
  */
-export async function computeDigests(input = {}) {
+export async function computeDigests(input: ComputeDigestsInput = {}): Promise<Digests> {
   const projectRoot = typeof input.projectRoot === 'string' ? input.projectRoot : undefined;
-  const gaps = [];
+  const gaps: CompatibilityGap[] = [];
   const skillRoot = input.skillRoot ?? (projectRoot === undefined
     ? undefined
     : path.join(projectRoot, ...SKILL_COPY_RELATIVE.split('/')));
 
-  let ruleFiles = [];
-  let scriptFiles = [];
+  let ruleFiles: DigestFile[] = [];
+  let scriptFiles: DigestFile[] = [];
   if (skillRoot === undefined || !await isDirectory(skillRoot)) {
     gaps.push({
       code: 'SKILL_COPY_MISSING',
@@ -134,8 +226,8 @@ export async function computeDigests(input = {}) {
       nextStep: '用项目 skill 的 init 建副本，或按团队规则把副本合并进项目；不要用全局副本代替项目副本（D8）',
     });
   } else {
-    const markdown = (relative) => relative.toLowerCase().endsWith('.md');
-    const ruleRelatives = [];
+    const markdown = (relative: string): boolean => relative.toLowerCase().endsWith('.md');
+    const ruleRelatives: string[] = [];
     if (await isFile(path.join(skillRoot, 'SKILL.md'))) ruleRelatives.push('SKILL.md');
     ruleRelatives.push(...await walk(skillRoot, 'references', markdown));
     ruleRelatives.push(...await walk(skillRoot, 'assets', markdown));
@@ -143,7 +235,7 @@ export async function computeDigests(input = {}) {
     scriptFiles = await hashFiles(skillRoot, await walk(skillRoot, 'scripts'));
   }
 
-  let catalog = null;
+  let catalog: CatalogIdentity | null = null;
   const catalogFile = await resolveCatalog(input.catalogPath);
   if (catalogFile === null) {
     gaps.push({
@@ -168,17 +260,17 @@ export async function computeDigests(input = {}) {
  * 读 `re/team/binding.json`。缺失或坏 JSON 都返回 `present:false`，不抛。
  * @param {string} projectRoot
  */
-export async function readBinding(projectRoot) {
+export async function readBinding(projectRoot: unknown): Promise<BindingRead> {
   const relative = 're/team/binding.json';
   if (typeof projectRoot !== 'string' || projectRoot.length === 0) {
     return { present: false, binding: null, path: relative, reason: '没有项目根' };
   }
   const file = path.join(projectRoot, 're', 'team', 'binding.json');
-  let text;
+  let text: string;
   try {
     text = await readFile(file, 'utf8');
   } catch (error) {
-    const missing = error && typeof error === 'object' && error.code === 'ENOENT';
+    const missing = thrownCode(error) === 'ENOENT';
     return {
       present: false,
       binding: null,
@@ -187,8 +279,8 @@ export async function readBinding(projectRoot) {
     };
   }
   try {
-    const binding = JSON.parse(text);
-    if (binding === null || typeof binding !== 'object' || Array.isArray(binding)) {
+    const binding: unknown = JSON.parse(text);
+    if (!isRecord(binding) || Array.isArray(binding)) {
       return { present: false, binding: null, path: relative, reason: `${relative} 不是 JSON 对象` };
     }
     return { present: true, binding, path: relative };
@@ -207,9 +299,9 @@ const BINDING_KEYS = {
   ruleDigest: ['ruleDigest', 'rule_digest'],
   scriptDigest: ['scriptDigest', 'script_digest'],
   catalogDigest: ['catalogDigest', 'catalog_digest'],
-};
+} satisfies Record<DigestKey, string[]>;
 
-function declaredValue(binding, key) {
+function declaredValue(binding: Record<string, unknown>, key: DigestKey): unknown {
   for (const candidate of BINDING_KEYS[key]) {
     if (binding[candidate] !== undefined) return binding[candidate];
   }
@@ -227,12 +319,17 @@ function declaredValue(binding, key) {
  *
  * @param {{projectRoot: string, binding?: object, catalogPath?: string}} input
  */
-export async function checkCompatibility(input = {}) {
+export async function checkCompatibility(input: CheckCompatibilityInput = {}): Promise<CompatibilityReport> {
   const projectRoot = typeof input.projectRoot === 'string' ? input.projectRoot : undefined;
   const digests = await computeDigests({ projectRoot, catalogPath: input.catalogPath });
-  const loaded = input.binding === undefined
+  const loaded: BindingRead = input.binding === undefined
     ? await readBinding(projectRoot)
     : { present: true, binding: input.binding, path: 're/team/binding.json' };
+  // `present:true` 的定义就是 `binding` 是对象，所以这里可以按已收窄读 `adapter`；
+  // 与原实现 `loaded.present && loaded.binding.adapter` 的判断顺序一致。
+  const adapterView: unknown = loaded.present ? loaded.binding.adapter : undefined;
+  const adapterContractVersion: unknown = isRecord(adapterView) ? (adapterView.contract_version ?? null) : null;
+  const noDifferences: DigestDifference[] = [];
 
   const base = {
     contract_version: CONTRACT_VERSION,
@@ -242,12 +339,9 @@ export async function checkCompatibility(input = {}) {
       present: loaded.present,
       path: loaded.path,
       matched: false,
-      differences: [],
+      differences: noDifferences,
       ...(loaded.reason === undefined ? {} : { reason: loaded.reason }),
-      adapter_contract_version: loaded.present && loaded.binding.adapter
-        && typeof loaded.binding.adapter === 'object'
-        ? (loaded.binding.adapter.contract_version ?? null)
-        : null,
+      adapter_contract_version: adapterContractVersion,
     },
   };
 
@@ -260,8 +354,8 @@ export async function checkCompatibility(input = {}) {
     };
   }
 
-  const differences = [];
-  for (const key of Object.keys(BINDING_KEYS)) {
+  const differences: DigestDifference[] = [];
+  for (const key of DIGEST_KEYS) {
     const declared = declaredValue(loaded.binding, key);
     const actual = digests[key];
     if (declared === undefined || declared === null || declared !== actual) {
