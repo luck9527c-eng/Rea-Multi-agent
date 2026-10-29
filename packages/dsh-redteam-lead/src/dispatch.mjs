@@ -847,12 +847,15 @@ async function preflight({ ctx, deps, envelope, request, root, dispatchId, attem
   const routeRead = await projectAdapter.readRoute(request.route_id)
   if (!routeRead || routeRead.ok !== true) {
     const code = stableCode(routeRead?.code ?? 'PROJECT_NOT_CONFIGURED')
+    const unbound = projectAdapter?.projectRoot === undefined
+      ? '（projectAdapter 未绑定 projectRoot：这是装配问题，不是项目记录问题——检查 index.js 是否按本次调用的 project_root 装配了项目适配器）'
+      : ''
     return {
       ok: false,
       envelope: blockedEnvelope(envelope, {
         code,
         operationId: request.operation_id,
-        reason: `读不到路线 ${request.route_id}：${routeRead?.reason ?? 'projectAdapter.readRoute 失败'}`,
+        reason: `读不到路线 ${request.route_id}：${routeRead?.reason ?? 'projectAdapter.readRoute 失败'}${unbound}`,
         nextStep: '先按项目 skill 建立该路线（问题/判据/预算/目标），再派发；工具不接受自由形状的路线草稿',
       }),
     }
