@@ -17,51 +17,167 @@
 
 import { createHash } from 'node:crypto'
 
+import { isRecord, thrownMessage } from './guards.js'
+
 /** 递归深度上限，防御异常 schema（规格本身无环）。 */
 const MAX_DEPTH = 64
 
-/** 允许入参是整份 schema（带 $defs）或 $defs 映射本身。 */
-function defsOf(schemaDefs) {
-  if (!schemaDefs || typeof schemaDefs !== 'object') throw new TypeError('schemaDefs 必须是对象')
-  return schemaDefs.$defs ?? schemaDefs
+/**
+ * 一条校验问题（`path` 是 JSON Pointer 形式的位置）。
+ *
+ * `params` 只在某些关键字上出现（规格不需要它，人读诊断才需要），因此是可选的松散对象。
+ */
+export interface Issue {
+  path: string
+  keyword: string
+  message: string
+  params?: unknown
 }
 
-function schemaOf(schemaDefs, defName) {
+/**
+ * 本模块认识的 schema 节点。
+ *
+ * schema 由 `JSON.parse` 读入（`docs/specs/rt-tools.schema.json`），关键字形状由规格保证；
+ * 这里按 JSON Schema 的语义声明本模块真正读到的那些关键字，其余关键字仍可按名读取（`unknown`）。
+ * 运行期判断保持原样：关键字缺省即跳过，非法值依旧走 JS 的比较/真值语义。
+ */
+interface SchemaNode extends Record<string, unknown> {
+  /** 仅支持本地 `#/$defs/<name>`。 */
+  $ref?: unknown
+  type?: string | string[]
+  enum?: unknown[]
+  const?: unknown
+  required?: string[]
+  properties?: Record<string, unknown>
+  additionalProperties?: unknown
+  items?: unknown
+  allOf?: unknown[]
+  anyOf?: unknown[]
+  oneOf?: unknown[]
+  not?: unknown
+  if?: unknown
+  then?: unknown
+  else?: unknown
+  pattern?: string
+  minLength?: number
+  maxLength?: number
+  minimum?: number
+  maximum?: number
+  minItems?: number
+  maxItems?: number
+  uniqueItems?: boolean
+  format?: string
+  default?: unknown
+}
+
+/** `$defs` 映射（定义名 → schema 节点）；值来自 JSON，读取时仍按需判断。 */
+type Defs = Record<string, unknown>
+
+/** 一次校验的共享上下文；`depth` 每层自增（`local` 是子层的副本）。 */
+interface ValidationCtx {
+  defs: Defs
+  issues: Issue[]
+  depth: number
+}
+
+/** `validateInput()` 的返回值。 */
+export interface ValidationResult {
+  ok: boolean
+  issues: Issue[]
+}
+
+/** `normalizeInput()` 的入参。 */
+export interface NormalizeInputOptions {
+  /** 整份 schema（含 `$defs`）或 `$defs` 映射本身。 */
+  schemaDefs?: unknown
+  /** 定义名，如 `rosterInput`。 */
+  defName?: string
+  input?: unknown
+  /** 项目根真实化；由调用方注入（本模块不做 I/O）。 */
+  normalizeRoot?: (raw: string) => string | Promise<string>
+}
+
+/** `normalizeInput()` 的返回值。 */
+export interface NormalizeInputResult {
+  ok: boolean
+  issues: Issue[]
+  value: unknown
+}
+
+/** `operationInputHash()` 的上下文；值原样进哈希载荷，因此按写入方给什么就收什么。 */
+export interface OperationHashContext {
+  tool?: unknown
+  action?: unknown
+  project?: unknown
+  session?: unknown
+  epoch?: unknown
+}
+
+/**
+ * 把任意读到的值记作一个 schema 节点。
+ *
+ * 不变量：本函数的入参一定来自 `$defs` 的条目或 `$ref` 的解析结果，即规格里的 schema 位置；
+ * JSON Schema 允许这里出现 `true`/`false` 布尔 schema，而本模块对布尔 schema 的处理是
+ * 「先做 `isRecord` 判断、原样放行」，所以类型上记作节点不会改变任何运行期行为。
+ */
+function asSchemaNode(value: unknown): SchemaNode {
+  return value as SchemaNode
+}
+
+/** 数组判断（`Array.isArray` 的谓词版本，收窄成 `unknown[]` 而不是 `any[]`）。 */
+function isArray(value: unknown): value is unknown[] {
+  return Array.isArray(value)
+}
+
+/** 非 null、非数组的对象（JSON 对象本体）。 */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 允许入参是整份 schema（带 $defs）或 $defs 映射本身。 */
+function defsOf(schemaDefs: unknown): Defs {
+  if (!isRecord(schemaDefs)) throw new TypeError('schemaDefs 必须是对象')
+  const defs = schemaDefs.$defs
+  // `$defs` 缺省时，入参本身就是 $defs 映射（契约允许两种入参）。
+  if (isRecord(defs)) return defs
+  return schemaDefs
+}
+
+function schemaOf(schemaDefs: unknown, defName: string): { defs: Defs; schema: SchemaNode } {
   const defs = defsOf(schemaDefs)
   const schema = defs[defName]
   if (!schema) throw new TypeError(`未定义的 schema 定义: ${String(defName)}`)
-  return { defs, schema }
+  return { defs, schema: asSchemaNode(schema) }
 }
 
 /**
  * 解析 `$ref`（仅本地 `#/$defs/<name>`），并把同层兄弟关键字叠加到解析结果上。
  * 规格里 `{ "$ref": "...", "default": [] }` 这种写法依赖兄弟关键字仍然生效。
  */
-function deref(node, defs, depth = 0) {
-  if (!node || typeof node !== 'object' || Array.isArray(node)) return node
-  if (typeof node.$ref !== 'string') return node
-  if (depth > MAX_DEPTH) throw new TypeError(`$ref 解析过深: ${node.$ref}`)
-  const match = /^#\/\$defs\/([^/]+)$/.exec(node.$ref)
-  if (!match) throw new TypeError(`不支持的 $ref: ${node.$ref}`)
+function deref(node: unknown, defs: Defs, depth = 0): SchemaNode {
+  if (!isRecord(node) || isArray(node)) return asSchemaNode(node)
+  const ref = node.$ref
+  if (typeof ref !== 'string') return asSchemaNode(node)
+  if (depth > MAX_DEPTH) throw new TypeError(`$ref 解析过深: ${ref}`)
+  const match = /^#\/\$defs\/([^/]+)$/.exec(ref)
+  if (!match) throw new TypeError(`不支持的 $ref: ${ref}`)
   const target = defs[match[1]]
-  if (!target) throw new TypeError(`$ref 指向未定义的 $defs: ${node.$ref}`)
+  if (!target) throw new TypeError(`$ref 指向未定义的 $defs: ${ref}`)
   const { $ref, ...siblings } = node
-  return { ...deref(target, defs, depth + 1), ...siblings }
+  // 与 `{ ...resolved, ...siblings }` 等价（对象展开即 Object.assign 语义），
+  // 这样不必对 unknown 的结果做类型断言。
+  return asSchemaNode(Object.assign({}, deref(target, defs, depth + 1), siblings))
 }
 
-function isPlainObject(value) {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function escapePointer(text) {
+function escapePointer(text: string | number): string {
   return String(text).replaceAll('~', '~0').replaceAll('/', '~1')
 }
 
-function childPath(path, key) {
+function childPath(path: string, key: string | number): string {
   return `${path}/${escapePointer(key)}`
 }
 
-function typeMatches(type, value) {
+function typeMatches(type: unknown, value: unknown): boolean {
   switch (type) {
     case 'object':
       return isPlainObject(value)
@@ -82,7 +198,7 @@ function typeMatches(type, value) {
   }
 }
 
-function typeName(value) {
+function typeName(value: unknown): string {
   if (value === null) return 'null'
   if (Array.isArray(value)) return 'array'
   if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number'
@@ -90,9 +206,9 @@ function typeName(value) {
 }
 
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
-const patternCache = new Map()
+const patternCache = new Map<string, RegExp>()
 
-function patternOf(source) {
+function patternOf(source: string): RegExp {
   let compiled = patternCache.get(source)
   if (!compiled) {
     compiled = new RegExp(source, 'u')
@@ -104,48 +220,47 @@ function patternOf(source) {
 /**
  * 按键排序的 JSON 编码（UTF-8 语义），用于哈希与深比较。
  * 正文文本原样保留。
- * @param {unknown} value
- * @returns {string}
+ *
+ * 契约要求返回字符串：调用方只喂 JSON 值，而 `JSON.stringify` 对 JSON 值恒返回字符串
+ * （只有 `undefined`/函数/Symbol 才返回 `undefined`，那不是本模块的入参）。
  */
-export function canonicalJson(value) {
-  return JSON.stringify(sortKeysDeep(value))
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortKeysDeep(value)) as string
 }
 
-function sortKeysDeep(value) {
+function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep)
   if (isPlainObject(value)) {
-    const out = {}
+    const out: Record<string, unknown> = {}
     for (const key of Object.keys(value).sort()) out[key] = sortKeysDeep(value[key])
     return out
   }
   return value
 }
 
-function deepEqual(left, right) {
+function deepEqual(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right)
 }
 
-function push(issues, path, keyword, message, params) {
+function push(issues: Issue[], path: string, keyword: string, message: string, params?: unknown): void {
   issues.push({ path, keyword, message, ...(params ? { params } : {}) })
 }
 
 /**
  * 校验单个值。
- * @param {object} node 已解引用的 schema 节点
- * @param {unknown} value
- * @param {string} path JSON Pointer 形式的位置
- * @param {{ defs: object, issues: object[], depth: number }} ctx
+ * @param node 已解引用的 schema 节点
+ * @param path JSON Pointer 形式的位置
  */
-function validateNode(node, value, path, ctx) {
-  if (!node || typeof node !== 'object') return
+function validateNode(node: SchemaNode, value: unknown, path: string, ctx: ValidationCtx): void {
+  if (!isRecord(node)) return
   if (ctx.depth > MAX_DEPTH) {
     push(ctx.issues, path, 'schema-depth', 'schema 递归过深，拒绝继续校验')
     return
   }
-  const local = { ...ctx, depth: ctx.depth + 1 }
+  const local: ValidationCtx = { ...ctx, depth: ctx.depth + 1 }
 
   if (node.type !== undefined) {
-    const allowed = Array.isArray(node.type) ? node.type : [node.type]
+    const allowed: unknown[] = isArray(node.type) ? node.type : [node.type]
     if (!allowed.some((type) => typeMatches(type, value))) {
       push(
         ctx.issues,
@@ -158,7 +273,7 @@ function validateNode(node, value, path, ctx) {
     }
   }
 
-  if (Array.isArray(node.enum) && !node.enum.some((candidate) => deepEqual(candidate, value))) {
+  if (isArray(node.enum) && !node.enum.some((candidate) => deepEqual(candidate, value))) {
     push(ctx.issues, path, 'enum', `取值必须是 ${node.enum.map((item) => JSON.stringify(item)).join('、')} 之一`, {
       allowed: node.enum,
     })
@@ -175,7 +290,7 @@ function validateNode(node, value, path, ctx) {
     if (node.maxLength !== undefined && value.length > node.maxLength) {
       push(ctx.issues, path, 'maxLength', `长度不得大于 ${node.maxLength}（实际 ${value.length}）`)
     }
-    if (node.pattern !== undefined && !patternOf(node.pattern).test(value)) {
+    if (node.pattern !== undefined && !patternOf(String(node.pattern)).test(value)) {
       push(ctx.issues, path, 'pattern', `不匹配必需格式 /${node.pattern}/`, { pattern: node.pattern })
     }
     if (node.format === 'date-time' && (!DATE_TIME.test(value) || Number.isNaN(Date.parse(value)))) {
@@ -192,7 +307,7 @@ function validateNode(node, value, path, ctx) {
     }
   }
 
-  if (Array.isArray(value)) {
+  if (isArray(value)) {
     if (node.minItems !== undefined && value.length < node.minItems) {
       push(ctx.issues, path, 'minItems', `至少需要 ${node.minItems} 项（实际 ${value.length}）`)
     }
@@ -200,7 +315,7 @@ function validateNode(node, value, path, ctx) {
       push(ctx.issues, path, 'maxItems', `最多允许 ${node.maxItems} 项（实际 ${value.length}）`)
     }
     if (node.uniqueItems === true) {
-      const seen = new Map()
+      const seen = new Map<string, number>()
       value.forEach((item, index) => {
         const key = canonicalJson(item)
         if (seen.has(key)) {
@@ -223,8 +338,10 @@ function validateNode(node, value, path, ctx) {
   }
 
   if (isPlainObject(value)) {
-    const properties = node.properties && typeof node.properties === 'object' ? node.properties : {}
-    if (Array.isArray(node.required)) {
+    const properties: Record<string, unknown> = node.properties && typeof node.properties === 'object'
+      ? node.properties
+      : {}
+    if (isArray(node.required)) {
       for (const name of node.required) {
         if (!Object.hasOwn(value, name)) {
           push(ctx.issues, childPath(path, name), 'required', `缺少必填字段 ${name}`, { missing: name })
@@ -250,18 +367,18 @@ function validateNode(node, value, path, ctx) {
     }
   }
 
-  if (Array.isArray(node.allOf)) {
+  if (isArray(node.allOf)) {
     for (const branch of node.allOf) {
       validateNode(deref(branch, ctx.defs), value, path, local)
     }
   }
 
-  if (Array.isArray(node.anyOf)) {
+  if (isArray(node.anyOf)) {
     const matches = node.anyOf.some((branch) => validateNodeReturnsOk(deref(branch, ctx.defs), value, path, local))
     if (!matches) push(ctx.issues, path, 'anyOf', '不满足任何一个允许的形状')
   }
 
-  if (Array.isArray(node.oneOf)) {
+  if (isArray(node.oneOf)) {
     const matches = node.oneOf.filter((branch) => validateNodeReturnsOk(deref(branch, ctx.defs), value, path, local))
     if (matches.length !== 1) {
       push(ctx.issues, path, 'oneOf', `必须恰好命中一种形状（命中 ${matches.length} 种）`, { matches: matches.length })
@@ -282,30 +399,34 @@ function validateNode(node, value, path, ctx) {
 }
 
 /** 子分支探测：用一个独立 issues 容器跑一遍，只关心是否零问题。 */
-function validateNodeReturnsOk(node, value, path, ctx) {
-  const issues = []
+function validateNodeReturnsOk(node: SchemaNode, value: unknown, path: string, ctx: ValidationCtx): boolean {
+  const issues: Issue[] = []
   validateNode(node, value, path, { defs: ctx.defs, issues, depth: ctx.depth })
   return issues.length === 0
 }
 
 /**
  * 按 `$defs` 中的定义校验入参。
- * @param {object} schemaDefs 整份 schema（含 `$defs`）或 `$defs` 映射本身
- * @param {string} defName 定义名，如 `rosterInput`
- * @param {unknown} value
- * @returns {{ ok: boolean, issues: Array<{ path: string, keyword: string, message: string }> }}
+ * @param schemaDefs 整份 schema（含 `$defs`）或 `$defs` 映射本身
+ * @param defName 定义名，如 `rosterInput`
  */
-export function validateInput(schemaDefs, defName, value) {
+export function validateInput(schemaDefs: unknown, defName: string, value: unknown): ValidationResult {
   const { defs, schema } = schemaOf(schemaDefs, defName)
-  const issues = []
+  const issues: Issue[] = []
   validateNode(deref(schema, defs), value, '', { defs, issues, depth: 0 })
   return { ok: issues.length === 0, issues }
 }
 
 /** 遍历 schema 与值，对每个「数组且 uniqueItems」的节点回调。 */
-function walkArrays(node, value, defs, path, visit) {
-  if (!node || typeof node !== 'object') return
-  if (Array.isArray(value)) {
+function walkArrays(
+  node: SchemaNode,
+  value: unknown,
+  defs: Defs,
+  path: string,
+  visit: (node: SchemaNode, array: unknown[], path: string) => void,
+): void {
+  if (!isRecord(node)) return
+  if (isArray(value)) {
     visit(node, value, path)
     if (node.items !== undefined) {
       const itemSchema = deref(node.items, defs)
@@ -323,14 +444,14 @@ function walkArrays(node, value, defs, path, visit) {
 
 /**
  * 规范化的第一步：拒绝重复集合项（语义为集合 = `uniqueItems: true` 的数组）。
- * @returns {Array<{ path: string, keyword: string, message: string }>} issues
+ * @returns issues
  */
-export function detectDuplicateSetItems(schemaDefs, defName, value) {
+export function detectDuplicateSetItems(schemaDefs: unknown, defName: string, value: unknown): Issue[] {
   const { defs, schema } = schemaOf(schemaDefs, defName)
-  const issues = []
+  const issues: Issue[] = []
   walkArrays(deref(schema, defs), value, defs, '', (node, array, path) => {
     if (node.uniqueItems !== true) return
-    const seen = new Map()
+    const seen = new Map<string, number>()
     array.forEach((item, index) => {
       const key = canonicalJson(item)
       if (seen.has(key)) {
@@ -348,18 +469,18 @@ export function detectDuplicateSetItems(schemaDefs, defName, value) {
 /**
  * 规范化第二步：按 schema 的 `default` 注解填默认值。
  * schema 的 default 只是注解，只有显式调用本函数才会生效（契约要求处理器显式填默认值）。
- * @returns {object} 填好默认值的新对象（不改调用方入参）
+ * @returns 填好默认值的新对象（不改调用方入参）
  */
-export function applyDefaults(schemaDefs, defName, value) {
+export function applyDefaults(schemaDefs: unknown, defName: string, value: unknown): unknown {
   const { defs, schema } = schemaOf(schemaDefs, defName)
   const out = structuredClone(value)
   fillDefaults(deref(schema, defs), out, defs)
   return out
 }
 
-function fillDefaults(node, value, defs) {
-  if (!node || typeof node !== 'object') return
-  if (Array.isArray(value)) {
+function fillDefaults(node: SchemaNode, value: unknown, defs: Defs): void {
+  if (!isRecord(node)) return
+  if (isArray(value)) {
     if (node.items === undefined) return
     const itemSchema = deref(node.items, defs)
     for (const item of value) fillDefaults(itemSchema, item, defs)
@@ -382,9 +503,9 @@ function fillDefaults(node, value, defs) {
 /**
  * 规范化第四步：把语义为集合的数组（`uniqueItems: true`）按规范 JSON 排序，
  * 让同一集合的不同书写顺序得到同一哈希。
- * @returns {object} 排序后的新对象
+ * @returns 排序后的新对象
  */
-export function sortSetArrays(schemaDefs, defName, value) {
+export function sortSetArrays(schemaDefs: unknown, defName: string, value: unknown): unknown {
   const { defs, schema } = schemaOf(schemaDefs, defName)
   const out = structuredClone(value)
   walkArrays(deref(schema, defs), out, defs, '', (node, array) => {
@@ -403,26 +524,31 @@ export function sortSetArrays(schemaDefs, defName, value) {
  * 判断某个属性是否是契约里的 `$defs.root`（需要真实化的项目根）。
  * 先看原始 `$ref`（规格就是这么写的），再容忍内联的同形写法。
  */
-function isRootSchema(rawSchema, resolvedSchema, defs) {
-  if (rawSchema && typeof rawSchema === 'object' && rawSchema.$ref === '#/$defs/root') return true
+function isRootSchema(rawSchema: unknown, resolvedSchema: SchemaNode, defs: Defs): boolean {
+  if (isRecord(rawSchema) && rawSchema.$ref === '#/$defs/root') return true
   return Boolean(defs.root) && deepEqual(resolvedSchema, defs.root)
 }
 
 /**
  * 规范化第三步：把 `$defs.root` 形状的字段交给注入的真实化函数（IO 由调用方提供）。
- * @returns {{ value: object, issues: object[] }}
  */
-function normalizeRootFields(node, value, defs, path, normalizeRoot) {
-  const issues = []
-  const apply = (currentNode, currentValue, currentPath) => {
-    if (!currentNode || typeof currentNode !== 'object') return currentValue
-    if (Array.isArray(currentValue)) {
+function normalizeRootFields(
+  node: SchemaNode,
+  value: unknown,
+  defs: Defs,
+  path: string,
+  normalizeRoot: (raw: string) => string | Promise<string>,
+): { value: unknown; issues: Issue[] } {
+  const issues: Issue[] = []
+  const apply = (currentNode: SchemaNode, currentValue: unknown, currentPath: string): unknown => {
+    if (!isRecord(currentNode)) return currentValue
+    if (isArray(currentValue)) {
       if (currentNode.items === undefined) return currentValue
       const itemSchema = deref(currentNode.items, defs)
       return currentValue.map((item, index) => apply(itemSchema, item, childPath(currentPath, index)))
     }
     if (!isPlainObject(currentValue) || !currentNode.properties) return currentValue
-    const next = { ...currentValue }
+    const next: Record<string, unknown> = { ...currentValue }
     for (const [name, rawSchema] of Object.entries(currentNode.properties)) {
       if (!Object.hasOwn(next, name)) continue
       const propertySchema = deref(rawSchema, defs)
@@ -430,7 +556,7 @@ function normalizeRootFields(node, value, defs, path, normalizeRoot) {
         try {
           next[name] = normalizeRoot(next[name])
         } catch (error) {
-          push(issues, childPath(currentPath, name), 'root', `项目根无法规范化: ${error?.message ?? error}`)
+          push(issues, childPath(currentPath, name), 'root', `项目根无法规范化: ${thrownMessage(error)}`)
         }
         continue
       }
@@ -443,17 +569,12 @@ function normalizeRootFields(node, value, defs, path, normalizeRoot) {
 
 /**
  * 校验 + 规范化：拒绝重复集合项 → 校验形状 → 填默认值 → 规范化项目根 → 集合排序。
- *
- * @param {{
- *   schemaDefs: object,
- *   defName: string,
- *   input: unknown,
- *   normalizeRoot?: (raw: string) => string | Promise<string>,
- * }} options
- * @returns {Promise<{ ok: boolean, issues: object[], value: unknown }>}
  */
-export async function normalizeInput(options = {}) {
-  const { schemaDefs, defName, input, normalizeRoot } = options
+export async function normalizeInput(options: NormalizeInputOptions = {}): Promise<NormalizeInputResult> {
+  const { schemaDefs, input, normalizeRoot } = options
+  // 定义名缺省时 String(undefined) === 'undefined'，与迁移前 `defs[undefined]` 的键强制转换逐字一致
+  // （随后因 `$defs` 里查不到该定义而抛 TypeError）。
+  const defName = String(options.defName)
   const { defs, schema } = schemaOf(schemaDefs, defName)
 
   const duplicateIssues = detectDuplicateSetItems(schemaDefs, defName, input)
@@ -476,12 +597,12 @@ export async function normalizeInput(options = {}) {
  * 操作输入哈希：`{tool, action, project, session, epoch, input}` 按键排序后编码成 UTF-8 JSON 求 SHA256。
  *
  * 正文文本保留实际内容；身份上下文字段由调用方按该操作首次捕获的授权上下文传入。
+ * 上下文各字段原样进哈希载荷（只做 JSON 编码），因此这里按调用方给什么就收什么。
  *
- * @param {unknown} input 已规范化的输入
- * @param {{ tool?: string|null, action?: string|null, project?: string|null, session?: string|null, epoch?: number|null }} [context]
- * @returns {string} 小写十六进制 SHA256
+ * @param input 已规范化的输入
+ * @returns 小写十六进制 SHA256
  */
-export function operationInputHash(input, context = {}) {
+export function operationInputHash(input: unknown, context: OperationHashContext = {}): string {
   const { tool = null, action = null, project = null, session = null, epoch = null } = context
   const payload = { tool, action, project, session, epoch, input }
   return createHash('sha256').update(canonicalJson(payload), 'utf8').digest('hex')
