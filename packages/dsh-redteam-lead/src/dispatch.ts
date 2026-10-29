@@ -26,7 +26,7 @@ import { ContractError, isErrorCode } from './errors.js'
 import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js'
 import * as resourceDefaults from './resources.js'
 import * as contractDefaults from './contract.js'
-import type { BaselineRef, CatalogPost, MergedRequirements, RouteRecord } from './contract.js'
+import type { BaselineRef, CatalogPost, ContractDigests, MergedRequirements, RouteRecord } from './contract.js'
 import type { Deps, Diagnostic, Envelope, HandlerCtx, HandlerResult } from './types.js'
 
 /** `$defs.id` */
@@ -212,7 +212,14 @@ interface PreflightPlan {
   routeTargets: string[]
   gaps: unknown[]
   callerName: string
+  /** 门 1 探测到的兼容性摘要：契约必须冻结它（收口侧的规则漂移守卫靠它）。 */
+  digests: ContractDigests
 }
+
+/** `readFrozenDigests()` 的结果：失败带稳定码，成功带要写进契约的三个摘要。 */
+type FrozenDigestsRead =
+  | { ok: true; digests: ContractDigests }
+  | { ok: false; code: string; reason: string; nextStep: string }
 
 /** preflight 的结果：拒绝时带合法信封（零副作用），通过时带计划。 */
 type PreflightResult = { ok: true; plan: PreflightPlan } | { ok?: false; envelope: Envelope }
@@ -1306,6 +1313,40 @@ async function resolveRetry({
 // 前置检查
 // ---------------------------------------------------------------------------
 
+/**
+ * 门 1 的兼容性探测 → 契约要冻结的三个内容摘要。
+ *
+ * 走**项目适配器**的 `probe()`（与收口侧 `checkPremises` 复核用的是同一个入口），所以两边看到的是
+ * 同一份「项目副本指纹」：适配器换实现（替身/未来布局）时两侧仍然自洽，不会因为一边读模块、
+ * 一边读适配器而必然不一致。`probe()` 内部已经算过 `computeDigests()`，这里只取结果，**不重复跑
+ * Python**。摘要缺项（例如项目副本没有 `SKILL.md`）时按失败处理：冻结不了规则版本就不该派发，
+ * 否则契约一落地就注定收不了口。
+ */
+async function readFrozenDigests(projectAdapter: ProjectAdapterLike, root: string): Promise<FrozenDigestsRead> {
+  const probe = recordOf(await projectAdapter.probe({ projectRoot: root }))
+  const compatibility = recordOf(probe.compatibility)
+  const ruleDigest = typeof compatibility.ruleDigest === 'string' ? compatibility.ruleDigest : null
+  const scriptDigest = typeof compatibility.scriptDigest === 'string' ? compatibility.scriptDigest : null
+  const catalogDigest = typeof compatibility.catalogDigest === 'string' ? compatibility.catalogDigest : null
+  if (probe.ok !== true) {
+    return {
+      ok: false,
+      code: stableCode(probe.code ?? 'PROJECT_NOT_CONFIGURED'),
+      reason: `项目兼容性探测失败，无法冻结规则版本：${probe.reason ?? probe.code ?? 'unknown'}`,
+      nextStep: '先按 rt_roster 的接入检查确认项目副本完整（INDEX/配置/SKILL.md/references/team-coordination.md），再派发',
+    }
+  }
+  if (ruleDigest === null) {
+    return {
+      ok: false,
+      code: 'SKILL_INCOMPATIBLE',
+      reason: '项目副本没有可冻结的规则摘要（SKILL.md 与 references/assets 的 Markdown 都读不到）',
+      nextStep: '先按 rt_roster 的接入检查确认项目内 skill 副本完整；没有规则可冻结时不能派发（收口会无法核对规则版本）',
+    }
+  }
+  return { ok: true, digests: { ruleDigest, scriptDigest, catalogDigest } }
+}
+
 async function preflight({
   ctx,
   deps,
@@ -1673,6 +1714,20 @@ async function preflight({
     }
   }
 
+  // (6) 规则版本：契约必须冻结派发当时的副本摘要，收口侧才有东西可比对（D8）。
+  // 放在 baseline 冻结之前：探测失败时不要先落下 `re/team/baselines/<dispatch>.json`。
+  const frozen = await readFrozenDigests(projectAdapter, root)
+  if (!frozen.ok) {
+    return {
+      envelope: blockedEnvelope(envelope, {
+        code: frozen.code,
+        operationId: request.operation_id,
+        reason: frozen.reason,
+        nextStep: frozen.nextStep,
+      }),
+    }
+  }
+
   // baseline：真实目标字节哈希 + 相关既有 seal。
   //
   // **装配接缝（T12）**：`deps.baseline` 是 T7 的 `src/baseline.mjs`（SEAMS §7 规定基准快照归它），
@@ -1735,6 +1790,7 @@ async function preflight({
       routeTargets,
       gaps: [...budget.gaps, ...(Array.isArray(capacity.gaps) ? capacity.gaps : [])],
       callerName,
+      digests: frozen.digests,
     },
   }
 }
@@ -1965,6 +2021,18 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
       baselineRef = capture.baseline_ref
     }
 
+    // 规则摘要：门 1 已经探过就直接复用（不重复跑 Python）；恢复路径没有计划时补探一次。
+    const frozen: FrozenDigestsRead = plan !== null
+      ? { ok: true, digests: plan.digests }
+      : await readFrozenDigests(projectAdapter, root)
+    if (!frozen.ok) {
+      return failure(frozen.code, {
+        reason: frozen.reason,
+        nextStep: frozen.nextStep,
+        phase: 'prepared',
+      })
+    }
+
     const built = contractMod.buildContract({
       dispatchId,
       attemptId,
@@ -1991,6 +2059,7 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
       contractRef,
       retryOf: request.retry_of,
       caller: callerName,
+      digests: frozen.digests,
     })
     const persisted = await contractMod.persistContract({
       root,

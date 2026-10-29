@@ -83,6 +83,8 @@ function defaultResponse(command, args, fixture) {
       return {
         exitCode: 0,
         stderr: '',
+        // 摘要必须是**小写 64-hex**：收口侧按 sha256 形状校验规则摘要，替身也要给得出合法形状，
+        // 否则「摘要形状」这一层门槛在测试里永远不被走到。
         stdout: prettyJson(fixture.compatibility ?? {
           projectRoot: fixture.projectRoot,
           indexPresent: true,
@@ -91,8 +93,8 @@ function defaultResponse(command, args, fixture) {
           hasTeamRules: true,
           pythonOk: true,
           versions: { python: '3.12.14', adapter: 1 },
-          ruleDigest: 'r'.repeat(64),
-          scriptDigest: 's'.repeat(64),
+          ruleDigest: 'a'.repeat(64),
+          scriptDigest: 'b'.repeat(64),
           catalogDigest: 'c'.repeat(64),
         }),
       };
