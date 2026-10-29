@@ -137,3 +137,25 @@ schema 是 `additionalProperties:false`，`capacity` 恰好 4 个属性：`remai
 ## D24 — 两套阶段枚举，不得混用
 
 `$defs.failureData` 的阶段是 `preflight…needs_recovery`（无 `completed`）；编排契约的操作阶段是 `prepared…completed` + `needs_recovery`（无 `preflight`）。两者各留逐字常量（`envelope.FAILURE_PHASES` / `operation.OPERATION_PHASES`），不要互相翻译。
+
+## D25 — activation「上限已声明、占用不可观测」不能导致全员 defer
+
+T4 的 `teamAdapter.capacity()` 如实返回：`memberSlots` 的 `used` 恒可数、`total/remaining` 来自声明；但 **`activations.remaining` 恒为 `null`**（真实宿主没有任何 activation 占用查询）。而 T3 的 `planBudget` 规则是「任一余额为 null → 新成员岗位 deferred + `CAPACITY_UNKNOWN`」。两者叠加会让**所有新成员岗位永远 deferred**，插件直接不可用。
+
+**裁决：把「上限未知」与「占用不可观测」分开。**
+
+- **上限未声明**（`activations.known === false`）→ 传 `remainingActivations = null`，`planBudget` 照旧 defer + `CAPACITY_UNKNOWN`。这是正确行为。
+- **上限已声明**（`activations.known === true`）→ 调用方传 **`remainingActivations = cap.activations.total`**（即声明的上限），由 `planBudget` 再扣 `reserved_activations`；**不要**传 `remaining`。同时把 `cap.gaps` 里的 `ACTIVATION_USAGE_UNOBSERVED` 原样并入返回的 `gaps`（非阻塞诊断）。
+- 于是「占用不可观测」表现为**一条可读的 gap**，而不是静默超配或全员阻塞。派发时若宿主真的抛 `ACTIVATION_LIMIT_REACHED`，按 D12 处理（记 failed、烧席位、不用同名重试）。
+
+**T5/T6 必须照此组装**，不得各自发明口径：
+
+```js
+const cap = await teamAdapter.capacity()
+const remainingActivations = cap.activations.known ? cap.activations.total : null
+const budget = planBudget({ ..., remainingMemberSlots: cap.memberSlots.remaining,
+                            remainingActivations, ... })
+const gaps = [...budget.gaps, ...cap.gaps]   // cap.gaps 只作非阻塞诊断
+```
+
+`rosterData.capacity` 仍然只投影 schema 的 4 个字段（D19）；`remaining_activations` 取 `budget.capacity` 里已扣预留的结果。
