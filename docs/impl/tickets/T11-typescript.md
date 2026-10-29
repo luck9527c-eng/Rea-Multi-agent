@@ -16,28 +16,16 @@
 
 ## 交付
 
-### 1. 仓库根 `package.json`（新建）
+> **工具链已由 Lead 预置，不要重建**：仓库根 `package.json`（`typescript@^5.9` + `@types/node@^24`）、`packages/dsh-redteam-lead/tsconfig.json`、`scripts/build.mjs` 都已提交，`tsc 5.9.3` 实测可用。
+> `tsconfig` 已定 `strict: true` + **`noUncheckedIndexedAccess: false`**（理由见 [DECISIONS.md](../DECISIONS.md) D30）。**不要**为了好过编译改这两个值。
+> 调外部程序时**不要** spawn `.cmd`/`.bat`（Windows 会 `spawn EINVAL`），见 D30。
 
-```json
-{
-  "name": "rea-multi-agent-workspace",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "build": "...",
-    "test": "...",
-    "typecheck": "..."
-  },
-  "devDependencies": { "typescript": "^5.9.0" }
-}
-```
+### 1. 仓库根 `package.json`（已存在，只按需微调）
 
-- `build` = 清 `dist` → `tsc -p packages/dsh-redteam-lead` → 把非 TS 资产（`src/catalog.data.json`）复制到 `dist/`。
-- `test` = `npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.ts"`。
-- `typecheck` = `tsc -p packages/dsh-redteam-lead --noEmit`。
-- **`typescript` 只在这里**；`packages/dsh-redteam-lead/package.json` 的 `dependencies` 必须继续为空。
+已含 `scripts.build` / `scripts.test` / `scripts.typecheck` / `scripts.doctor`，`devDependencies` 为 `typescript` 与 `@types/node`。你只需在需要时把它们对齐到真实命令。
+**`typescript` 只在这里**；`packages/dsh-redteam-lead/package.json` 的 `dependencies` 必须继续为空。
 
-### 2. `packages/dsh-redteam-lead/tsconfig.json`
+### 2. `packages/dsh-redteam-lead/tsconfig.json`（已存在，不要改关键项）
 
 `strict: true`、`module: "nodenext"`、`moduleResolution: "nodenext"`、`target: "es2023"`、`lib: ["ES2023"]`、`types: ["node"]`、`rootDir: "src"`、`outDir: "dist"`、`declaration: true`、`sourceMap: false`、`verbatimModuleSyntax: true`、`erasableSyntaxOnly: true`、`noUncheckedIndexedAccess: true`、`exactOptionalPropertyTypes: false`（与现有 `?.`/可选字段写法兼容；若要打开，先证明 278 用例仍绿）。
 `@types/node` 也放根 `devDependencies`。
