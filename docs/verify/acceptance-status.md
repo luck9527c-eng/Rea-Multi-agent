@@ -20,6 +20,8 @@
 
 - **凡是 `层` 含 L3 的行一律 `not-run`**（T9 的结论：第三层从未执行）。这些行的 L1/L2 半已经通过的，
   在 `备注` 里给出用例名——但整行不因此判 `pass`。这正是"不拿自动化冒充真会话"的口径。
+  **唯一例外是 A39**：规格把它的四条观察全部放在 L1（能力匹配不需要会话），T9 的 18 行待执行清单也没把它
+  算进去，所以判 `pass`，L3 半未执行写在备注里。
 - **门禁命令**（本表所有 `pass` 都能被它复跑，在仓库根执行）：
   `npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"`
   当前结果：**543 用例 / 543 pass / 0 fail / 0 skipped**（含本表自身的文档契约用例
@@ -97,6 +99,7 @@
 
 | 静态检查项（规格原话） | 状态 | 证据位置 | 备注 |
 |---|---|---|---|
+| 工具 Schema 的 Draft 2020-12 元校验（结构自洽） | `pass` | [schema-static.test.mjs](../../packages/dsh-redteam-lead/test/schema-static.test.mjs)「schema 的 $defs 齐备，且所有 $ref 都能解析」「每个封闭对象都声明了全部 required 属性，且 object 类型确实封闭」；[bundle.test.mjs](../../packages/dsh-redteam-lead/test/bundle.test.mjs)「src/tool-schema.mjs 与 docs/specs/rt-tools.schema.json 逐 $defs 无漂移」 | 零依赖元校验（不引 ajv）：`$ref` 可解析、封闭对象 `required` 齐备、注册投影不漂移。**不是**完整 Draft 2020-12 实现验证——那要外部校验器，属静态检查的已知边界（规格要求的是"对 Schema 执行元校验 + 合法/非法样例"，后者在下面的行里）。 |
 | 默认只读 inspect | `pass` | [validate.test.mjs](../../packages/dsh-redteam-lead/test/validate.test.mjs)「rosterInput：inspect 携带 operation_id 被拒（else 分支的 not 约束）」；[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 作为 Lead：给出可核对提议，且不创建成员/任务、不写 binding 与 roster」 | 默认 `action` 缺省即 `inspect`（`applyDefaults` 用例），且 inspect 带 `operation_id` 会被 `not` 约束拒绝。 |
 | bind / takeover 必填条件 | `pass` | [validate.test.mjs](../../packages/dsh-redteam-lead/test/validate.test.mjs)「rosterInput：action=bind 缺 operation_id 被拒（if/then 条件约束）」「rosterInput：bind/takeover 的 target_kinds 不能为空（then 分支 minItems）」「rosterInput：takeover 缺 recovery_ref 被拒（const 条件），带齐则通过」 | 正例 + 反例都有；`takeover` 的 `recovery_ref` 是 `const` 条件（**T10 补的用例**）。 |
 | 拒绝不支持的清单刷新 action / 返回数据 | `pass` | [validate.test.mjs](../../packages/dsh-redteam-lead/test/validate.test.mjs)「rosterInput：未知 action（含 skill 侧的清单刷新动作）被拒，不静默当成 inspect」；[bundle.test.mjs](../../packages/dsh-redteam-lead/test/bundle.test.mjs)「三工具注册：raw JSON Schema（自包含）、output.schema 为宿主子集投影、render 全能」「handler 抛异常或返回不合规信封时，注册表只看到合法信封（不抛栈）」 | `refresh_tools`/`refresh`/`list` 三种都被 `enum` 拒绝；返回值形状由注册 schema 与宿主校验器镜像守住。 |
