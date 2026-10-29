@@ -1,6 +1,8 @@
 # 评审：`docs/specs/rea-multi-agent.md`
 
-- 评审对象：本仓库 `docs/specs/rea-multi-agent.md`（204 行，状态「待评审」）
+> **状态：已采纳**（2026-10-29）。规格已按本评审的 P0 七条、P1 九条、P2 六条修订完毕（提交 `9bcc268`）；其中五处结论经源码复核后更正，逐条记在规格的「评审更正记录」一节。本文保持评审时的原貌，不随规格回改。
+
+- 评审对象：本仓库 `docs/specs/rea-multi-agent.md`（评审时 204 行，状态「待评审」）
 - 评审日期：2026-10-29
 - 核对基线：DSH 0.2.1-rc.3（宿主打包在 `D:\Apps\DSH\resources\app.asar`），profile `desktop`（`C:\Users\Administrator\.dsh\profiles\desktop`），既有插件 `@local/dsh-rea-plugin`（`D:\workSpace\DSH\redteam-preset`）
 - 方法：逐条把 spec 里的平台断言与宿主实现对照（只读解包 asar + 读 profile 组合 + 一次真实的团队服务会话观察），再把设计逻辑、可测性、接口与体例分轴评审
