@@ -279,6 +279,19 @@ test('空需求返回空结果；重复需求只算一次', () => {
   assert.equal(duplicated.matched.length, 1);
 });
 
+test('嵌套在 all_capabilities 里的 provider 也会出现在 providers 引用中', () => {
+  const bindings = bindingsFor({
+    'mcp:toolchain': { all_capabilities: ['binary-static'] },
+    'binary-static': { any_provider: [provider()] },
+  });
+  const result = matchCapabilities(['mcp:toolchain'], ['pwsh'], inventory(), bindings);
+  assert.equal(result.missing.length, 0);
+  assert.equal(result.matched.length, 1);
+  assert.equal(result.providers.length, 1);
+  assert.equal(result.providers[0].tool_id, 'ida-local');
+  assert.equal(result.providers[0].capability, 'binary-static');
+});
+
 test('同一能力族同时声明两种组合方式时按非法绑定拒绝', () => {
   const bindings = bindingsFor({
     shell: { any_tool: ['pwsh'], all_capabilities: ['fs'] },

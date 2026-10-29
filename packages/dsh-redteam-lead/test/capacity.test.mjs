@@ -4,6 +4,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { planBudget } from '../src/capacity.mjs';
+import { composeTemplate } from '../src/catalog.mjs';
+import { matchCapabilities } from '../src/capability.mjs';
 
 function post(id, priority, extra = {}) {
   return {
@@ -304,4 +306,42 @@ test('没有候选岗位时返回空计划而不是默认建岗', () => {
   assert.deepEqual(result.deferred, []);
   assert.deepEqual(result.disabled, []);
   assert.equal(result.recommended_members, 0);
+});
+
+test('A06 场景：mixed 并集、缺工具、预算只够两岗时稳定裁剪且保留专岗缺口', () => {
+  const composed = composeTemplate('mixed', ['game', 'webapp']);
+  assert.equal(composed.ok, true);
+  // 执行者只有通用 shell/fs/search 工具；jobs 与 web 不可用。
+  const toolNames = ['read', 'write', 'glob', 'grep', 'pwsh', 'bash'];
+  const candidates = composed.posts.map((post) => {
+    const match = matchCapabilities(post.required, toolNames, null, null);
+    return {
+      ...post,
+      capability: { satisfied: match.missing.length === 0, missing: match.missing },
+    };
+  });
+
+  const result = planBudget({
+    candidates,
+    remainingMemberSlots: 2,
+    remainingActivations: 2,
+    reservedMemberSlots: 0,
+    reservedActivations: 0,
+    maxPosts: 6,
+  });
+
+  // 预算两岗：priority 10 的 cross-check 与 20 的 triage 先保留。
+  assert.deepEqual(result.assigned.map((entry) => entry.post_id), ['cross-check', 'triage']);
+  assert.equal(result.recommended_members, 2);
+  // 覆盖缺口：web-recon / web-api 缺 web，binary-dynamic 缺 jobs 与动态 provider。
+  assert.deepEqual(
+    result.vacant.map((entry) => entry.post_id),
+    ['web-recon', 'binary-static', 'binary-dynamic', 'web-api'],
+  );
+  // 工具满足但被预算裁掉的两岗。
+  assert.deepEqual(result.deferred.map((entry) => entry.post_id), ['web-bundle', 'protocol']);
+  // 每个候选岗位都恰好出现在一个状态桶里，既没被静默丢弃，也没被造出来。
+  const all = [...result.assigned, ...result.vacant, ...result.deferred, ...result.disabled];
+  assert.equal(all.length, composed.posts.length);
+  assert.deepEqual(new Set(all.map((entry) => entry.post_id)), new Set(composed.posts.map((entry) => entry.id)));
 });

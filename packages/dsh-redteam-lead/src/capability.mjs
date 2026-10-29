@@ -315,17 +315,22 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
       stack.push(name);
       const parts = [];
       const failures = [];
+      const childProviders = [];
       for (const child of value) {
         const result = resolve(child);
-        if (result.ok) parts.push(result.entry);
-        else failures.push({ child, ...result });
+        if (result.ok) {
+          parts.push(result.entry);
+          childProviders.push(...(result.providers ?? []));
+        } else {
+          failures.push({ child, ...result });
+        }
       }
       stack.pop();
       if (failures.length === 0) {
         return {
           ok: true,
           entry: { capability: name, via: 'all_capabilities', parts },
-          providers: [],
+          providers: childProviders,
         };
       }
       const reason = `能力族 ${name} 需要全部满足：${value.join(', ')}；缺少：${failures
