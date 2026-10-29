@@ -86,6 +86,8 @@ interface OperationRecord {
   input_hash?: unknown
   phase?: string
   data?: { binding?: { team_id?: unknown } } & Record<string, unknown>
+  /** 恢复时随 attempt 记录一起回写（`retry_of` 撤销过就带上原撤销块）。 */
+  revoked?: unknown
 }
 
 /** 适配器绑定快照（`re/team/binding.json` 的三字段投影）。 */
@@ -127,6 +129,13 @@ type MemberDecision =
 /** 交给锁内阶段的成员选择（只剩 reuse/spawn）。 */
 type MemberChoice = { action: 'reuse' | 'spawn'; member: string; failedBefore?: string[] }
 
+/** 锁内确定的成员身份（名字/宿主 id/复用方式）；字段来自适配器，按 `unknown` 收。 */
+interface MemberIdentity {
+  name: unknown
+  id: unknown
+  mode: string
+}
+
 /** 成员决策的「够用部分」：preflight 的计划，或台账里记下的意图。 */
 interface MemberIntentLike {
   action: unknown
@@ -149,6 +158,28 @@ interface CapabilityMatchResult extends CapabilityMatchView {
 interface BudgetPlan {
   assigned: readonly { post_id: unknown }[]
   gaps: readonly { code?: string; reason?: string; next_step?: string }[]
+}
+
+/** `capacity.planBudget` 的入参：本模块实际传的七个键。 */
+interface PlanBudgetInput {
+  candidates: readonly Record<string, unknown>[]
+  remainingMemberSlots: unknown
+  remainingActivations: unknown
+  reuseCandidates: readonly Record<string, unknown>[]
+  maxPosts: number
+  reservedMemberSlots: number
+  reservedActivations: number
+}
+
+/**
+ * 取 `capacity.planBudget` 的调用视图。
+ *
+ * 该模块的形参还没标注（默认值把 `candidates` 推成 `never[]`、余额推成 `null`），与它
+ * JSDoc 记录的入参形状对不上；先收成 `unknown` 再给出本模块的调用签名。运行期拿到的
+ * 还是同一个函数 —— 断言只收敛调用处的类型，不改变任何调用结果（该函数自己兜底非法值）。
+ */
+function planBudgetOf(module: { planBudget?: unknown }): (input: PlanBudgetInput) => BudgetPlan {
+  return module.planBudget as (input: PlanBudgetInput) => BudgetPlan
 }
 
 /** `resources.normalizeResourceNeeds` 的 issues 形状（三字段诊断）。 */
@@ -533,6 +564,36 @@ function errorEnvelope(envelope: EnvelopeModule, {
 /** 适配器码 → 契约码（适配器已经映射过一次；这里只兜底未登记码）。 */
 function stableCode(code: unknown): string {
   return isErrorCode(code) ? code : 'RECOVERY_REQUIRED'
+}
+
+// ---------------------------------------------------------------------------
+// 外部结果读取
+//
+// 适配器/模块结果是**别的模块推断或声明的联合**：`ok` 在未标注时会被宽化成 `boolean`
+// （不能当判别式收窄），字段也只在部分分支上存在。本模块一律**按键读**，读取统一走
+// `recordOf`：对对象是恒等变换，对 `null`/`undefined` 给 `{}` —— 判据仍是「读不到的键
+// 就是 undefined」，与原代码的 `x.field` / `x?.field` 逐字等价。
+// ---------------------------------------------------------------------------
+
+/**
+ * 资源/基准模块的失败诊断 → 契约三字段。
+ *
+ * 这三个字段在那些模块的失败分支里都由 `issue()` / `baselineFailure()` 构造，类型上的
+ * 可选性来自各自的联合返回；这里按原值透传，只把缺字段补成空串
+ * （`$defs.diagnostic` 是封闭三字段）。
+ */
+function diagnosticsOf(value: unknown): Diagnostic[] {
+  const rows = Array.isArray(value) ? value : []
+  const out: Diagnostic[] = []
+  for (const row of rows) {
+    const view = recordOf(row)
+    out.push({
+      code: typeof view.code === 'string' ? view.code : '',
+      reason: typeof view.reason === 'string' ? view.reason : '',
+      next_step: typeof view.next_step === 'string' ? view.next_step : '',
+    })
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,12 +1230,14 @@ async function resolveRetry({
 
   const oldTaskId = nonEmpty(record.task_id) ? record.task_id : null
   if (oldTaskId !== null) {
-    const task = await teamAdapter.getTask(oldTaskId)
-    if (task?.ok === true && (task.task.status === 'completed' || task.task.status === 'deleted')) {
+    const task = recordOf(await teamAdapter.getTask(oldTaskId))
+    // 成功分支才带任务视图；读不到任务（`null`）按「未收口」处理，与原来的判据一致。
+    const taskView = recordOf(task.task)
+    if (task.ok === true && (taskView.status === 'completed' || taskView.status === 'deleted')) {
       return {
         ok: false,
         code: 'STALE_ATTEMPT',
-        reason: `旧 dispatch 的任务 ${oldTaskId} 已是 ${task.task.status}，不能重开宿主已完成/删除的任务`,
+        reason: `旧 dispatch 的任务 ${oldTaskId} 已是 ${taskView.status}，不能重开宿主已完成/删除的任务`,
         next_step: '另发新 dispatch（新 operation_id）；已收口的尝试只入历史',
       }
     }
@@ -1261,9 +1324,9 @@ async function preflight({
   const def = (code: string, reason: string, nextStep: string): { code: string; reason: string; nextStep: string } => ({ code, reason, nextStep })
 
   // (1) 路线 + impact
-  const routeRead = await projectAdapter.readRoute(request.route_id)
-  if (!routeRead || routeRead.ok !== true) {
-    const code = stableCode(routeRead?.code ?? 'PROJECT_NOT_CONFIGURED')
+  const routeRead = recordOf(await projectAdapter.readRoute(request.route_id))
+  if (routeRead.ok !== true) {
+    const code = stableCode(routeRead.code ?? 'PROJECT_NOT_CONFIGURED')
     const unbound = projectAdapter?.projectRoot === undefined
       ? '（projectAdapter 未绑定 projectRoot：这是装配问题，不是项目记录问题——检查 index.js 是否按本次调用的 project_root 装配了项目适配器）'
       : ''
@@ -1272,13 +1335,14 @@ async function preflight({
       envelope: blockedEnvelope(envelope, {
         code,
         operationId: request.operation_id,
-        reason: `读不到路线 ${request.route_id}：${routeRead?.reason ?? 'projectAdapter.readRoute 失败'}${unbound}`,
+        reason: `读不到路线 ${request.route_id}：${routeRead.reason ?? 'projectAdapter.readRoute 失败'}${unbound}`,
         nextStep: '先按项目 skill 建立该路线（问题/判据/预算/目标），再派发；工具不接受自由形状的路线草稿',
       }),
     }
   }
-  const route = routeRead.route
-  const routeId = typeof route?.id === 'string' ? route.id : route?.route_id
+  // 路线记录按字段读（`RouteRecord` 就是 `Record<string, unknown>`）；非对象按空记录处理。
+  const route = recordOf(routeRead.route)
+  const routeId = typeof route.id === 'string' ? route.id : route.route_id
   if (routeId !== request.route_id) {
     return {
       envelope: blockedEnvelope(envelope, {
@@ -1313,13 +1377,13 @@ async function preflight({
     }
   }
 
-  const impact = await projectAdapter.impact()
-  if (!impact || impact.ok !== true) {
+  const impact = recordOf(await projectAdapter.impact())
+  if (impact.ok !== true) {
     return {
       envelope: blockedEnvelope(envelope, {
-        code: stableCode(impact?.code ?? 'CHECK_FAILED'),
+        code: stableCode(impact.code ?? 'CHECK_FAILED'),
         operationId: request.operation_id,
-        reason: `读不到 impact：${impact?.reason ?? impact?.stderr ?? 'projectAdapter.impact 失败'}`,
+        reason: `读不到 impact：${impact.reason ?? impact.stderr ?? 'projectAdapter.impact 失败'}`,
         nextStep: '先修好项目记录/脚本（stderr 保留原文），再派发；不要跳过 impact 校验',
       }),
     }
@@ -1345,8 +1409,8 @@ async function preflight({
   // (2) 路线依赖必须都是有效 validated
   const dependsOnRoutes = Array.isArray(route.depends_on) ? route.depends_on.filter(nonEmpty) : []
   for (const depId of dependsOnRoutes) {
-    const dep = await projectAdapter.readRoute(depId)
-    if (!dep || dep.ok !== true) {
+    const dep = recordOf(await projectAdapter.readRoute(depId))
+    if (dep.ok !== true) {
       return {
         envelope: blockedEnvelope(envelope, {
           code: 'DEPENDENCY_BLOCKED',
@@ -1356,12 +1420,13 @@ async function preflight({
         }),
       }
     }
-    if (dep.route?.status !== 'validated') {
+    const depRoute = recordOf(dep.route)
+    if (depRoute.status !== 'validated') {
       return {
         envelope: blockedEnvelope(envelope, {
           code: 'DEPENDENCY_BLOCKED',
           operationId: request.operation_id,
-          reason: `路线 ${request.route_id} 依赖的路线 ${depId} 状态是 ${JSON.stringify(dep.route?.status)}，不是 validated`,
+          reason: `路线 ${request.route_id} 依赖的路线 ${depId} 状态是 ${JSON.stringify(depRoute.status)}，不是 validated`,
           nextStep: `先按 skill 把路线 ${depId} 做到有效 validated（或显式调整依赖），再派发`,
         }),
       }
@@ -1424,42 +1489,45 @@ async function preflight({
   }
 
   // (4) 预算 / 成员 / 依赖任务
-  const capacity = await teamAdapter.capacity()
-  if (!capacity || capacity.ok !== true) {
+  const capacity = recordOf(await teamAdapter.capacity())
+  if (capacity.ok !== true) {
     return {
       envelope: blockedEnvelope(envelope, {
-        code: stableCode(capacity?.code ?? 'TEAM_SERVICE_UNAVAILABLE'),
+        code: stableCode(capacity.code ?? 'TEAM_SERVICE_UNAVAILABLE'),
         operationId: request.operation_id,
-        reason: `拿不到容量信息：${capacity?.reason ?? 'teamAdapter.capacity() 失败'}`,
+        reason: `拿不到容量信息：${capacity.reason ?? 'teamAdapter.capacity() 失败'}`,
         nextStep: '先修好团队服务/身份；不要靠 spawn 试探余额（会烧名字与席位）',
       }),
     }
   }
-  const members = await teamAdapter.listMembers()
-  if (!members || members.ok !== true) {
+  // `listMembers` 的形参是「可选 agent」：显式传 `undefined` 与不传等价（适配器内部再回落）。
+  const members = recordOf(await teamAdapter.listMembers(undefined))
+  if (members.ok !== true) {
     return {
       envelope: blockedEnvelope(envelope, {
-        code: stableCode(members?.code ?? 'TEAM_SERVICE_UNAVAILABLE'),
+        code: stableCode(members.code ?? 'TEAM_SERVICE_UNAVAILABLE'),
         operationId: request.operation_id,
-        reason: `读不到成员名册：${members?.reason ?? 'teamAdapter.listMembers() 失败'}`,
+        reason: `读不到成员名册：${members.reason ?? 'teamAdapter.listMembers() 失败'}`,
         nextStep: '先修好团队服务，再派发',
       }),
     }
   }
-  const tasks = await teamAdapter.listTasks()
-  if (!tasks || tasks.ok !== true) {
+  const tasks = recordOf(await teamAdapter.listTasks())
+  if (tasks.ok !== true) {
     return {
       envelope: blockedEnvelope(envelope, {
-        code: stableCode(tasks?.code ?? 'TEAM_SERVICE_UNAVAILABLE'),
+        code: stableCode(tasks.code ?? 'TEAM_SERVICE_UNAVAILABLE'),
         operationId: request.operation_id,
-        reason: `读不到任务板：${tasks?.reason ?? 'teamAdapter.listTasks() 失败'}`,
+        reason: `读不到任务板：${tasks.reason ?? 'teamAdapter.listTasks() 失败'}`,
         nextStep: '先修好团队服务，再派发',
       }),
     }
   }
+  const taskRows = recordRows(tasks.tasks)
 
   const memberDecision = decideMember({
-    postId: post.id,
+    // 岗位 ID 来自目录条目：`decideMember` 只在 `rt-<post_id>` 名字模板里用它（模板本来就是 String）。
+    postId: String(post.id),
     members: members.members,
     tasks: tasks.tasks,
     excludeTaskIds,
@@ -1475,18 +1543,22 @@ async function preflight({
     }
   }
 
-  const remainingActivations = capacity.activations?.known === true ? capacity.activations.total : null
-  const budget: BudgetPlan = deps.capacity.planBudget({
+  const activations = recordOf(capacity.activations)
+  const remainingActivations = activations.known === true ? activations.total : null
+  const planBudget = planBudgetOf(deps.capacity)
+  const budget = planBudget({
     candidates: [{
       post_id: post.id,
       priority: post.priority,
       required: post.required,
       optional: post.optional,
       anchors_required: post.anchors_required,
-      enabled: post.enabled !== false,
+      // `disabled` 已在上面早返回里拒绝过；`planBudget` 只按 `enabled === false` 判禁用，
+      // 所以原值透传与原来的 `!== false` 分类一致（`undefined` 仍是「已启用」）。
+      enabled: post.enabled,
       capability: { satisfied: true, missing: [] },
     }],
-    remainingMemberSlots: capacity.memberSlots?.remaining ?? null,
+    remainingMemberSlots: recordOf(capacity.memberSlots).remaining ?? null,
     remainingActivations,
     reuseCandidates: memberDecision.action === 'reuse'
       ? [{ post_id: post.id, member: memberDecision.member, activation_increment: 1 }]
@@ -1514,7 +1586,7 @@ async function preflight({
   // depends_on_tasks → blockedBy：必须已存在且已完成，且只在当前绑定的 team/session 解析
   const currentTeamId = bindingSnapshot(await readBinding(root, deps))?.team_id ?? null
   for (const taskId of request.depends_on_tasks) {
-    const existingTask = tasks.tasks.find((task: Record<string, unknown>) => task.id === taskId)
+    const existingTask = taskRows.find((task) => task.id === taskId)
     if (!existingTask) {
       const foreign = (await listAttemptRecords(root)).find((record) => record.task_id === taskId)
       const foreignBinding = recordOf(foreign?.binding)
@@ -1565,7 +1637,8 @@ async function preflight({
       }),
     }
   }
-  let registry: unknown
+  // 注册表形状由 `resources` 模块决定（本模块只透传）；用它的返回类型，不在这里猜。
+  let registry: Awaited<ReturnType<ResourcesModule['readRegistry']>>
   try {
     registry = await resourcesMod.readRegistry(root)
   } catch (error) {
@@ -1580,21 +1653,22 @@ async function preflight({
       }),
     }
   }
-  const resourcePlan = resourcesMod.planReservations({
+  const resourcePlan = recordOf(resourcesMod.planReservations({
     registry,
     needs: needsNormalized.needs,
     dispatchId,
     attemptId,
     now: typeof deps.clock?.isoNow === 'function' ? deps.clock.isoNow() : new Date().toISOString(),
-  })
-  if (!resourcePlan.ok) {
+  }))
+  if (resourcePlan.ok !== true) {
+    const resourceDiagnostics = diagnosticsOf(resourcePlan.diagnostics)
     return {
       envelope: blockedEnvelope(envelope, {
         code: stableCode(resourcePlan.code),
         operationId: request.operation_id,
-        diagnostics: resourcePlan.diagnostics,
-        reason: resourcePlan.diagnostics[0].reason,
-        nextStep: resourcePlan.diagnostics[0].next_step,
+        diagnostics: resourceDiagnostics,
+        reason: resourceDiagnostics[0]?.reason ?? '资源无法租用',
+        nextStep: resourceDiagnostics[0]?.next_step ?? '核对资源归属后以同一 operation ID 重入',
       }),
     }
   }
@@ -1608,19 +1682,22 @@ async function preflight({
   // 而不是另造一份 T6 时代的 `{frozen_at, targets:[{id,…}]}` 内联对象 —— 那样收口会
   // 以「基准快照路径不是项目内相对路径」直接 RECOVERY_REQUIRED（T12 之前从未跑过这条缝）。
   const dependencyRunIds = Array.isArray(route.dependency_runs) ? route.dependency_runs.filter(nonEmpty) : []
+  // 装配接缝的入参按对象传（两份 `captureBaseline` 的入参形状不同：`baseline` 认 clock/fs，
+  // `contract` 认 dependencyRunIds；各取所需，这里不替它们裁剪）。
+  const captureInput = {
+    root,
+    dispatchId,
+    attemptId,
+    targetIds: request.target_ids,
+    projectAdapter,
+    now: typeof deps.clock?.isoNow === 'function' ? deps.clock.isoNow() : new Date().toISOString(),
+    clock: deps.clock,
+    atomic: deps.atomic,
+    paths: deps.paths,
+    fs: deps.fs,
+  }
   const capture = deps.baseline && typeof deps.baseline.captureBaseline === 'function'
-    ? await deps.baseline.captureBaseline({
-      root,
-      dispatchId,
-      attemptId,
-      targetIds: request.target_ids,
-      projectAdapter,
-      now: typeof deps.clock?.isoNow === 'function' ? deps.clock.isoNow() : new Date().toISOString(),
-      clock: deps.clock,
-      atomic: deps.atomic,
-      paths: deps.paths,
-      fs: deps.fs,
-    })
+    ? await deps.baseline.captureBaseline(captureInput)
     : await contractMod.captureBaseline({
       root,
       targetIds: request.target_ids,
@@ -1631,12 +1708,14 @@ async function preflight({
       dependencyRunIds,
     })
   if (!capture || capture.ok !== true) {
+    // 两条装配路径的失败分支字段不同（`baseline` 给 `issues`、`contract` 给三字段诊断）。
+    const captureView = recordOf(capture)
     return {
       envelope: blockedEnvelope(envelope, {
-        code: stableCode(capture?.code ?? 'BASELINE_MISMATCH'),
+        code: stableCode(captureView.code ?? 'BASELINE_MISMATCH'),
         operationId: request.operation_id,
-        reason: capture?.reason ?? '冻结不了派发基准',
-        nextStep: capture?.next_step ?? '先按 skill 登记目标字节哈希/样本路径，再派发',
+        reason: captureView.reason ?? '冻结不了派发基准',
+        nextStep: captureView.next_step ?? '先按 skill 登记目标字节哈希/样本路径，再派发',
       }),
     }
   }
@@ -1654,7 +1733,7 @@ async function preflight({
       resourcePlan,
       baseline: capture,
       routeTargets,
-      gaps: [...budget.gaps, ...(capacity.gaps ?? [])],
+      gaps: [...budget.gaps, ...(Array.isArray(capacity.gaps) ? capacity.gaps : [])],
       callerName,
     },
   }
@@ -1785,8 +1864,9 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
       phase: 'needs_recovery',
     })
   }
+  const routeReadForContract = recordOf(await projectAdapter.readRoute(request.route_id))
   const routeForContract: RouteRecord | null = plan?.route
-    ?? ((await projectAdapter.readRoute(request.route_id))?.route ?? null)
+    ?? (isPlainObject(routeReadForContract.route) ? routeReadForContract.route : null)
   const requirementsForContract = plan?.requirements ?? contractMod.mergeRequirements(postForPrompt, request)
   const capabilityMatchForContract = plan
     ? {
@@ -1799,36 +1879,37 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
 
   // ---- step 2：资源租用（锁内，幂等） ----
   if (data.resources === undefined) {
-    const reserved = await resourcesMod.reserveResources({
+    const reserved = recordOf(await resourcesMod.reserveResources({
       root,
       needs: request.resource_needs,
       dispatchId,
       attemptId,
       clock,
       atomic,
-    })
-    if (!reserved.ok) {
+    }))
+    if (reserved.ok !== true) {
       // 资源复核失败不落盘；但 operation 台账已写，按「已持久化后失败」给 partial
       const code = stableCode(reserved.code)
+      const reservedDiagnostics = diagnosticsOf(reserved.diagnostics)
       return partialEnvelope(envelope, {
         code,
         operationId,
         phase: 'prepared',
         data: { dispatch_id: dispatchId, attempt_id: attemptId },
-        diagnostics: reserved.diagnostics,
-        reason: reserved.diagnostics?.[0]?.reason ?? '资源无法租用（未建成员、未建任务）',
-        nextStep: reserved.diagnostics?.[0]?.next_step ?? '核对资源归属后以同一 operation ID 重入',
+        diagnostics: reservedDiagnostics,
+        reason: reservedDiagnostics[0]?.reason ?? '资源无法租用（未建成员、未建任务）',
+        nextStep: reservedDiagnostics[0]?.next_step ?? '核对资源归属后以同一 operation ID 重入',
       })
     }
     await advance('prepared', {
-      resources: reserved.reservations.map((reservation: Record<string, unknown>) => ({
+      resources: recordRows(reserved.reservations).map((reservation) => ({
         resource_key: reservation.resource_key,
         physical_identity: reservation.physical_identity,
         mode: reservation.mode,
         generation: reservation.generation,
       })),
       resources_revision: reserved.revision,
-      resource_gaps: reserved.gaps ?? [],
+      resource_gaps: Array.isArray(reserved.gaps) ? reserved.gaps : [],
     })
   }
 
@@ -1847,7 +1928,8 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
       })
     } catch (error) {
       return failure('PATH_INVALID', {
-        reason: `工作区路径不合法：${error?.message ?? '未知路径错误'}`,
+        // 抛出物可能不是 Error：按字段读（等价于迁移前的 `error?.message`）。
+        reason: `工作区路径不合法：${recordOf(error).message ?? '未知路径错误'}`,
         nextStep: '把 re/team/work 恢复为项目内普通目录（不要 junction/symlink）；越界路径一律拒绝',
         phase: 'prepared',
       })
@@ -1883,7 +1965,9 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
       binding: bindingSnap,
       post: postForPrompt,
       route: routeForContract,
-      targets: baselineRef.targets,
+      // `buildContract` 先校验 `baselineRef.targets` 是非空数组（否则抛 BASELINE_MISMATCH），
+      // 校验发生在用它之前；这里只把「非数组」的静态可能收掉，可观察行为不变。
+      targets: Array.isArray(baselineRef.targets) ? baselineRef.targets : [],
       baselineRef,
       objective: request.objective,
       requirements: requirementsForContract,
@@ -1916,14 +2000,18 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
     await contractMod.ensureWorkDir({ root, dispatchId, attemptId, paths })
   }
 
-  const contractRefFinal = data.contract_ref
-  const contractSha256 = data.contract_sha256
+  // 上面的落盘分支保证这两个键已写入（本 attempt 刚写或读自台账）；这里把台账的 `unknown`
+  // 收成字符串。缺键只会出现在**部分写入的旧台账**：那时哈希按空串继续，交付信封会以
+  // SHA256 形状拒绝（与原行为同样是 DELIVERY_FAILED，只是诊断文本里的哈希为空）。
+  const contractRefFinal = nonEmpty(data.contract_ref) ? data.contract_ref : contractRef
+  const contractSha256 = typeof data.contract_sha256 === 'string' ? data.contract_sha256 : ''
 
   // ---- step 4：成员（复用或新建；先存意图，响应丢失按确定名字关联） ----
   if (!nonEmpty(data.member)) {
-    const decision = plan?.memberDecision
+    const memberIntent = recordOf(data.member_intent)
+    const decision: MemberIntentLike | null = plan?.memberDecision
       ?? (isPlainObject(data.member_intent)
-        ? { action: data.member_intent.action, member: data.member_intent.name }
+        ? { action: memberIntent.action, member: memberIntent.name }
         : null)
     if (decision === null) {
       return failure('RECOVERY_REQUIRED', {
@@ -1941,12 +2029,13 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
         },
       })
     }
-    const intent = data.member_intent
-    const membersNow = await teamAdapter.listMembers()
-    const rows = membersNow?.ok === true ? membersNow.members : []
+    // 台账里的意图（`advance` 刚写或恢复时读回）；字段一律按 `unknown` 读。
+    const intent = recordOf(data.member_intent)
+    const membersNow = recordOf(await teamAdapter.listMembers(undefined))
+    const rows = membersNow.ok === true ? recordRows(membersNow.members) : []
     const existingRow = rows.find((row) => row.name === intent.name) ?? null
 
-    let member = null
+    let member: MemberIdentity | null = null
     if (existingRow !== null && existingRow.status !== 'failed' && existingRow.status !== 'provisioning') {
       // 复用目标、或上次 spawn 已生效但响应丢失：按确定的名字唯一关联
       member = { name: existingRow.name, id: existingRow.id, mode: intent.action === 'reuse' ? 'reuse' : 'spawn-adopted' }
@@ -1973,27 +2062,29 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
         rulesEntry: RULES_ENTRY,
         skillCopyPath: SKILL_COPY_ENTRY,
       })
-      const spawned = await teamAdapter.spawnTeammate({
+      const spawned = recordOf(await teamAdapter.spawnTeammate({
         name: intent.name,
         prompt,
         description: `rt_dispatch ${postForPrompt.id} ${request.route_id}`,
-      })
-      if (spawned?.ok === true) {
-        member = { name: spawned.member?.name ?? intent.name, id: spawned.member?.id ?? null, mode: 'spawn' }
+      }))
+      // 成功分支带成员视图（可能是 `null`：适配器把非对象投影成 null）。
+      const spawnedMember = recordOf(spawned.member)
+      if (spawned.ok === true) {
+        member = { name: spawnedMember.name ?? intent.name, id: spawnedMember.id ?? null, mode: 'spawn' }
       } else {
-        const after = await teamAdapter.listMembers()
-        const appeared = after?.ok === true
-          ? after.members.find((row) => row.name === intent.name && row.status !== 'failed' && row.status !== 'provisioning') ?? null
+        const after = recordOf(await teamAdapter.listMembers(undefined))
+        const appeared = after.ok === true
+          ? recordRows(after.members).find((row) => row.name === intent.name && row.status !== 'failed' && row.status !== 'provisioning') ?? null
           : null
         if (appeared !== null) {
           member = { name: appeared.name, id: appeared.id, mode: 'spawn-adopted' }
         } else {
-          const code = stableCode(spawned?.code)
+          const code = stableCode(spawned.code)
           await advance(phase, {
-            member_failed: { name: intent.name, code, reason: spawned?.reason ?? null, at: now() },
+            member_failed: { name: intent.name, code, reason: spawned.reason ?? null, at: now() },
           })
           return failure(code, {
-            reason: `创建成员 ${intent.name} 失败：${spawned?.reason ?? code}。该名字与席位可能已被消耗（D12）`,
+            reason: `创建成员 ${intent.name} 失败：${spawned.reason ?? code}。该名字与席位可能已被消耗（D12）`,
             nextStep: `先核对成员名册确认 ${intent.name} 是否已占用；不要用同名重试，下一次派发会自动用下一个名字`,
             phase: 'member_ready',
             extra: { member: intent.name },
@@ -2030,9 +2121,9 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
       await advance('member_ready', { task_intent: summary })
     }
     const marker = `dispatch=${dispatchId} attempt=${attemptId}`
-    const before = await teamAdapter.listTasks()
-    const matched = before?.ok === true
-      ? before.tasks.filter((task) => typeof task.description === 'string' && task.description.includes(marker))
+    const before = recordOf(await teamAdapter.listTasks())
+    const matched = before.ok === true
+      ? recordRows(before.tasks).filter((row) => typeof row.description === 'string' && row.description.includes(marker))
       : []
     if (matched.length > 1) {
       return failure('RECOVERY_REQUIRED', {
@@ -2041,26 +2132,26 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
         phase: 'member_ready',
       })
     }
-    let task = matched[0] ?? null
+    let task: Record<string, unknown> | null = matched[0] ?? null
     if (task === null) {
-      const created = await teamAdapter.createTask({
+      const created = recordOf(await teamAdapter.createTask({
         subject: summary.subject,
         description: summary.description,
         blockedBy: [...request.depends_on_tasks],
-      })
-      if (created?.ok === true) {
-        task = created.task
+      }))
+      if (created.ok === true) {
+        task = recordOf(created.task)
       } else {
-        const after = await teamAdapter.listTasks()
-        const adopted = after?.ok === true
-          ? after.tasks.filter((candidate) => typeof candidate.description === 'string' && candidate.description.includes(marker))
+        const after = recordOf(await teamAdapter.listTasks())
+        const adopted = after.ok === true
+          ? recordRows(after.tasks).filter((row) => typeof row.description === 'string' && row.description.includes(marker))
           : []
         if (adopted.length === 1) {
           task = adopted[0]
         } else {
-          const code = stableCode(created?.code)
+          const code = stableCode(created.code)
           return failure(code, {
-            reason: `创建任务失败：${created?.reason ?? code}`,
+            reason: `创建任务失败：${created.reason ?? code}`,
             nextStep: '核对任务板与依赖（blockedBy 必须是已存在且已完成的任务），修好后以同一 operation ID 重入',
             phase: 'member_ready',
           })
@@ -2076,52 +2167,55 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
 
   // ---- step 6：指派（reassign → in_progress + owner） ----
   if (data.task_status !== 'in_progress') {
-    const current = await teamAdapter.getTask(data.task_id)
-    if (current?.ok !== true) {
-      return failure(stableCode(current?.code), {
-        reason: `读不到任务 ${data.task_id}：${current?.reason ?? 'getTask 失败'}`,
+    const current = recordOf(await teamAdapter.getTask(data.task_id))
+    const currentTask = recordOf(current.task)
+    if (current.ok !== true) {
+      return failure(stableCode(current.code), {
+        reason: `读不到任务 ${data.task_id}：${current.reason ?? 'getTask 失败'}`,
         nextStep: '核对任务板；任务被删除时另发新 dispatch',
         phase: 'task_created',
       })
     }
-    if (current.task.status === 'completed' || current.task.status === 'deleted') {
+    if (currentTask.status === 'completed' || currentTask.status === 'deleted') {
       return failure('STALE_ATTEMPT', {
-        reason: `任务 ${data.task_id} 已是 ${current.task.status}，不能作为本 attempt 的交付目标`,
+        reason: `任务 ${data.task_id} 已是 ${currentTask.status}，不能作为本 attempt 的交付目标`,
         nextStep: '另发新 dispatch；已收口的任务不要重开',
         phase: 'task_created',
         extra: { task_id: data.task_id },
       })
     }
-    if (current.task.status === 'in_progress' && current.task.owner === memberName) {
-      await advance('assigned', { task_status: 'in_progress', task_revision: current.task.revision })
+    if (currentTask.status === 'in_progress' && currentTask.owner === memberName) {
+      await advance('assigned', { task_status: 'in_progress', task_revision: currentTask.revision })
     } else {
       if (!isPlainObject(data.assign_intent)) {
         await advance('task_created', {
-          assign_intent: { owner: memberName, expected_revision: current.task.revision },
+          assign_intent: { owner: memberName, expected_revision: currentTask.revision },
         })
       }
-      const assigned = await teamAdapter.updateTask({
+      const assigned = recordOf(await teamAdapter.updateTask({
         taskId: data.task_id,
-        expectedRevision: current.task.revision,
+        expectedRevision: currentTask.revision,
         action: 'reassign',
         owner: memberName,
-      })
-      if (assigned?.ok === true) {
-        await advance('assigned', { task_status: 'in_progress', task_revision: assigned.task.revision })
+      }))
+      if (assigned.ok === true) {
+        await advance('assigned', { task_status: 'in_progress', task_revision: recordOf(assigned.task).revision })
       } else {
-        const reread = await teamAdapter.getTask(data.task_id)
-        if (reread?.ok === true && reread.task.status === 'in_progress' && reread.task.owner === memberName) {
-          await advance('assigned', { task_status: 'in_progress', task_revision: reread.task.revision })
+        const reread = recordOf(await teamAdapter.getTask(data.task_id))
+        const rereadTask = recordOf(reread.task)
+        if (reread.ok === true && rereadTask.status === 'in_progress' && rereadTask.owner === memberName) {
+          await advance('assigned', { task_status: 'in_progress', task_revision: rereadTask.revision })
         } else {
-          const code = stableCode(assigned?.code)
+          const code = stableCode(assigned.code)
+          const actualRevision = assigned.actualRevision
           return failure(code, {
-            reason: `指派任务 ${data.task_id} 给 ${memberName} 失败：${assigned?.reason ?? code}`,
+            reason: `指派任务 ${data.task_id} 给 ${memberName} 失败：${assigned.reason ?? code}`,
             nextStep: code === 'REVISION_CONFLICT'
-              ? `任务被改到 revision ${assigned?.actualRevision ?? '未知'}：先核对 owner 与依赖再续做，不要覆盖别人的决策`
+              ? `任务被改到 revision ${actualRevision ?? '未知'}：先核对 owner 与依赖再续做，不要覆盖别人的决策`
               : '核对任务 owner/revision 与依赖状态后以同一 operation ID 重入',
             phase: 'task_created',
             extra: {
-              ...(Number.isInteger(assigned?.actualRevision) ? { actual_revision: assigned.actualRevision } : {}),
+              ...(Number.isInteger(actualRevision) ? { actual_revision: actualRevision } : {}),
             },
           })
         }
@@ -2167,14 +2261,14 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
         },
       })
     }
-    const sent = await teamAdapter.sendMessage({ target: memberName, content: built.blocks })
-    if (sent?.ok !== true) {
-      const code = stableCode(sent?.code)
+    const sent = recordOf(await teamAdapter.sendMessage({ target: memberName, content: built.blocks }))
+    if (sent.ok !== true) {
+      const code = stableCode(sent.code)
       await advance('assigned', {
-        delivery_error: { code, reason: sent?.reason ?? null, at: now(), envelope_id: built.envelope_id },
+        delivery_error: { code, reason: sent.reason ?? null, at: now(), envelope_id: built.envelope_id },
       })
       return failure('DELIVERY_FAILED', {
-        reason: `${code === 'DELIVERY_FAILED' ? '投递交付信封失败' : `投递失败（${code}）`}：${sent?.reason ?? '宿主拒绝了消息'}`,
+        reason: `${code === 'DELIVERY_FAILED' ? '投递交付信封失败' : `投递失败（${code}）`}：${sent.reason ?? '宿主拒绝了消息'}`,
         nextStep: `任务与成员身份已保留（task=${data.task_id} member=${memberName}）：以同一 operation ID 重入只会重发同一份信封，不会再建成员/任务；不要截断契约或把正文塞进消息`,
         phase: 'assigned',
         resolvedCode: 'DELIVERY_FAILED',
@@ -2192,16 +2286,18 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
   const diagnostics = []
   let auditWritten = data.audit_at !== undefined
   if (justDelivered && !auditWritten) {
-    const audit = deps.audit && typeof deps.audit.appendAudit === 'function'
+    // `AuditEntry` 的列都是文本：台账里的任务是字符串（写进去的是字符串 ID），
+    // 非字符串按「没有」处理 —— 审计是 best-effort 的记录，不改变派发判定。
+    const audit = recordOf(deps.audit && typeof deps.audit.appendAudit === 'function'
       ? await deps.audit.appendAudit(root, {
         kind: 'dispatch',
         route: request.route_id,
-        task: data.task_id,
-        member: memberName,
+        task: typeof data.task_id === 'string' ? data.task_id : null,
+        member: typeof memberName === 'string' ? memberName : null,
         requester: callerName,
         verdict: 'delivered',
       }, { clock })
-      : { written: false, error: '缺少 deps.audit' }
+      : { written: false, error: '缺少 deps.audit' })
     auditWritten = audit.written === true
     if (!auditWritten) {
       diagnostics.push(envelope.diagnostic(
