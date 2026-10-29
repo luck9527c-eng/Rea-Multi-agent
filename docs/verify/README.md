@@ -139,7 +139,7 @@ node <仓库根>\packages\dsh-redteam-lead\scripts\l3-verify.mjs diff --before <
 - `gaps`：缺失/读不到的显式清单。刚开会话时 `binding.json`、`dispatches/`、`receipts/` 缺失是**正常**的，
   照实贴即可，不要为了让 gap 变少而手工建文件。
 
-> 这两个 JSON 都是 **UTF-8 无 BOM**（里面的 `label` 有中文）。Windows PowerShell 5.1 的
+> `collect` 与 `diff` 的 JSON 都是 **UTF-8 无 BOM**（里面的 `label` 有中文）。Windows PowerShell 5.1 的
 > `Get-Content`/`ConvertFrom-Json` 默认按 ANSI 读，会乱码甚至报 JSON 解析错——读的时候加
 > `-Encoding utf8`，或者直接用编辑器打开：
 
@@ -157,7 +157,7 @@ Get-Content <证据目录>\sN-diff.json -Raw -Encoding utf8 | ConvertFrom-Json
    这里给出的是**证据文件自身**的哈希）。
 4. 只有在**七步全部有判定**（允许某些断言 `not-run`，但每步都要有结论）之后，才把整层判成 `pass`。
    部分执行的记录照样归档，结论写 `not-run` 或 `fail`。
-5. `docs/verify/acceptance-status.md` 的 L3 行由 T10 汇总；本目录只提供记录，不改总表。
+5. 总表 `docs/verify/acceptance-status.md` 由 T10 汇总（本 ticket 只建了 L3 空壳）；本文件只负责记录本身。
 
 ## 失败了怎么留证
 
