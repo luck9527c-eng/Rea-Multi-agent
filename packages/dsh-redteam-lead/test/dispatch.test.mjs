@@ -517,6 +517,28 @@ test('禁用的岗位 / 工作区被换成 junction → 拒绝且不建成员', 
   assert.deepEqual(await filesUnder(junction.project.root, 're/team/dispatches'), [])
 })
 
+test('前置拒绝在完全没有 re/team 的项目上也不创建任何目录或文件', async (t) => {
+  const { project, ctx, team, input } = setup(t, {
+    files: { 're/team/resources.json': null },
+    capacity: { known: false },
+    tools: { default: { read: {}, glob: {}, grep: {} } },
+  })
+
+  const { envelope } = await handleDispatch(ctx, input())
+  assertEnvelopeShape(envelope, { expectStatus: 'blocked' })
+  assert.equal(envelope.code, 'CAPABILITY_MISSING')
+
+  let exists = true
+  try {
+    await stat(join(project.root, 're', 'team'))
+  } catch {
+    exists = false
+  }
+  assert.equal(exists, false, '前置拒绝不得创建 re/team/（锁、台账、契约、资源都不行）')
+  assert.equal(team.callsFor('spawnTeammate').length, 0)
+  assert.equal(team.callsFor('createTask').length, 0)
+})
+
 // ---------------------------------------------------------------------------
 // 超长契约 / 交付
 // ---------------------------------------------------------------------------
