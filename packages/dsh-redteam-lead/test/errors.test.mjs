@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { ContractError, ERROR_CODES, ERROR_GROUPS, isContractError, isErrorCode } from '../src/errors.mjs'
+import { ContractError, ERROR_CODES, ERROR_GROUPS, isContractError, isErrorCode } from '../dist/errors.js'
 import { loadSpecJson } from './helpers/tmp.mjs'
 
 /** 契约表逐字顺序（orchestration-contract.md「稳定错误码」）。 */

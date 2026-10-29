@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { ContractError, ERROR_CODES } from '../src/errors.mjs'
+import { ContractError, ERROR_CODES } from '../dist/errors.js'
 import {
   FAILURE_PHASES,
   RESULT_STATUSES,
@@ -12,8 +12,8 @@ import {
   fromError,
   ok,
   partial,
-} from '../src/envelope.mjs'
-import { validateInput } from '../src/validate.mjs'
+} from '../dist/envelope.js'
+import { validateInput } from '../dist/validate.js'
 import { loadSpecJson } from './helpers/tmp.mjs'
 
 const OPERATION_ID = 'op-roster-1'

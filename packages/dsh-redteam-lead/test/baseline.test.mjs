@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import * as fsp from 'node:fs/promises'
 import path from 'node:path'
 
-import * as atomic from '../src/atomic.mjs'
-import * as paths from '../src/paths.mjs'
+import * as atomic from '../dist/atomic.js'
+import * as paths from '../dist/paths.js'
 import { makeClock, makeTempProject } from './helpers/host.mjs'
 import { createFakeProject } from './helpers/fake-project.mjs'
 import {
@@ -14,7 +14,7 @@ import {
   compareBaseline,
   loadBaseline,
   sealRunSet,
-} from '../src/baseline.mjs'
+} from '../dist/baseline.js'
 
 const SHA = (char) => char.repeat(64)
 

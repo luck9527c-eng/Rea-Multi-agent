@@ -3,15 +3,15 @@ import assert from 'node:assert/strict'
 import * as fsp from 'node:fs/promises'
 import path from 'node:path'
 
-import * as atomic from '../src/atomic.mjs'
-import * as baseline from '../src/baseline.mjs'
-import * as paths from '../src/paths.mjs'
-import * as validate from '../src/validate.mjs'
-import { schemaDefs } from '../src/tool-schema.mjs'
+import * as atomic from '../dist/atomic.js'
+import * as baseline from '../dist/baseline.js'
+import * as paths from '../dist/paths.js'
+import * as validate from '../dist/validate.js'
+import { schemaDefs } from '../dist/tool-schema.js'
 import { makeCtx, makeTempProject } from './helpers/host.mjs'
 import { createFakeProject } from './helpers/fake-project.mjs'
 import { createFakeTeam } from './helpers/fake-team.mjs'
-import { handleConclude } from '../src/conclude.mjs'
+import { handleConclude } from '../dist/conclude.js'
 
 const SHA = (char) => char.repeat(64)
 

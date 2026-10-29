@@ -7,7 +7,7 @@ import {
   composeTemplate,
   defaultCatalog,
   validateCatalog,
-} from '../src/catalog.mjs';
+} from '../dist/catalog.js';
 
 /** 把目录深拷贝一份，供「篡改后应被拒绝」的用例使用。 */
 function cloneCatalog() {

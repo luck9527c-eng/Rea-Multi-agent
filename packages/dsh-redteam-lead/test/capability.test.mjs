@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { matchCapabilities } from '../src/capability.mjs';
+import { matchCapabilities } from '../dist/capability.js';
 
 const SHA = 'a'.repeat(64);
 const REGISTRY = [

@@ -24,9 +24,9 @@ import { readFileSync } from 'node:fs'
 import { readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 
-import { handleRoster } from '../src/roster.mjs'
-import { createTeamAdapter } from '../src/team-adapter.mjs'
-import { validateInput } from '../src/validate.mjs'
+import { handleRoster } from '../dist/roster.js'
+import { createTeamAdapter } from '../dist/team-adapter.js'
+import { validateInput } from '../dist/validate.js'
 import { makeCtx, makeTempProject } from './helpers/host.mjs'
 
 const SHA256 = /^[0-9a-f]{64}$/u

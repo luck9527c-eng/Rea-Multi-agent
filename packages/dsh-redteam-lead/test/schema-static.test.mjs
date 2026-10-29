@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { defaultCatalog, validateCatalog } from '../src/catalog.mjs';
+import { defaultCatalog, validateCatalog } from '../dist/catalog.js';
 
 const schemaUrl = new URL('../../../docs/specs/rt-tools.schema.json', import.meta.url);
 const catalogUrl = new URL('../../../docs/specs/roster-catalog.json', import.meta.url);

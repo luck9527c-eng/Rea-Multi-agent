@@ -12,9 +12,9 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import * as atomic from '../src/atomic.mjs'
-import * as resources from '../src/resources.mjs'
-import { ContractError } from '../src/errors.mjs'
+import * as atomic from '../dist/atomic.js'
+import * as resources from '../dist/resources.js'
+import { ContractError } from '../dist/errors.js'
 import { makeTempProject } from './helpers/host.mjs'
 
 const NOW = '2026-10-29T08:00:00.000Z'

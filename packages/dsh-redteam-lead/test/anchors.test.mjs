@@ -7,7 +7,7 @@ import {
   parseLocator,
   validateAnchorRef,
   validateAnchorSet,
-} from '../src/anchors.mjs'
+} from '../dist/anchors.js'
 
 const SHA = (char) => char.repeat(64)
 const RUN = 'RUN-1'

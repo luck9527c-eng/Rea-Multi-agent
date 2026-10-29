@@ -18,7 +18,7 @@ import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 import { makeTempProject } from './helpers/host.mjs'
-import * as binding from '../src/binding.mjs'
+import * as binding from '../dist/binding.js'
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex')

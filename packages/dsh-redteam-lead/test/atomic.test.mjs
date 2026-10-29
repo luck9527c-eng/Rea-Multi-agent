@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError } from '../src/errors.mjs'
+import { ContractError } from '../dist/errors.js'
 import {
   DEFAULT_REPLACE_ATTEMPTS,
   TRANSIENT_REPLACE_CODES,
@@ -13,7 +13,7 @@ import {
   sha256File,
   verifyFileHash,
   writeJsonAtomic,
-} from '../src/atomic.mjs'
+} from '../dist/atomic.js'
 import { makeTempProject } from './helpers/tmp.mjs'
 
 /** 断言抛 OPERATION_CONFLICT（内容/哈希冲突在契约里归到这一个稳定码）。 */

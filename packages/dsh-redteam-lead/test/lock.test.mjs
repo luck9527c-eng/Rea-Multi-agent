@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError } from '../src/errors.mjs'
-import { LOCK_PATH, acquire, isStale, ownProcessIdentity, readLock, release, staleReasons } from '../src/lock.mjs'
+import { ContractError } from '../dist/errors.js'
+import { LOCK_PATH, acquire, isStale, ownProcessIdentity, readLock, release, staleReasons } from '../dist/lock.js'
 import { makeTempProject } from './helpers/tmp.mjs'
 
 /** 固定假时钟，用来断言「过期不等于自动解锁」。 */

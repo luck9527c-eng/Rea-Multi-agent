@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { AUDIT_FIELDS, AUDIT_PATH, appendAudit } from '../src/audit.mjs'
+import { AUDIT_FIELDS, AUDIT_PATH, appendAudit } from '../dist/audit.js'
 import { makeTempProject } from './helpers/tmp.mjs'
 
 const clock = { isoNow: () => '2026-10-29T08:00:00.000Z', now: () => Date.parse('2026-10-29T08:00:00.000Z') }

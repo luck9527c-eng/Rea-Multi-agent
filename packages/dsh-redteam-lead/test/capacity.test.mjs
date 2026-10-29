@@ -3,9 +3,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { planBudget } from '../src/capacity.mjs';
-import { composeTemplate } from '../src/catalog.mjs';
-import { matchCapabilities } from '../src/capability.mjs';
+import { planBudget } from '../dist/capacity.js';
+import { composeTemplate } from '../dist/catalog.js';
+import { matchCapabilities } from '../dist/capability.js';
 
 function post(id, priority, extra = {}) {
   return {
