@@ -213,3 +213,9 @@ pm run build 通路正常（无 .ts 时如实报 TS18003 并非零退出）。
 oUncheckedIndexedAccess: false**。理由：本次是**机械迁移**，目标是把模块边界的类型钉住，而不是在迁移途中跟每一处 obj[key] 搏斗；打开它会让迁移量成倍膨胀且容易诱发「加 ! 兜底」的伪类型安全。要开另立 ticket。
 
 **踩到的坑（复用价值高）**：Windows 上 Node ≥ 18.20 因 CVE-2024-27980 的修正，在 shell: false 下**拒绝 spawn .cmd/.bat**，会抛 spawn EINVAL。所以 scripts/build.mjs 用 `process.execPath` + `node_modules/typescript/bin/tsc` 的 **JS 入口**，而不是 `.bin/tsc.cmd`。任何要调外部程序的代码都适用这条：优先找 .exe 或 JS 入口，不要靠 .cmd shim，也**不要**为了跑通而打开 shell: true（那会引入注入面）。
+
+## D31 — 测试保持 `.mjs`（T13 明确降级为后续项）
+
+产品代码已全部是 TypeScript（`src/*.ts` → `dist/`，`tsc` 0 错、`strict: true`）。**测试保持 `.mjs` 并 import `dist/*.js`** —— 它们跑的是要发货的字节，行为断言完整。
+
+未做「测试也转 TS」（T13）的理由：它只增加测试内部类型，不改变被测行为；而当前剩余工作（真实 skill 集成、第三层验收套件、验收总表、代码审查）对交付价值更高。**这是有意的降级，不是遗漏**：T13 的 ticket 保留，可随时执行，门禁届时切到 `test/**/*.test.ts`。
