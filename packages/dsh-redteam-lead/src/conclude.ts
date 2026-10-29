@@ -45,6 +45,264 @@ import * as submissionModule from './submission.js'
 import * as validateModule from './validate.js'
 import { createProjectAdapter } from './project-adapter.js'
 import { createTeamAdapter } from './team-adapter.js'
+import { isRecord, recordOf, thrownMessage } from './guards.js'
+import type { Clock, Deps, Diagnostic, Envelope, FsLike, HandlerCtx, HandlerResult } from './types.js'
+
+/* -------------------------------------------------------------------------- */
+/* 本模块自己的形状（共享层只收跨模块契约，其余就地声明）                        */
+/* -------------------------------------------------------------------------- */
+
+/** `envelope` 模块的命名空间类型（`deps.envelope` 与真实模块同形状）。 */
+type EnvelopeModule = typeof envelopeModule
+
+/** 七类结果表的一行（与 `OUTCOME_RULES` 的值逐字同形）。 */
+interface OutcomeRule {
+  route_statuses: readonly string[]
+  requires_runs: boolean
+  requires_anchors: boolean
+  success_dependency: string
+}
+
+/**
+ * 装配后的依赖：模块键与真实模块同形状，缺哪个就回落到本包实现。
+ *
+ * `index.ts` 给的就是 SEAMS §1 的 `Deps`（`envelope` 等是模块命名空间，`clock`/`fs` 是注入实现）；
+ * 这里是**收窄后的视图**，每个键都已确定可用，调用点才不必到处判空。
+ */
+interface ResolvedModules {
+  envelope: EnvelopeModule
+  errors: typeof errorsModule
+  validate: typeof validateModule
+  paths: typeof pathsModule
+  atomic: typeof atomicModule
+  lock: typeof lockModule
+  identity: typeof identityModule
+  operation: typeof operationModule
+  audit: typeof auditModule
+  submission: typeof submissionModule
+  anchors: typeof anchorsModule
+  baseline: typeof baselineModule
+  clock: Clock
+  fs: FsLike
+}
+
+/**
+ * `$defs.review` 的八个必填字段。
+ *
+ * 只把「后续按字符串用」的字段写成具体类型；其余保持 `unknown` —— 本文件读到就按未知处理
+ * （`closureForStatus` / `buildRouteUpdate` 里逐处 `typeof` 收窄）。
+ */
+interface ConcludeReview {
+  outcome: string
+  summary: unknown
+  reason: unknown
+  proposed_route_status: string
+  evidence_run_ids: string[]
+  anchor_refs: readonly unknown[]
+  limitations: string[]
+  next_step: string | null
+}
+
+/**
+ * `$defs.concludeInput` 的有效形状。
+ *
+ * **只在 `checkInputShape()` 返回 `ok: true` 之后成立**：那一步逐字段核对了八个必填项与
+ * `review` 的八字段（`checkInputShape` 是唯一把入参从 `unknown` 收成这个形状的地方）。
+ */
+interface ConcludeInput {
+  project_root: string
+  operation_id: string
+  dispatch_id: string
+  attempt_id: string
+  task_id: string
+  expected_revision: number
+  submission_ref: string
+  submission_sha256: string
+  review: ConcludeReview
+}
+
+/**
+ * 派发记录（`re/team/dispatches/<D>.json`）。
+ *
+ * 只给 `ref` 定类型（本文件自己拼的），其余**按未知读**：T6 写、T7 只读，字段形状要与
+ * attempt 关联记录 / `contract` 内嵌两种形状对齐（见 `readDispatchContext` 的注释）。
+ */
+interface DispatchRecord {
+  ref: string
+  dispatch_id: unknown
+  attempt_id: unknown
+  task_id: unknown
+  route_id: unknown
+  member: unknown
+  contract_sha256: unknown
+  rule_digest: unknown
+  baseline_ref: unknown
+  baseline: unknown
+  target_ids: unknown
+  anchors_required: unknown
+  evidence_required: unknown
+  work_dir: unknown
+  contract_ref: unknown
+}
+
+/** attempt 关联记录（`re/team/attempts/<D>.<A>.json`）：只有三个键本文件要用。 */
+interface AttemptLink {
+  task_id?: unknown
+  member?: unknown
+  contract_sha256?: unknown
+}
+
+/** 提交记录（`submission.json`，已由 `submission.readVerifiedSubmission` 校验过）。 */
+interface SubmissionArtifact {
+  path: string
+  sha256: string
+}
+
+/** 提交记录里本文件用到的字段。 */
+interface SubmissionRecord {
+  task_id?: unknown
+  contract_sha256?: unknown
+  outcome?: unknown
+  run_ids: string[]
+  anchor_refs?: unknown[]
+  state_recovery_ref?: unknown
+  artifacts: SubmissionArtifact[]
+}
+
+/** 路线记录（`re/routes/<R>.json`，项目 skill 写；本文件读判据后整体回写）。 */
+interface RouteRecord {
+  id?: string
+  status?: string
+  state_reason?: unknown
+  resume_when?: string
+  closure?: unknown
+  target_ids?: unknown[]
+  evidence?: unknown[]
+  history?: unknown[]
+  [key: string]: unknown
+}
+
+/** 路线 history 的一条事件（`prior_closure` 只在该事件的 `from` 已是终态时出现）。 */
+interface RouteHistoryEvent {
+  at: string
+  from: unknown
+  to: string
+  reason: unknown
+  evidence: string[]
+  prior_closure?: unknown
+}
+
+/** 一条 RUN 的收口视图：`project.readRun()` 的原始记录 + 摘要。 */
+interface RunEntry {
+  run_id: string
+  status: unknown
+  artifacts: unknown[]
+  record: unknown
+}
+
+/** 一条检查输出（`concludeData.checks` 的条目与回执里的同名字段）。 */
+interface CheckEntry {
+  name: string
+  status: 'pass'
+  output_ref: string
+  exit_code: number | null
+}
+
+/** 前提复核产出的影响摘要（回执的 `premise_impact`）。 */
+interface PremiseImpact {
+  pending_reviews: number
+  dispute_impacts: number
+  recovery_pending: number
+}
+
+/**
+ * 收口流程用到的团队适配器面。
+ *
+ * 只有 `getTask` / `updateTask` 两个方法；返回值按 `unknown` 收（适配器返回的是
+ * `{ok,…}` 判别联合，本文件逐处判空，不依赖适配器内部形状）。
+ */
+interface ConcludeTeam {
+  getTask(taskId: string): Promise<unknown>
+  updateTask(request: { taskId: string; expectedRevision: number; action: 'complete' }): Promise<unknown>
+}
+
+/** 收口流程用到的项目适配器面（七个只读/派生入口，返回值按 `unknown` 收）。 */
+interface ConcludeProject {
+  readRun(runId: string): Promise<unknown>
+  readRoute(routeId: unknown): Promise<unknown>
+  readSeals(): Promise<unknown>
+  impact(): Promise<unknown>
+  index(): Promise<unknown>
+  check(options: { hashes: boolean; complete: boolean }): Promise<unknown>
+  probe(options: { projectRoot: string }): Promise<unknown>
+}
+
+/** 适配器工厂（SEAMS §1 的两种 deps 形状之一：函数则每次调用新建实例）。 */
+type AdapterFactory = (input: Record<string, unknown>) => Promise<unknown>
+
+/* ---- 未标注返回类型的模块结果（`submission` / `anchors` / `baseline`） ---- */
+
+/**
+ * 把「结构已知但没有返回类型标注」的模块结果贴回判别联合。
+ *
+ * 断言的理由：`submission` / `anchors` / `baseline` 三个模块的返回是
+ * `{ok:true, …}` / `{ok:false, code, issues}` 两种对象，但函数**没有返回类型标注**，
+ * `ok` 因此被拓宽成 `boolean`，TS 无法按判别联合收窄（报「属性可能不存在」）。
+ * 本文件对它们的用法只有三条：`ok === true` 判成功、失败支读 `code`/`issues`、
+ * 成功支读载荷 —— 与运行时逐字一致。断言不重建对象、不改判据、不补默认值，
+ * 因此不改变任何字节，只把同一个对象贴回它本来的形状。
+ */
+function resultOf<T>(value: unknown): T {
+  return value as T
+}
+
+/** `anchors.mergeRequiredKinds()` 的结果（无 `ok` 判别，两种来源的 issue 都回在这里）。 */
+interface MergedKinds {
+  kinds: string[]
+  issues: Diagnostic[]
+}
+
+/** `submission.readVerifiedSubmission()` 的结果。 */
+type VerifiedSubmissionRead =
+  | { ok: true; submission: SubmissionRecord; bytes: unknown; sha256: string; relative_path: string }
+  | { ok: false; code: string; issues: Diagnostic[] }
+
+/** `anchors.validateAnchorSet()` 的结果。 */
+type AnchorCheckRead =
+  | { ok: true }
+  | { ok: false; code: string; issues: Diagnostic[] }
+
+/** `baseline.loadBaseline()` 的结果（成功支带项目内 `ref` 与快照本体）。 */
+type LoadedBaselineRead =
+  | { ok: true; ref: string; baseline: object }
+  | { ok: false; code: string; issues: Diagnostic[] }
+
+/** `baseline.compareBaseline()` 的结果。 */
+type ComparedBaselineRead =
+  | { ok: true; compared: unknown }
+  | { ok: false; code: string; issues: Diagnostic[] }
+
+/** `sealRunSet()` 的一条 seal 结果（`action` 为 `skipped` 的不进回执）。 */
+interface SealResultEntry {
+  run_id: string
+  action: string
+  path?: unknown
+  exit_code?: unknown
+  [key: string]: unknown
+}
+
+/** `baseline.sealRunSet()` 的结果。 */
+type SealRunSetRead =
+  | { ok: true; results: SealResultEntry[] }
+  | {
+    ok: false
+    code: string
+    issues: Diagnostic[]
+    run_id?: unknown
+    exit_code?: unknown
+    stdout?: unknown
+    stderr?: unknown
+  }
 
 /** 七类结果允许的路线变化与成功依赖（编排契约的七行表，数据驱动）。 */
 export const OUTCOME_RULES = Object.freeze({
@@ -132,21 +390,59 @@ const DEFAULT_CLOCK = {
   isoNow: () => new Date().toISOString(),
 }
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function diag(code, reason, nextStep) {
+/** 契约诊断（三字段封闭形状，见 `$defs.diagnostic`）。 */
+function diag(code: string, reason: string, nextStep: string): Diagnostic {
   return envelopeModule.diagnostic(code, reason, nextStep)
 }
 
-function isStableCode(code) {
+/** 是否是契约里登记过的稳定错误码（是则收窄成 `string`，供信封直接用）。 */
+function isStableCode(code: unknown): code is string {
   return typeof code === 'string' && errorsModule.isErrorCode(code)
 }
 
+/**
+ * 七类结果表里取一行；未知 outcome（含原型链上的名字）给 `undefined`。
+ *
+ * 与 `OUTCOME_RULES[outcome]` 的取值逐字等价（`Object.hasOwn` 不参与判断），
+ * 只是让「可能没有这一行」在类型上成立。
+ */
+function outcomeRuleOf(outcome: string): OutcomeRule | undefined {
+  const table: Readonly<Record<string, OutcomeRule>> = OUTCOME_RULES
+  return table[outcome]
+}
+
+/**
+ * 重放已落盘的信封：逐字保留 `{ ...stored, replayed: true }`。
+ *
+ * 断言的理由：`stored` 只可能由本文件写出（台账 `saveResult()` 与最终回执的 `result: envelope`），
+ * 形状就是本文件的 `envelope`；这里不重建、不补字段，写坏的回执仍会在调用方的
+ * `$defs.result` 校验里被拒（`index.ts` 的二次校验），所以类型口径不改变任何字节。
+ */
+function replayEnvelope(stored: unknown): Envelope {
+  return resultOf<Envelope>({ ...recordOf(stored), replayed: true })
+}
+
+/**
+ * 审计条目里的列值。
+ *
+ * `audit.AuditEntry` 把 `member` 声明成 `string | null`，但 `audit.column()` 本身按未知处理
+ * （数字/布尔会被转成文本）。派发记录里的成员是任意 JSON 值，这里保持原值 —— 断言的理由：
+ * 转换反而会改变 `audit.jsonl` 的字节，而写入方接受未知值。
+ */
+function auditColumn(value: unknown): string | null {
+  return value as string | null
+}
+
 /** 依赖解析：deps 里给了就用，没给（或为 null）就用本包真实模块。 */
-function resolveModules(ctx) {
-  const deps = ctx?.deps ?? {}
+function resolveModules(ctx: unknown): ResolvedModules {
+  // 逐字保留「ctx/deps 不是对象就当作没有」的降级（handler 绝不 reject）。
+  // 两段式断言的理由：`Record<string, unknown>` 与 SEAMS §1 的 `Deps` 没有索引签名重叠，
+  // 不能单段 `as`；而装配层给的确实就是 `Deps` 形状 —— 缺的键由下面的 `??` 回落到本包实现。
+  const deps = recordOf(recordOf(ctx).deps) as unknown as Deps
   return {
     envelope: deps.envelope ?? envelopeModule,
     errors: deps.errors ?? errorsModule,
@@ -165,38 +461,56 @@ function resolveModules(ctx) {
   }
 }
 
-async function resolveTeam(ctx, root) {
-  const dep = ctx?.deps?.teamAdapter
-  if (dep && typeof dep.getTask === 'function') return dep
-  if (typeof dep === 'function') {
+/** 是团队适配器实例：`getTask` 是 SEAMS §1 实例的判别方法（逐字保留原有的存在性判断）。 */
+function isTeamAdapter(value: unknown): value is ConcludeTeam {
+  return isRecord(value) && typeof value.getTask === 'function'
+}
+
+/** 是项目适配器实例：`readRoute` 是本包实例的判别方法。 */
+function isProjectAdapter(value: unknown): value is ConcludeProject {
+  return isRecord(value) && typeof value.readRoute === 'function'
+}
+
+/** 是适配器工厂（SEAMS §1 的另一种 deps 形状）。 */
+function isAdapterFactory(value: unknown): value is AdapterFactory {
+  return typeof value === 'function'
+}
+
+async function resolveTeam(ctx: unknown, root: string): Promise<ConcludeTeam | null> {
+  const view = recordOf(ctx)
+  const dep = recordOf(view.deps).teamAdapter
+  if (isTeamAdapter(dep)) return dep
+  if (isAdapterFactory(dep)) {
     try {
       const created = await dep({
-        services: ctx.services,
-        exec: ctx.exec,
-        agent: ctx.exec?.agent,
-        config: ctx.config,
+        services: view.services,
+        exec: view.exec,
+        agent: recordOf(view.exec).agent,
+        config: view.config,
         projectRoot: root,
-        deps: ctx.deps,
+        deps: view.deps,
       })
-      if (created && typeof created.getTask === 'function') return created
+      if (isTeamAdapter(created)) return created
     } catch {
       return null
     }
     return null
   }
-  if (ctx?.services?.agentTeams !== undefined) {
-    return createTeamAdapter({ services: ctx.services, exec: ctx.exec, config: ctx.config, projectRoot: root })
+  const services = recordOf(view.services)
+  if (services.agentTeams !== undefined) {
+    return createTeamAdapter({ services: view.services, exec: view.exec, config: view.config, projectRoot: root })
   }
   return null
 }
 
-async function resolveProject(ctx, root) {
-  const dep = ctx?.deps?.projectAdapter
-  if (dep && typeof dep.readRoute === 'function') return dep
-  if (typeof dep === 'function') {
+async function resolveProject(ctx: unknown, root: string): Promise<ConcludeProject | null> {
+  const view = recordOf(ctx)
+  const dep = recordOf(view.deps).projectAdapter
+  if (isProjectAdapter(dep)) return dep
+  if (isAdapterFactory(dep)) {
     try {
-      const created = await dep({ projectRoot: root, config: ctx.config, deps: ctx.deps })
-      if (created && typeof created.readRoute === 'function') return created
+      const created = await dep({ projectRoot: root, config: view.config, deps: view.deps })
+      if (isProjectAdapter(created)) return created
     } catch {
       return null
     }
@@ -205,18 +519,19 @@ async function resolveProject(ctx, root) {
   return null
 }
 
-function sessionOf(ctx, caller) {
+function sessionOf(ctx: unknown, caller: { root?: string | null } | null): unknown {
   const fromCaller = typeof caller?.root === 'string' && caller.root.length > 0 ? caller.root : null
+  const view = recordOf(ctx)
   return fromCaller
-    ?? ctx?.config?.sessionId
-    ?? ctx?.exec?.sessionId
-    ?? ctx?.services?.agentTeams?.teamId
+    ?? recordOf(view.config).sessionId
+    ?? recordOf(view.exec).sessionId
+    ?? recordOf(recordOf(view.services).agentTeams).teamId
     ?? null
 }
 
-function epochOf(ctx) {
-  const value = ctx?.config?.epoch
-  return Number.isSafeInteger(value) ? value : null
+function epochOf(ctx: unknown): number | null {
+  const value = recordOf(recordOf(ctx).config).epoch
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : null
 }
 
 /* -------------------------------------------------------------------------- */
@@ -227,9 +542,11 @@ function epochOf(ctx) {
  * 入参形状检查（schema 之外的最后一道防线：测试与直接调用都可能绕过宿主校验）。
  * @returns {{ok: true, value: object} | {ok: false, issues: object[]}}
  */
-export function checkInputShape(input) {
-  const issues = []
-  const bad = (reason, nextStep) => issues.push(diag('INVALID_ARGUMENT', reason, nextStep))
+export function checkInputShape(
+  input: unknown,
+): { ok: true; value: ConcludeInput } | { ok: false; issues: Diagnostic[] } {
+  const issues: Diagnostic[] = []
+  const bad = (reason: string, nextStep: string) => issues.push(diag('INVALID_ARGUMENT', reason, nextStep))
 
   if (!isPlainObject(input)) {
     return { ok: false, issues: [diag('INVALID_ARGUMENT', 'rt_conclude 的输入必须是对象', '按 $defs.concludeInput 传参')] }
@@ -250,7 +567,8 @@ export function checkInputShape(input) {
   if (typeof input.task_id !== 'string' || input.task_id.trim().length === 0) {
     bad('缺少 task_id', '传入派发时登记的宿主 task id')
   }
-  if (!Number.isSafeInteger(input.expected_revision) || input.expected_revision < 0) {
+  const revision = input.expected_revision
+  if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
     bad('expected_revision 必须是 >=0 的整数', '传入读任务时的 revision（CAS）')
   }
   if (typeof input.submission_ref !== 'string' || input.submission_ref.length === 0) {
@@ -267,19 +585,23 @@ export function checkInputShape(input) {
     for (const field of REVIEW_FIELDS) {
       if (!Object.hasOwn(review, field)) bad(`review 缺少必填字段 ${field}`, '按 $defs.review 补齐')
     }
-    if (!submissionModule.OUTCOMES.includes(review.outcome)) {
-      bad(`review.outcome 不在七类结果里：${JSON.stringify(review.outcome)}`, `outcome 只能取 ${submissionModule.OUTCOMES.join('|')}`)
+    const outcome = review.outcome
+    if (typeof outcome !== 'string' || !submissionModule.OUTCOMES.includes(outcome)) {
+      bad(`review.outcome 不在七类结果里：${JSON.stringify(outcome)}`, `outcome 只能取 ${submissionModule.OUTCOMES.join('|')}`)
     }
-    if (!ROUTE_STATUSES.includes(review.proposed_route_status)) {
-      bad(`review.proposed_route_status 不是 skill 路线状态：${JSON.stringify(review.proposed_route_status)}`, `只能取 ${ROUTE_STATUSES.join('|')}`)
+    const proposed = review.proposed_route_status
+    if (typeof proposed !== 'string' || !ROUTE_STATUSES.includes(proposed)) {
+      bad(`review.proposed_route_status 不是 skill 路线状态：${JSON.stringify(proposed)}`, `只能取 ${ROUTE_STATUSES.join('|')}`)
     }
-    if (!Array.isArray(review.evidence_run_ids) || review.evidence_run_ids.some((id) => typeof id !== 'string')) {
+    const evidenceRunIds = review.evidence_run_ids
+    if (!Array.isArray(evidenceRunIds) || evidenceRunIds.some((id) => typeof id !== 'string')) {
       bad('review.evidence_run_ids 必须是 RUN 标识数组', '给出本次判定依据的 RUN ID 列表')
     }
     if (!Array.isArray(review.anchor_refs)) {
       bad('review.anchor_refs 必须是数组', '没有锚点时给 []')
     }
-    if (!Array.isArray(review.limitations) || review.limitations.some((item) => typeof item !== 'string')) {
+    const limitations = review.limitations
+    if (!Array.isArray(limitations) || limitations.some((item) => typeof item !== 'string')) {
       bad('review.limitations 必须是字符串数组', '如实记录局限；没有也要给 []')
     }
     if (review.next_step !== null && typeof review.next_step !== 'string') {
@@ -288,12 +610,21 @@ export function checkInputShape(input) {
   }
 
   if (issues.length > 0) return { ok: false, issues }
-  return { ok: true, value: input }
+  // 断言的理由：上面逐字段核对了八个必填项与 review 的八字段；`value` 交回的是同一个入参对象
+  // （不复制、不补默认值），所以这里的形状就是 `ConcludeInput` 的成立条件。
+  return { ok: true, value: resultOf<ConcludeInput>(input) }
 }
 
 /* -------------------------------------------------------------------------- */
 /* 结果分类门槛（七行表）                                                       */
 /* -------------------------------------------------------------------------- */
+
+/** `effectiveRequiredKinds()` 的入参。 */
+interface RequiredKindsInput {
+  outcome: string
+  runIds?: string[]
+  requiredKinds?: string[]
+}
 
 /**
  * 实际生效的锚点要求：未开始即阻塞/取消的交付不强制补造成功锚点
@@ -302,13 +633,30 @@ export function checkInputShape(input) {
  * @param {{ outcome: string, runIds?: string[], requiredKinds?: string[] }} input
  * @returns {string[]}
  */
-export function effectiveRequiredKinds(input) {
+export function effectiveRequiredKinds(input: RequiredKindsInput): string[] {
   const required = Array.isArray(input.requiredKinds) ? [...input.requiredKinds] : []
-  const rule = OUTCOME_RULES[input.outcome]
+  const rule = outcomeRuleOf(input.outcome)
   if (rule === undefined) return required
   if (rule.requires_runs !== true && Array.isArray(input.runIds) && input.runIds.length === 0) return []
   return required
 }
+
+/** `evaluateDelivery()` 的入参。 */
+interface DeliveryInput {
+  outcome: string
+  proposedRouteStatus: string
+  runIds: string[]
+  evidenceRunIds: string[]
+  requiredKinds: string[]
+  anchorKinds: string[]
+  stateRecoveryRef: unknown
+  submissionOutcome: unknown
+}
+
+/** `evaluateDelivery()` 的判定。 */
+type DeliveryVerdict =
+  | { ok: true; successDependency: boolean }
+  | { ok: false; code: 'CHECK_FAILED' | 'SUBMISSION_INVALID'; issues: Diagnostic[] }
 
 /**
  * 按七类结果检查交付门槛（成功/反证型合并后的锚点要求、未开始即阻塞的诊断依据）。
@@ -324,9 +672,9 @@ export function effectiveRequiredKinds(input) {
  * @param {string} input.submissionOutcome
  * @returns {{ok:true, successDependency:boolean} | {ok:false, code:'CHECK_FAILED'|'SUBMISSION_INVALID', issues:object[]}}
  */
-export function evaluateDelivery(input) {
-  const issues = []
-  const rule = OUTCOME_RULES[input.outcome]
+export function evaluateDelivery(input: DeliveryInput): DeliveryVerdict {
+  const issues: Diagnostic[] = []
+  const rule = outcomeRuleOf(input.outcome)
   if (rule === undefined) {
     return {
       ok: false,
@@ -418,7 +766,7 @@ export function evaluateDelivery(input) {
 /* 路线更新                                                                    */
 /* -------------------------------------------------------------------------- */
 
-const TERMINAL_ROUTE_STATUSES = new Set(['validated', 'falsified', 'superseded'])
+const TERMINAL_ROUTE_STATUSES: ReadonlySet<unknown> = new Set(['validated', 'falsified', 'superseded'])
 const FALSIFICATION_FIELDS = Object.freeze([
   'criterion',
   'coverage',
@@ -428,9 +776,21 @@ const FALSIFICATION_FIELDS = Object.freeze([
   'control_refs',
 ])
 
-function closureForStatus({ nextStatus, route, review }) {
+/** `closureForStatus()` 的入参。 */
+interface ClosureInput {
+  nextStatus: string
+  route: RouteRecord
+  review: ConcludeReview
+}
+
+/** `closureForStatus()` 的结果：要么给出 closure，要么给出拒绝理由。 */
+type ClosureResult =
+  | { ok: true; closure: unknown }
+  | { ok: false; issues: Diagnostic[] }
+
+function closureForStatus({ nextStatus, route, review }: ClosureInput): ClosureResult {
   if (!TERMINAL_ROUTE_STATUSES.has(nextStatus)) return { ok: true, closure: route.closure ?? null }
-  const base = isPlainObject(route.closure) ? route.closure : {}
+  const base: Record<string, unknown> = isPlainObject(route.closure) ? route.closure : {}
   const scope = typeof base.scope === 'string' && base.scope.length > 0
     ? base.scope
     : `targets: ${(Array.isArray(route.target_ids) ? route.target_ids : []).join(', ')}`
@@ -441,7 +801,7 @@ function closureForStatus({ nextStatus, route, review }) {
     ? review.evidence_run_ids
     : (Array.isArray(base.evidence) ? base.evidence : [])
 
-  const closure = { ...base, summary: review.summary, scope, limitations, evidence }
+  const closure: Record<string, unknown> = { ...base, summary: review.summary, scope, limitations, evidence }
 
   if (nextStatus === 'falsified') {
     const missing = FALSIFICATION_FIELDS.filter((field) => {
@@ -479,6 +839,19 @@ function closureForStatus({ nextStatus, route, review }) {
   return { ok: true, closure }
 }
 
+/** `buildRouteUpdate()` 的入参。 */
+interface RouteUpdateInput {
+  route: RouteRecord
+  review: ConcludeReview
+  nextStatus: string
+  at: string
+}
+
+/** `buildRouteUpdate()` 的结果：改后的路线，或拒绝理由。 */
+type RouteUpdateResult =
+  | { ok: true; route: RouteRecord; changed: boolean; historyAppended: boolean }
+  | { ok: false; code: 'CHECK_FAILED'; issues: Diagnostic[] }
+
 /**
  * 依据 review 生成路线更新（history / closure / evidence / state_reason）。
  *
@@ -487,7 +860,7 @@ function closureForStatus({ nextStatus, route, review }) {
  * @returns {{ok:true, route:object, changed:boolean, historyAppended:boolean}
  *   | {ok:false, code:'CHECK_FAILED', issues:object[]}}
  */
-export function buildRouteUpdate({ route, review, nextStatus, at }) {
+export function buildRouteUpdate({ route, review, nextStatus, at }: RouteUpdateInput): RouteUpdateResult {
   if (!ROUTE_STATUSES.includes(nextStatus)) {
     return { ok: false, code: 'CHECK_FAILED', issues: [diag('CHECK_FAILED', `未知路线状态：${nextStatus}`, '按 skill 的路线状态枚举取值')] }
   }
@@ -495,7 +868,7 @@ export function buildRouteUpdate({ route, review, nextStatus, at }) {
   const closureResult = closureForStatus({ nextStatus, route, review })
   if (closureResult.ok !== true) return { ok: false, code: 'CHECK_FAILED', issues: closureResult.issues }
 
-  const evidence = Array.isArray(route.evidence) ? [...route.evidence] : []
+  const evidence: unknown[] = Array.isArray(route.evidence) ? [...route.evidence] : []
   for (const runId of Array.isArray(review.evidence_run_ids) ? review.evidence_run_ids : []) {
     if (!evidence.includes(runId)) evidence.push(runId)
   }
@@ -533,8 +906,8 @@ export function buildRouteUpdate({ route, review, nextStatus, at }) {
     return { ok: true, route: updated, changed: false, historyAppended: false }
   }
 
-  const history = Array.isArray(route.history) ? [...route.history] : []
-  const event = {
+  const history: unknown[] = Array.isArray(route.history) ? [...route.history] : []
+  const event: RouteHistoryEvent = {
     at,
     from,
     to: nextStatus,
@@ -553,17 +926,26 @@ export function buildRouteUpdate({ route, review, nextStatus, at }) {
 /* 影响报告                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/** `routeImpactOf()` 的结果（四个清单都只按「影响本路线的条目」筛出）。 */
+interface RouteImpact {
+  pendingReviews: unknown[]
+  disputeImpacts: unknown[]
+  recovery: unknown[]
+  items: unknown[]
+}
+
 /**
  * 从 `impact` 报告里挑出影响本路线的条目。
  * @returns {{items: object[], pendingReviews: object[], disputeImpacts: object[], recovery: object[]}}
  */
-export function routeImpactOf(impactJson, routeId) {
-  const pending = Array.isArray(impactJson?.pending_reviews) ? impactJson.pending_reviews : []
-  const disputes = Array.isArray(impactJson?.dispute_impacts) ? impactJson.dispute_impacts : []
-  const recovery = Array.isArray(impactJson?.recovery_pending) ? impactJson.recovery_pending : []
-  const pendingReviews = pending.filter((item) => item?.route_id === routeId)
-  const disputeImpacts = disputes.filter((item) => item?.route_id === routeId)
-  const recoveryItems = recovery.filter((item) => item?.route_id === routeId || item === routeId)
+export function routeImpactOf(impactJson: unknown, routeId: unknown): RouteImpact {
+  const view = recordOf(impactJson)
+  const pending = Array.isArray(view.pending_reviews) ? view.pending_reviews : []
+  const disputes = Array.isArray(view.dispute_impacts) ? view.dispute_impacts : []
+  const recovery = Array.isArray(view.recovery_pending) ? view.recovery_pending : []
+  const pendingReviews = pending.filter((item) => recordOf(item).route_id === routeId)
+  const disputeImpacts = disputes.filter((item) => recordOf(item).route_id === routeId)
+  const recoveryItems = recovery.filter((item) => recordOf(item).route_id === routeId || item === routeId)
   return {
     pendingReviews,
     disputeImpacts,
@@ -578,19 +960,20 @@ export function routeImpactOf(impactJson, routeId) {
 
 /**
  * @param {object} ctx HandlerCtx（SEAMS §1）
- * @param {object} input 已通过 `$defs.concludeInput` 校验（本文件不信任这一点）
+ * @param {object} rawInput 已通过 `$defs.concludeInput` 校验（本文件不信任这一点）
  * @returns {Promise<{ envelope: object }>}
  */
-export async function handleConclude(ctx, input) {
+export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promise<HandlerResult> {
   const en = resolveModules(ctx).envelope
-  const operationId = typeof input?.operation_id === 'string' && OPERATION_ID.test(input.operation_id)
-    ? input.operation_id
+  const raw = recordOf(rawInput)
+  const operationId = typeof raw.operation_id === 'string' && OPERATION_ID.test(raw.operation_id)
+    ? raw.operation_id
     : null
   let phase = 'preflight'
 
   try {
     const modules = resolveModules(ctx)
-    const shape = checkInputShape(input)
+    const shape = checkInputShape(rawInput)
     if (shape.ok !== true) {
       return {
         envelope: en.error({
@@ -601,6 +984,7 @@ export async function handleConclude(ctx, input) {
         }),
       }
     }
+    const input = shape.value
 
     /* ---- 0. 身份（先于任何写入） ---------------------------------------- */
     const caller = await modules.identity.resolveCaller(ctx)
@@ -627,7 +1011,7 @@ export async function handleConclude(ctx, input) {
     }
 
     /* ---- 1. 项目根与依赖 ------------------------------------------------- */
-    let root
+    let root: string
     try {
       root = await modules.paths.normalizeProjectRoot(input.project_root)
     } catch (error) {
@@ -683,11 +1067,11 @@ export async function handleConclude(ctx, input) {
       }
     }
     if (existing !== null && isPlainObject(existing.result)) {
-      return { envelope: { ...existing.result, replayed: true } }
+      return { envelope: replayEnvelope(existing.result) }
     }
 
     /* ---- 2. 项目锁（所有写入持有） --------------------------------------- */
-    let held = null
+    let held: Awaited<ReturnType<typeof lockModule.acquire>> | null = null
     try {
       held = await modules.lock.acquire(root, {
         session: typeof session === 'string' && session.length > 0 ? session : 'conclude',
@@ -713,7 +1097,7 @@ export async function handleConclude(ctx, input) {
         }
       }
       if (current !== null && isPlainObject(current.result)) {
-        return { envelope: { ...current.result, replayed: true } }
+        return { envelope: replayEnvelope(current.result) }
       }
 
       const receiptRef = receiptPathFor(input.dispatch_id, input.attempt_id)
@@ -736,7 +1120,7 @@ export async function handleConclude(ctx, input) {
         }
       }
       if (business.exists === true) {
-        return { envelope: { ...business.receipt.result, replayed: true } }
+        return { envelope: replayEnvelope(business.receipt.result) }
       }
 
       await ledger.prepare(input.operation_id, inputHash, 'integrating', {
@@ -770,7 +1154,7 @@ export async function handleConclude(ctx, input) {
       const { task, route, premiseImpact } = premise
 
       /* ---- 步骤 2：校验提交 -------------------------------------------- */
-      const submitted = await modules.submission.readVerifiedSubmission({
+      const submitted = resultOf<VerifiedSubmissionRead>(await modules.submission.readVerifiedSubmission({
         root,
         submissionRef: input.submission_ref,
         expectedSha256: input.submission_sha256,
@@ -779,7 +1163,7 @@ export async function handleConclude(ctx, input) {
         paths: modules.paths,
         fs: modules.fs,
         atomic: modules.atomic,
-      })
+      }))
       if (submitted.ok !== true) {
         return {
           envelope: failWithIssues(en, {
@@ -790,7 +1174,7 @@ export async function handleConclude(ctx, input) {
           }),
         }
       }
-      const submission = submitted.submission
+      const submission: SubmissionRecord = submitted.submission
 
       const submissionIssues = crossCheckSubmission({ submission, dispatch: dispatch.record, taskId: input.task_id })
       if (submissionIssues.length > 0) {
@@ -800,16 +1184,16 @@ export async function handleConclude(ctx, input) {
       }
 
       /* ---- 步骤 3：RUN 身份 + 锚点闭集 ---------------------------------- */
-      const runs = []
+      const runs: RunEntry[] = []
       for (const runId of submission.run_ids) {
-        const read = await project.readRun(runId)
-        if (read?.ok !== true) {
-          if (read?.code === 'PROJECT_NOT_CONFIGURED') {
+        const read = recordOf(await project.readRun(runId))
+        if (read.ok !== true) {
+          if (read.code === 'PROJECT_NOT_CONFIGURED') {
             return {
               envelope: failWithIssues(en, {
                 code: 'SUBMISSION_INVALID',
                 operationId,
-                issues: [diag('SUBMISSION_INVALID', `提交声明的 ${runId} 在本项目里不存在（${read?.reason ?? 'not found'}）`, 'RUN 记录必须先按 skill 归档到 re/runs/<RUN>/run.json，再声明在提交里')],
+                issues: [diag('SUBMISSION_INVALID', `提交声明的 ${runId} 在本项目里不存在（${read.reason ?? 'not found'}）`, 'RUN 记录必须先按 skill 归档到 re/runs/<RUN>/run.json，再声明在提交里')],
                 data: { phase },
               }),
             }
@@ -818,26 +1202,27 @@ export async function handleConclude(ctx, input) {
             envelope: failWithIssues(en, {
               code: 'RECOVERY_REQUIRED',
               operationId,
-              issues: [diag('RECOVERY_REQUIRED', `读 ${runId} 的 run.json 失败：${read?.reason ?? read?.code ?? 'unknown'}`, 'RUN 记录损坏要先按恢复流程核对；不要当作没有该运行')],
+              issues: [diag('RECOVERY_REQUIRED', `读 ${runId} 的 run.json 失败：${read.reason ?? read.code ?? 'unknown'}`, 'RUN 记录损坏要先按恢复流程核对；不要当作没有该运行')],
               data: { phase },
             }),
           }
         }
+        const run = recordOf(read.run)
         runs.push({
           run_id: runId,
-          status: read.run?.status ?? 'unknown',
-          artifacts: Array.isArray(read.run?.artifacts) ? read.run.artifacts : [],
+          status: run.status ?? 'unknown',
+          artifacts: Array.isArray(run.artifacts) ? run.artifacts : [],
           record: read.run,
         })
       }
-      const artifactsForRun = (runId) => (runs.find((item) => item.run_id === runId)?.artifacts ?? [])
-        .map((artifact) => artifact?.path)
-        .filter((value) => typeof value === 'string')
+      const artifactsForRun = (runId: string): string[] => (runs.find((item) => item.run_id === runId)?.artifacts ?? [])
+        .map((artifact) => recordOf(artifact).path)
+        .filter((value): value is string => typeof value === 'string')
 
-      const merged = modules.anchors.mergeRequiredKinds({
+      const merged = resultOf<MergedKinds>(modules.anchors.mergeRequiredKinds({
         anchorsRequired: dispatch.record.anchors_required,
         evidenceRequired: dispatch.record.evidence_required,
-      })
+      }))
       if (merged.issues.length > 0) {
         return {
           envelope: failWithIssues(en, { code: 'SUBMISSION_INVALID', operationId, issues: merged.issues, data: { phase } }),
@@ -848,16 +1233,16 @@ export async function handleConclude(ctx, input) {
         runIds: submission.run_ids,
         requiredKinds: merged.kinds,
       })
-      const anchorRefs = [
+      const anchorRefs: unknown[] = [
         ...(Array.isArray(submission.anchor_refs) ? submission.anchor_refs : []),
         ...(Array.isArray(input.review.anchor_refs) ? input.review.anchor_refs : []),
       ]
-      const anchorCheck = modules.anchors.validateAnchorSet({
+      const anchorCheck = resultOf<AnchorCheckRead>(modules.anchors.validateAnchorSet({
         refs: anchorRefs,
         requiredKinds,
         runIds: submission.run_ids,
         artifactsForRun,
-      })
+      }))
       if (anchorCheck.ok !== true) {
         return {
           envelope: failWithIssues(en, { code: anchorCheck.code, operationId, issues: anchorCheck.issues, data: { phase } }),
@@ -870,7 +1255,7 @@ export async function handleConclude(ctx, input) {
         runIds: submission.run_ids,
         evidenceRunIds: input.review.evidence_run_ids,
         requiredKinds,
-        anchorKinds: anchorRefs.map((ref) => ref?.kind).filter((kind) => typeof kind === 'string'),
+        anchorKinds: anchorRefs.map((ref) => recordOf(ref).kind).filter((kind) => typeof kind === 'string'),
         stateRecoveryRef: submission.state_recovery_ref,
         submissionOutcome: submission.outcome,
       })
@@ -908,31 +1293,31 @@ export async function handleConclude(ctx, input) {
       }
 
       /* ---- 步骤 5：基准比对 + seal ------------------------------------- */
-      const loaded = await modules.baseline.loadBaseline({
+      const loaded = resultOf<LoadedBaselineRead>(await modules.baseline.loadBaseline({
         root,
         dispatchId: input.dispatch_id,
         ref: dispatch.record.baseline_ref,
         embedded: dispatch.record.baseline,
         fs: modules.fs,
         paths: modules.paths,
-      })
+      }))
       if (loaded.ok !== true) {
         return { envelope: failWithIssues(en, { code: loaded.code, operationId, issues: loaded.issues, data: { phase } }) }
       }
 
-      const sealList = await project.readSeals()
-      if (sealList?.ok !== true) {
+      const sealList = recordOf(await project.readSeals())
+      if (sealList.ok !== true) {
         return {
           envelope: failWithIssues(en, {
             code: 'RECOVERY_REQUIRED',
             operationId,
-            issues: [diag('RECOVERY_REQUIRED', `读不了 re/seals 清单：${sealList?.reason ?? sealList?.code ?? 'unknown'}`, '确认 re/seals 可读；读失败不能当作没有封存')],
+            issues: [diag('RECOVERY_REQUIRED', `读不了 re/seals 清单：${sealList.reason ?? sealList.code ?? 'unknown'}`, '确认 re/seals 可读；读失败不能当作没有封存')],
             data: { phase },
           }),
         }
       }
 
-      const compared = await modules.baseline.compareBaseline({
+      const compared = resultOf<ComparedBaselineRead>(await modules.baseline.compareBaseline({
         root,
         baseline: loaded.baseline,
         projectAdapter: project,
@@ -940,18 +1325,18 @@ export async function handleConclude(ctx, input) {
         fs: modules.fs,
         paths: modules.paths,
         atomic: modules.atomic,
-      })
+      }))
       if (compared.ok !== true) {
         return {
           envelope: failWithIssues(en, { code: compared.code, operationId, issues: compared.issues, data: { phase } }),
         }
       }
 
-      const sealed = await modules.baseline.sealRunSet({
+      const sealed = resultOf<SealRunSetRead>(await modules.baseline.sealRunSet({
         projectAdapter: project,
         runs: runs.map((item) => ({ run_id: item.run_id, status: item.status })),
         seals: sealList.seals,
-      })
+      }))
       if (sealed.ok !== true) {
         await recordStageFailure(modules, root, input, {
           stage: 'seal',
@@ -974,7 +1359,7 @@ export async function handleConclude(ctx, input) {
         }
       }
 
-      const checks = []
+      const checks: CheckEntry[] = []
       checks.push(await writeCheck({
         modules, root, dispatchId: input.dispatch_id, attemptId: input.attempt_id,
         name: 'baseline',
@@ -1027,14 +1412,14 @@ export async function handleConclude(ctx, input) {
         }
       }
 
-      const impact = await project.impact()
-      if (impact?.ok !== true) {
+      const impact = recordOf(await project.impact())
+      if (impact.ok !== true) {
         await recordStageFailure(modules, root, input, {
           stage: 'impact',
-          exit_code: impact?.exitCode ?? null,
-          stdout: impact?.stdout ?? '',
-          stderr: impact?.stderr ?? '',
-          failures: impact?.failures ?? [],
+          exit_code: impact.exitCode ?? null,
+          stdout: impact.stdout ?? '',
+          stderr: impact.stderr ?? '',
+          failures: impact.failures ?? [],
           code: 'CHECK_FAILED',
         })
         return {
@@ -1065,7 +1450,7 @@ export async function handleConclude(ctx, input) {
               diag(
                 'CHECK_FAILED',
                 `impact 报告本路线仍有待复查/争议影响，不能维持 ${input.review.proposed_route_status}：`
-                  + impacted.items.map((item) => JSON.stringify(item.route_id ?? item)).join('；'),
+                  + impacted.items.map((item) => JSON.stringify(recordOf(item).route_id ?? item)).join('；'),
                 '先按 skill 处置复查/争议并记录原因，再把路线改为 blocked/paused（或撤销争议）后收口',
               ),
             ],
@@ -1080,14 +1465,14 @@ export async function handleConclude(ctx, input) {
         exitCode: impact.exitCode ?? 0,
       }))
 
-      const indexed = await project.index()
-      if (indexed?.ok !== true) {
+      const indexed = recordOf(await project.index())
+      if (indexed.ok !== true) {
         await recordStageFailure(modules, root, input, {
           stage: 'index',
-          exit_code: indexed?.exitCode ?? null,
-          stdout: indexed?.stdout ?? '',
-          stderr: indexed?.stderr ?? '',
-          failures: indexed?.failures ?? [],
+          exit_code: indexed.exitCode ?? null,
+          stdout: indexed.stdout ?? '',
+          stderr: indexed.stderr ?? '',
+          failures: indexed.failures ?? [],
           code: 'CHECK_FAILED',
         })
         return {
@@ -1112,14 +1497,14 @@ export async function handleConclude(ctx, input) {
         exitCode: indexed.exitCode ?? 0,
       }))
 
-      const checked = await project.check({ hashes: true, complete: false })
-      if (checked?.ok !== true) {
+      const checked = recordOf(await project.check({ hashes: true, complete: false }))
+      if (checked.ok !== true) {
         await recordStageFailure(modules, root, input, {
           stage: 'check',
-          exit_code: checked?.exitCode ?? null,
-          stdout: checked?.stdout ?? '',
-          stderr: checked?.stderr ?? '',
-          failures: checked?.failures ?? [],
+          exit_code: checked.exitCode ?? null,
+          stdout: checked.stdout ?? '',
+          stderr: checked.stderr ?? '',
+          failures: checked.failures ?? [],
           code: 'CHECK_FAILED',
         })
         return {
@@ -1171,7 +1556,7 @@ export async function handleConclude(ctx, input) {
             diagnostics: [
               diag(
                 'RECOVERY_REQUIRED',
-                `预备收口回执写不成：${error?.message ?? String(error)}`,
+                `预备收口回执写不成：${thrownMessage(error)}`,
                 '确认 re/team/receipts 可写后再重入；业务回执未落盘前不得报 ok，也先别完成任务',
               ),
             ],
@@ -1182,16 +1567,16 @@ export async function handleConclude(ctx, input) {
 
       /* ---- 完成任务（原生提前完成则只核对，不再 complete） -------------- */
       const unreviewed = task.status === 'completed'
-      let taskRevisionAfter = task.revision
+      let taskRevisionAfter: unknown = task.revision
       if (!unreviewed) {
-        const completed = await team.updateTask({
+        const completed = recordOf(await team.updateTask({
           taskId: input.task_id,
           expectedRevision: input.expected_revision,
           action: 'complete',
-        })
-        if (completed?.ok !== true) {
-          const code = isStableCode(completed?.code) ? completed.code : 'RECOVERY_REQUIRED'
-          const actualRevision = Number.isSafeInteger(completed?.actualRevision) ? completed.actualRevision : undefined
+        }))
+        if (completed.ok !== true) {
+          const code = isStableCode(completed.code) ? completed.code : 'RECOVERY_REQUIRED'
+          const actualRevision = Number.isSafeInteger(completed.actualRevision) ? completed.actualRevision : undefined
           return {
             envelope: failWithIssues(en, {
               code,
@@ -1199,7 +1584,7 @@ export async function handleConclude(ctx, input) {
               issues: [
                 diag(
                   code,
-                  `任务 ${input.task_id} 完成失败：${completed?.reason ?? completed?.code ?? 'unknown'}`
+                  `任务 ${input.task_id} 完成失败：${completed.reason ?? completed.code ?? 'unknown'}`
                     + (actualRevision === undefined ? '' : `（实际 revision ${actualRevision}）`),
                   '事实已整合但任务未完成：按恢复流程核对 owner/revision，一致后再补 complete；不要重复 seal/history',
                 ),
@@ -1214,8 +1599,9 @@ export async function handleConclude(ctx, input) {
             }),
           }
         }
-        const verified = await team.getTask(input.task_id)
-        if (verified?.ok !== true || verified.task?.status !== 'completed') {
+        const verified = recordOf(await team.getTask(input.task_id))
+        const verifiedTask = recordOf(verified.task)
+        if (verified.ok !== true || verifiedTask.status !== 'completed') {
           return {
             envelope: en.partial({
               code: 'RECOVERY_REQUIRED',
@@ -1223,7 +1609,7 @@ export async function handleConclude(ctx, input) {
               diagnostics: [
                 diag(
                   'RECOVERY_REQUIRED',
-                  `任务 ${input.task_id} 的完成态无法核实（读到 ${verified?.task?.status ?? verified?.code ?? 'unknown'}）`,
+                  `任务 ${input.task_id} 的完成态无法核实（读到 ${verifiedTask.status ?? verified.code ?? 'unknown'}）`,
                   '按宿主快照核对任务状态后再补最终回执；不要把未核实的完成态当作 ok',
                 ),
               ],
@@ -1231,7 +1617,7 @@ export async function handleConclude(ctx, input) {
             }),
           }
         }
-        taskRevisionAfter = Number.isSafeInteger(verified.task?.revision) ? verified.task.revision : taskRevisionAfter
+        taskRevisionAfter = Number.isSafeInteger(verifiedTask.revision) ? verifiedTask.revision : taskRevisionAfter
       }
 
       /* ---- 审计（best-effort） ----------------------------------------- */
@@ -1241,16 +1627,17 @@ export async function handleConclude(ctx, input) {
           kind: 'conclude',
           route: route.id,
           task: input.task_id,
-          member: dispatch.record.member ?? task.owner ?? null,
+          member: auditColumn(dispatch.record.member ?? task.owner ?? null),
           requester: caller.name ?? 'lead',
           verdict: input.review.outcome,
         },
         { clock: modules.clock },
       )
-      const auditWritten = audit?.written === true
+      const auditWritten = audit.written === true
+      const auditFailure = audit.written === false ? audit.error : 'unknown'
 
       /* ---- 最终回执 ----------------------------------------------------- */
-      const diagnostics = []
+      const diagnostics: Diagnostic[] = []
       if (unreviewed) {
         diagnostics.push(
           diag(
@@ -1262,7 +1649,7 @@ export async function handleConclude(ctx, input) {
       }
       if (!auditWritten) {
         diagnostics.push(
-          diag('AUDIT_WRITE_FAILED', `审计写入失败：${audit?.error ?? 'unknown'}`, '审计是 best-effort：回执中 audit_written=false；稍后按需补记，不要据此改变证据判定'),
+          diag('AUDIT_WRITE_FAILED', `审计写入失败：${auditFailure}`, '审计是 best-effort：回执中 audit_written=false；稍后按需补记，不要据此改变证据判定'),
         )
       }
 
@@ -1322,7 +1709,7 @@ export async function handleConclude(ctx, input) {
             diagnostics: [
               diag(
                 'RECOVERY_REQUIRED',
-                `最终收口回执写不成：${error?.message ?? String(error)}`,
+                `最终收口回执写不成：${thrownMessage(error)}`,
                 '回执是恢复必需项：确认 re/team/receipts 可写后以同一 operation ID 重入；任务已完成但不得报 ok',
               ),
             ],
@@ -1355,12 +1742,24 @@ export async function handleConclude(ctx, input) {
 /* 内部：前提、提交交叉核对、归档、回执读写                                      */
 /* -------------------------------------------------------------------------- */
 
-function failurePhaseOf(operationPhase) {
+/** 台账里记的阶段 → 失败信封的 `data.phase`（未登记的阶段按 `integrating` 报）。 */
+function failurePhaseOf(operationPhase: unknown): string {
   const phases = envelopeModule.FAILURE_PHASES
-  return phases.includes(operationPhase) ? operationPhase : 'integrating'
+  return typeof operationPhase === 'string' && phases.includes(operationPhase) ? operationPhase : 'integrating'
 }
 
-function failWithIssues(envelope, options) {
+/** `failWithIssues()` 的入参。 */
+interface FailWithIssuesOptions {
+  code: string
+  operationId: string | null
+  issues: readonly Diagnostic[]
+  data: Record<string, unknown>
+  status?: string
+  diagnostics?: readonly Diagnostic[]
+}
+
+/** 把「问题清单」折成一个信封：默认 blocked，`status` 为 partial/error 时改用对应状态。 */
+function failWithIssues(envelope: EnvelopeModule, options: FailWithIssuesOptions): Envelope {
   const { code, operationId, issues, data, status, diagnostics: extra = [] } = options
   const diagnostics = [
     ...issues.map((item) => diag(item.code ?? code, item.reason, item.next_step)),
@@ -1372,9 +1771,16 @@ function failWithIssues(envelope, options) {
   return envelope.blocked(payload)
 }
 
-function firstFailure(result) {
-  const failures = Array.isArray(result?.failures) ? result.failures : []
-  if (failures.length > 0) return failures[0].message ?? failures[0].raw ?? null
+/** 脚本失败清单里的第一条原文（`message` 优先，其次 `raw`）；没有就是 `null`。 */
+function firstFailure(result: unknown): unknown {
+  const listed = recordOf(result).failures
+  const failures: unknown[] = Array.isArray(listed) ? listed : []
+  if (failures.length > 0) {
+    const first = recordOf(failures[0])
+    const message = first.message
+    if (message !== undefined && message !== null) return message
+    return first.raw ?? null
+  }
   return null
 }
 
@@ -1382,23 +1788,49 @@ function firstFailure(result) {
  * 脚本失败的原文摘要：优先 fail-fast 的第一条 `ERROR:`，其次 `reason`，最后 stderr 首行。
  * `check` 只报第一条违规，必须保留原文而不是自造汇总。
  */
-function stageFailureText(result) {
+function stageFailureText(result: unknown): string {
   const first = firstFailure(result)
   if (typeof first === 'string' && first.length > 0) return first
-  if (typeof result?.reason === 'string' && result.reason.length > 0) return result.reason
-  if (typeof result?.stderr === 'string' && result.stderr.trim().length > 0) {
-    return result.stderr.trim().split(/\r?\n/u)[0]
+  const view = recordOf(result)
+  const reason = view.reason
+  if (typeof reason === 'string' && reason.length > 0) return reason
+  const stderr = view.stderr
+  if (typeof stderr === 'string' && stderr.trim().length > 0) {
+    return stderr.trim().split(/\r?\n/u)[0]
   }
   return 'unknown'
 }
 
-function receiptDirOf(dispatchId, attemptId) {
+function receiptDirOf(dispatchId: string, attemptId: string): string {
   return `${RECEIPTS_DIR}/${dispatchId}-${attemptId}`
 }
 
-function receiptPathFor(dispatchId, attemptId) {
+function receiptPathFor(dispatchId: string, attemptId: string): string {
   return `${receiptDirOf(dispatchId, attemptId)}/receipt.json`
 }
+
+/** `readDispatchContext()` / `readAttemptLink()` 的公共入参。 */
+interface RecordReadInput {
+  root: string
+  dispatchId: string
+  fs: FsLike
+  paths: typeof pathsModule
+}
+
+/** `readAttemptLink()` 的入参（`attemptId` 来自未受信任的记录，按未知读）。 */
+interface AttemptLinkInput extends RecordReadInput {
+  attemptId: unknown
+}
+
+/** `readDispatchContext()` 的结果。 */
+type DispatchContextRead =
+  | { ok: true; record: DispatchRecord }
+  | { ok: false; code: 'RECOVERY_REQUIRED'; issues: Diagnostic[] }
+
+/** `readAttemptLink()` 的结果（记录**不存在**是正常的：`record: null`）。 */
+type AttemptLinkRead =
+  | { ok: true; record: AttemptLink | null }
+  | { ok: false; issues: Diagnostic[] }
 
 /**
  * 读派发记录：T6 写，T7 只读。
@@ -1418,7 +1850,7 @@ function receiptPathFor(dispatchId, attemptId) {
  *
  * 兼容顶层字段与 `contract` 内嵌两种形状（旧记录）。
  */
-async function readDispatchContext({ root, dispatchId, fs, paths }) {
+async function readDispatchContext({ root, dispatchId, fs, paths }: RecordReadInput): Promise<DispatchContextRead> {
   const ref = `${DISPATCHES_DIR}/${dispatchId}.json`
   let text
   try {
@@ -1430,7 +1862,7 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
       issues: [
         diag(
           'RECOVERY_REQUIRED',
-          `读不到派发记录 ${ref}（${error?.code ?? 'unknown'}）`,
+          `读不到派发记录 ${ref}（${recordOf(error).code ?? 'unknown'}）`,
           '确认 dispatch_id 属于本项目；派发记录丢失要按恢复流程核对，不能凭提交自证身份',
         ),
       ],
@@ -1446,7 +1878,7 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
       issues: [diag('RECOVERY_REQUIRED', `派发记录不是合法 JSON：${ref}（${error instanceof Error ? error.message : String(error)}）`, '按恢复流程核对记录来源；不要覆盖它')],
     }
   }
-  const pick = (key) => (record[key] !== undefined ? record[key] : record.contract?.[key])
+  const pick = (key: string): unknown => (record[key] !== undefined ? record[key] : record.contract?.[key])
   const attemptId = pick('attempt_id') ?? null
   const attempt = await readAttemptLink({ root, dispatchId, attemptId, fs, paths })
   if (attempt.ok !== true) {
@@ -1456,7 +1888,7 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
   const post = pick('post')
   const rawBaseline = pick('baseline_ref')
   const compatibility = pick('compatibility')
-  const flat = {
+  const flat: DispatchRecord = {
     ref,
     dispatch_id: pick('dispatch_id') ?? dispatchId,
     attempt_id: attemptId,
@@ -1464,12 +1896,12 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
     route_id: pick('route_id') ?? null,
     member: pick('member') ?? pick('member_name') ?? link?.member ?? null,
     contract_sha256: pick('contract_sha256') ?? link?.contract_sha256 ?? null,
-    rule_digest: pick('rule_digest') ?? (typeof compatibility?.ruleDigest === 'string' ? compatibility.ruleDigest : null),
+    rule_digest: pick('rule_digest') ?? (typeof recordOf(compatibility).ruleDigest === 'string' ? recordOf(compatibility).ruleDigest : null),
     // 路径（项目内相对）与内联快照都收：`loadBaseline` 用 `ref` 读文件、用 `embedded` 直接校验。
     baseline_ref: typeof rawBaseline === 'string' ? rawBaseline : null,
     baseline: pick('baseline') ?? (isPlainObject(rawBaseline) ? rawBaseline : null),
     target_ids: pick('target_ids') ?? [],
-    anchors_required: pick('anchors_required') ?? (Array.isArray(post?.anchors_required) ? post.anchors_required : []),
+    anchors_required: pick('anchors_required') ?? (Array.isArray(recordOf(post).anchors_required) ? recordOf(post).anchors_required : []),
     evidence_required: pick('evidence_required') ?? [],
     work_dir: pick('work_dir') ?? null,
     contract_ref: pick('contract_ref') ?? null,
@@ -1491,17 +1923,18 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
  * 记录**存在但损坏**是 `RECOVERY_REQUIRED` —— 那意味着 task/member 关联不可信，
  * 不能当作「没有绑定」继续放行。
  */
-async function readAttemptLink({ root, dispatchId, attemptId, fs, paths }) {
+async function readAttemptLink({ root, dispatchId, attemptId, fs, paths }: AttemptLinkInput): Promise<AttemptLinkRead> {
   if (typeof attemptId !== 'string' || !ATTEMPT_ID.test(attemptId)) return { ok: true, record: null }
   const ref = `${ATTEMPTS_DIR}/${dispatchId}.${attemptId}.json`
   let text
   try {
     text = await fs.readFile(paths.resolveInProject(root, ref), 'utf8')
   } catch (error) {
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { ok: true, record: null }
+    const code = recordOf(error).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return { ok: true, record: null }
     return {
       ok: false,
-      issues: [diag('RECOVERY_REQUIRED', `读不了 attempt 关联记录 ${ref}（${error?.code ?? 'unknown'}）`, '确认 re/team/attempts 可读；读失败不能当作没有绑定')],
+      issues: [diag('RECOVERY_REQUIRED', `读不了 attempt 关联记录 ${ref}（${code ?? 'unknown'}）`, '确认 re/team/attempts 可读；读失败不能当作没有绑定')],
     }
   }
   let parsed
@@ -1516,7 +1949,23 @@ async function readAttemptLink({ root, dispatchId, attemptId, fs, paths }) {
   return { ok: true, record: isPlainObject(parsed) ? parsed : null }
 }
 
-async function checkPremises({ envelope: en, team, project, dispatch, input, operationId, root }) {
+/** `checkPremises()` 的入参。 */
+interface PremisesInput {
+  envelope: EnvelopeModule
+  team: ConcludeTeam
+  project: ConcludeProject
+  dispatch: DispatchRecord
+  input: ConcludeInput
+  operationId: string | null
+  root: string
+}
+
+/** `checkPremises()` 的结果：通过则带任务/路线与影响摘要，否则带拒绝信封。 */
+type PremisesResult =
+  | { ok: false; envelope: Envelope }
+  | { ok: true; task: Record<string, unknown>; route: RouteRecord; premiseImpact: PremiseImpact }
+
+async function checkPremises({ envelope: en, team, project, dispatch, input, operationId, root }: PremisesInput): Promise<PremisesResult> {
   if (typeof dispatch.attempt_id === 'string' && dispatch.attempt_id !== input.attempt_id) {
     return {
       ok: false,
@@ -1542,21 +1991,24 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
     }
   }
 
-  const taskResult = await team.getTask(input.task_id)
-  if (taskResult?.ok !== true) {
-    const code = isStableCode(taskResult?.code) ? taskResult.code : 'RECOVERY_REQUIRED'
+  const taskResult = recordOf(await team.getTask(input.task_id))
+  if (taskResult.ok !== true) {
+    const code = isStableCode(taskResult.code) ? taskResult.code : 'RECOVERY_REQUIRED'
     return {
       ok: false,
       envelope: en.blocked({
         code,
         operationId,
-        reason: `读不到任务 ${input.task_id}：${taskResult?.reason ?? taskResult?.code ?? 'unknown'}`,
+        reason: `读不到任务 ${input.task_id}：${taskResult.reason ?? taskResult.code ?? 'unknown'}`,
         nextStep: '确认 task_id 属于当前团队；无法关联时按恢复流程核对名册/任务板',
         data: { phase: 'preflight', task_id: input.task_id },
       }),
     }
   }
-  const task = taskResult.task
+  // 断言的理由：`ok:true` 的适配器确实带 `task`（`projectTask()` 的产物），下面沿用原有的
+  // `task.status` / `task.revision` **直接解引用**（历史行为：`task` 是 null 时抛错由外层兜底），
+  // 所以这里贴回记录形状而不是用 `recordOf` 把 null 读成 `{}` —— 那会改变这条错误路径的结论。
+  const task = resultOf<Record<string, unknown>>(taskResult.task)
   if (task.status === 'deleted') {
     return {
       ok: false,
@@ -1606,23 +2058,24 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
     }
   }
 
-  const routeResult = await project.readRoute(dispatch.route_id)
-  if (routeResult?.ok !== true) {
-    const code = routeResult?.code === 'PROJECT_NOT_CONFIGURED'
+  const routeResult = recordOf(await project.readRoute(dispatch.route_id))
+  if (routeResult.ok !== true) {
+    const code = routeResult.code === 'PROJECT_NOT_CONFIGURED'
       ? 'PROJECT_NOT_CONFIGURED'
-      : (isStableCode(routeResult?.code) ? routeResult.code : 'RECOVERY_REQUIRED')
+      : (isStableCode(routeResult.code) ? routeResult.code : 'RECOVERY_REQUIRED')
     return {
       ok: false,
       envelope: en.blocked({
         code,
         operationId,
-        reason: `读不到路线 ${dispatch.route_id}：${routeResult?.reason ?? routeResult?.code ?? 'unknown'}`,
+        reason: `读不到路线 ${dispatch.route_id}：${routeResult.reason ?? routeResult.code ?? 'unknown'}`,
         nextStep: '路线必须由 Lead 先按 skill 建成正式记录；缺失时先补齐路线再收口',
         data: { phase: 'preflight', route_id: dispatch.route_id },
       }),
     }
   }
-  const route = routeResult.route
+  // 断言的理由同上：`ok:true` 的 `readRoute()` 带解析后的路线记录；下面沿用原来的直接解引用。
+  const route = resultOf<Record<string, unknown>>(routeResult.route)
   if (route.id !== dispatch.route_id) {
     return {
       ok: false,
@@ -1638,15 +2091,15 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
 
   // 规则版本：派发时冻结过规则摘要才比对（副本变化需要重做兼容性检查，见 D8）。
   if (typeof dispatch.rule_digest === 'string' && SHA256.test(dispatch.rule_digest)) {
-    const probe = await project.probe({ projectRoot: root })
-    const current = probe?.compatibility?.ruleDigest ?? null
-    if (probe?.ok !== true || current === null) {
+    const probe = recordOf(await project.probe({ projectRoot: root }))
+    const current = recordOf(probe.compatibility).ruleDigest ?? null
+    if (probe.ok !== true || current === null) {
       return {
         ok: false,
         envelope: en.blocked({
           code: 'SKILL_INCOMPATIBLE',
           operationId,
-          reason: `无法复核项目规则版本（probe: ${probe?.reason ?? probe?.code ?? 'unknown'}）`,
+          reason: `无法复核项目规则版本（probe: ${probe.reason ?? probe.code ?? 'unknown'}）`,
           nextStep: '先按 rt_roster 的接入检查确认项目副本完整，再收口',
           data: { phase: 'preflight', route_id: dispatch.route_id },
         }),
@@ -1666,8 +2119,8 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
     }
   }
 
-  const impact = await project.impact()
-  if (impact?.ok !== true) {
+  const impact = recordOf(await project.impact())
+  if (impact.ok !== true) {
     return {
       ok: false,
       envelope: en.blocked({
@@ -1693,8 +2146,15 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
   }
 }
 
-function crossCheckSubmission({ submission, dispatch, taskId }) {
-  const issues = []
+/** `crossCheckSubmission()` 的入参。 */
+interface CrossCheckInput {
+  submission: SubmissionRecord
+  dispatch: DispatchRecord
+  taskId: string
+}
+
+function crossCheckSubmission({ submission, dispatch, taskId }: CrossCheckInput): Diagnostic[] {
+  const issues: Diagnostic[] = []
   if (submission.task_id !== taskId) {
     issues.push(diag('SUBMISSION_INVALID', `提交的 task_id=${submission.task_id} 与调用 task_id=${taskId} 不一致`, '按当前任务收口；换了任务请另发收口'))
   }
@@ -1710,17 +2170,38 @@ function crossCheckSubmission({ submission, dispatch, taskId }) {
   return issues
 }
 
+/** `archiveAttempt()` 的入参。 */
+interface ArchiveAttemptInput {
+  modules: ResolvedModules
+  root: string
+  dispatchId: string
+  attemptId: string
+  operationId: string
+  submission: SubmissionRecord
+  submissionBytes: unknown
+  submissionSha: string
+  submissionRef: string
+  runs: RunEntry[]
+  now: string
+}
+
+/** `archiveAttempt()` 的结果：成功后给出回执目录与路径映射。 */
+type ArchiveResult =
+  | { ok: true; dir: string; mapping: Record<string, unknown> }
+  | { ok: false; code: string; status: 'blocked' | 'partial'; issues: Diagnostic[] }
+
 /**
  * 归档：核对过的产物复制到 RUN 声明的正式位置；原提交、路径映射与执行事实进回执目录。
  */
-async function archiveAttempt(input) {
+async function archiveAttempt(input: ArchiveAttemptInput): Promise<ArchiveResult> {
   const { modules, root, dispatchId, attemptId, operationId, submission } = input
   const dir = receiptDirOf(dispatchId, attemptId)
-  const mappingArtifacts = []
-  const runArtifacts = new Map()
+  const mappingArtifacts: { source_path: string; archived_path: string; sha256: string }[] = []
+  const runArtifacts = new Map<string, unknown>()
   for (const run of input.runs) {
     for (const artifact of run.artifacts) {
-      if (typeof artifact?.sha256 === 'string') runArtifacts.set(artifact.sha256, artifact.path)
+      const view = recordOf(artifact)
+      if (typeof view.sha256 === 'string') runArtifacts.set(view.sha256, view.path)
     }
   }
 
@@ -1733,7 +2214,7 @@ async function archiveAttempt(input) {
         ok: false,
         code: 'SUBMISSION_INVALID',
         status: 'blocked',
-        issues: [diag('SUBMISSION_INVALID', `产物路径越界：${artifact.path}（${error?.message ?? error}）`, 'artifacts 只能指向本 attempt 分配目录')],
+        issues: [diag('SUBMISSION_INVALID', `产物路径越界：${artifact.path}（${thrownMessage(error)}）`, 'artifacts 只能指向本 attempt 分配目录')],
       }
     }
     try {
@@ -1743,7 +2224,7 @@ async function archiveAttempt(input) {
         ok: false,
         code: 'SUBMISSION_INVALID',
         status: 'blocked',
-        issues: [diag('SUBMISSION_INVALID', `产物缺失或哈希不符：${artifact.path}（${error?.message ?? error}）`, '重新核对原始产物；提交后不得改写该版本')],
+        issues: [diag('SUBMISSION_INVALID', `产物缺失或哈希不符：${artifact.path}（${thrownMessage(error)}）`, '重新核对原始产物；提交后不得改写该版本')],
       }
     }
     const formal = runArtifacts.get(artifact.sha256)
@@ -1775,13 +2256,13 @@ async function archiveAttempt(input) {
         ok: false,
         code: 'BASELINE_MISMATCH',
         status: 'blocked',
-        issues: [diag('BASELINE_MISMATCH', `归档目标已存在且内容不一致：${formal}（${error?.message ?? error}）`, '正式记录不得覆盖：保留既有字节，按新 RUN 归档新证据')],
+        issues: [diag('BASELINE_MISMATCH', `归档目标已存在且内容不一致：${formal}（${thrownMessage(error)}）`, '正式记录不得覆盖：保留既有字节，按新 RUN 归档新证据')],
       }
     }
   }
 
-  const primary = input.runs[0]?.record ?? null
-  const mapping = {
+  const primary: unknown = input.runs[0]?.record ?? null
+  const mapping: Record<string, unknown> = {
     schema_version: 1,
     kind: 'conclude_archive_mapping',
     dispatch_id: dispatchId,
@@ -1798,21 +2279,21 @@ async function archiveAttempt(input) {
       ? { run_id: null }
       : {
         run_id: input.runs[0].run_id,
-        command: primary.command ?? null,
-        cwd: primary.cwd ?? null,
-        started_at: primary.started_at ?? null,
-        ended_at: primary.ended_at ?? null,
-        provenance: primary.provenance ?? null,
+        command: recordOf(primary).command ?? null,
+        cwd: recordOf(primary).cwd ?? null,
+        started_at: recordOf(primary).started_at ?? null,
+        ended_at: recordOf(primary).ended_at ?? null,
+        provenance: recordOf(primary).provenance ?? null,
       },
     runs: input.runs.map((run) => ({
       run_id: run.run_id,
       status: run.status,
-      command: run.record?.command ?? null,
-      cwd: run.record?.cwd ?? null,
-      started_at: run.record?.started_at ?? null,
-      ended_at: run.record?.ended_at ?? null,
-      provenance: run.record?.provenance ?? null,
-      artifacts: run.artifacts.map((artifact) => ({ path: artifact?.path ?? null, sha256: artifact?.sha256 ?? null })),
+      command: recordOf(run.record).command ?? null,
+      cwd: recordOf(run.record).cwd ?? null,
+      started_at: recordOf(run.record).started_at ?? null,
+      ended_at: recordOf(run.record).ended_at ?? null,
+      provenance: recordOf(run.record).provenance ?? null,
+      artifacts: run.artifacts.map((artifact) => ({ path: recordOf(artifact).path ?? null, sha256: recordOf(artifact).sha256 ?? null })),
     })),
   }
 
@@ -1826,7 +2307,7 @@ async function archiveAttempt(input) {
       ok: false,
       code: 'RECOVERY_REQUIRED',
       status: 'partial',
-      issues: [diag('RECOVERY_REQUIRED', `归档记录写不成：${error?.message ?? error}`, '确认 re/team/receipts 可写后以同一 operation ID 重入；已保留的证据不回滚')],
+      issues: [diag('RECOVERY_REQUIRED', `归档记录写不成：${thrownMessage(error)}`, '确认 re/team/receipts 可写后以同一 operation ID 重入；已保留的证据不回滚')],
     }
   }
 
@@ -1837,7 +2318,12 @@ async function archiveAttempt(input) {
  * 记录脚本失败阶段（best-effort）：`re/team/receipts/<D>-<A>/failed-<operation>.json`。
  * 阶段与 stdout/stderr/exitCode 原文必须保留，供 Lead 按同一 operation ID 重入。
  */
-async function recordStageFailure(modules, root, input, payload) {
+async function recordStageFailure(
+  modules: ResolvedModules,
+  root: string,
+  input: ConcludeInput,
+  payload: Record<string, unknown>,
+): Promise<void> {
   try {
     const ref = `${receiptDirOf(input.dispatch_id, input.attempt_id)}/failed-${input.operation_id}.json`
     const absolute = await modules.paths.assertSafeWriteTarget(root, ref)
@@ -1856,8 +2342,19 @@ async function recordStageFailure(modules, root, input, payload) {
   }
 }
 
+/** `writeCheck()` 的入参。 */
+interface WriteCheckInput {
+  modules: ResolvedModules
+  root: string
+  dispatchId: string
+  attemptId: string
+  name: string
+  payload: Record<string, unknown>
+  exitCode: unknown
+}
+
 /** 写一条检查输出并返回 concludeData.checks 条目。 */
-async function writeCheck(input) {
+async function writeCheck(input: WriteCheckInput): Promise<CheckEntry> {
   const { modules, root, dispatchId, attemptId, name, payload, exitCode } = input
   const ref = `${receiptDirOf(dispatchId, attemptId)}/checks/${name}.json`
   try {
@@ -1866,7 +2363,8 @@ async function writeCheck(input) {
   } catch {
     // 检查输出是诊断附件：写不成不影响判定（回执仍会记阶段与原始文本的引用位置）。
   }
-  return { name, status: 'pass', output_ref: ref, exit_code: Number.isSafeInteger(exitCode) ? exitCode : null }
+  const exit_code = typeof exitCode === 'number' && Number.isSafeInteger(exitCode) ? exitCode : null
+  return { name, status: 'pass', output_ref: ref, exit_code }
 }
 
 /**
@@ -1874,15 +2372,32 @@ async function writeCheck(input) {
  * @returns {Promise<{ok:true, exists:false} | {ok:true, exists:true, receipt:object}
  *   | {ok:false, issues:object[]}>}
  */
-async function readBusinessReceipt({ root, ref, fs, paths, dispatchId, attemptId }) {
+/** `readBusinessReceipt()` 的入参。 */
+interface BusinessReceiptInput {
+  root: string
+  ref: string
+  fs: FsLike
+  paths: typeof pathsModule
+  dispatchId: string
+  attemptId: string
+}
+
+/** `readBusinessReceipt()` 的结果：没有回执也是成功（`exists: false`）。 */
+type BusinessReceiptRead =
+  | { ok: true; exists: false }
+  | { ok: true; exists: true; receipt: Record<string, unknown> }
+  | { ok: false; issues: Diagnostic[] }
+
+async function readBusinessReceipt({ root, ref, fs, paths, dispatchId, attemptId }: BusinessReceiptInput): Promise<BusinessReceiptRead> {
   let text
   try {
     text = await fs.readFile(paths.resolveInProject(root, ref), 'utf8')
   } catch (error) {
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { ok: true, exists: false }
+    const code = recordOf(error).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return { ok: true, exists: false }
     return {
       ok: false,
-      issues: [diag('RECOVERY_REQUIRED', `读不了收口回执 ${ref}（${error?.code ?? 'unknown'}）`, '确认 re/team/receipts 可读；读失败不能当作没有收口')],
+      issues: [diag('RECOVERY_REQUIRED', `读不了收口回执 ${ref}（${code ?? 'unknown'}）`, '确认 re/team/receipts 可读；读失败不能当作没有收口')],
     }
   }
   let receipt
