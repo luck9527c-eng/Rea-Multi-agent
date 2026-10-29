@@ -1,0 +1,1348 @@
+/**
+ * 包内 tool schema 副本 —— 数据源是 `docs/specs/rt-tools.schema.json`（唯一权威），本文件只是
+ * 一份**逐字复制**的 `$defs`，不做任何改写、不手写变体。
+ *
+ * 为什么要有副本：本地 `link:` 安装的 bundle 按自身真实路径解析模块，读不到仓库里的
+ * `docs/`；工具注册又必须在模块加载时就有完整的 raw JSON Schema。
+ *
+ * 漂移测试在 `test/bundle.test.mjs`：把本文件的每个 `$defs` 与规格逐项深比较，不一致即失败。
+ * 所以**不要在这里手改**：要改先改规格（docs/specs 由 Lead 维护），再重新生成本文件。
+ *
+ * @module @local/dsh-redteam-lead/tool-schema
+ */
+
+/** 规格文件的完整内容（含 `$schema` / `$id` / `$defs`），逐字复制。 */
+const SPEC =
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rea-multi-agent:tools:v1",
+  "title": "Rea-Multi-agent tool contract v1",
+  "$ref": "#/$defs/request",
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,95}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Project-relative forward-slash path; semantic containment and reparse-point checks are mandatory."
+    },
+    "root": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Explicitly selected absolute local analysis root; canonicalized and binding-checked."
+    },
+    "routeId": {
+      "type": "string",
+      "pattern": "^R-[A-Za-z0-9_-]+$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^RUN-[A-Za-z0-9_-]+$"
+    },
+    "dispatchId": {
+      "type": "string",
+      "pattern": "^D-[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "attemptId": {
+      "type": "string",
+      "pattern": "^A-[0-9]{6}$"
+    },
+    "strings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/text"
+      },
+      "uniqueItems": true
+    },
+    "kinds": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "binary",
+          "game",
+          "webapp"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "date": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "routeStatus": {
+      "enum": [
+        "planned",
+        "active",
+        "blocked",
+        "paused",
+        "validated",
+        "falsified",
+        "superseded"
+      ]
+    },
+    "outcome": {
+      "enum": [
+        "finding",
+        "no_finding",
+        "refuted",
+        "blocked",
+        "budget_exhausted",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "errorCode": {
+      "enum": [
+        "INVALID_ARGUMENT",
+        "ROLE_REQUIRED",
+        "PATH_INVALID",
+        "TEAM_SERVICE_UNAVAILABLE",
+        "PROJECT_NOT_CONFIGURED",
+        "SKILL_INCOMPATIBLE",
+        "PROJECT_SESSION_MISMATCH",
+        "PROJECT_BUSY",
+        "UNKNOWN_CAPABILITY",
+        "CAPABILITY_MISSING",
+        "CAPABILITY_NOT_READY",
+        "CAPACITY_UNKNOWN",
+        "CAPACITY_EXHAUSTED",
+        "POST_DISABLED",
+        "MEMBER_BUSY",
+        "DEPENDENCY_BLOCKED",
+        "RESOURCE_BINDING_MISSING",
+        "RESOURCE_BUSY",
+        "DELIVERY_FAILED",
+        "START_ACK_TIMEOUT",
+        "RECOVERY_REQUIRED",
+        "OPERATION_CONFLICT",
+        "REVISION_CONFLICT",
+        "STALE_ATTEMPT",
+        "SUBMISSION_INVALID",
+        "BASELINE_MISMATCH",
+        "CHECK_FAILED",
+        "UNREVIEWED_COMPLETION"
+      ]
+    },
+    "anchorKind": {
+      "enum": [
+        "binary_location",
+        "source_location",
+        "web_capture",
+        "runtime_event",
+        "evidence_export",
+        "artifact_locator"
+      ]
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resource_key",
+        "mode"
+      ],
+      "properties": {
+        "resource_key": {
+          "$ref": "#/$defs/text"
+        },
+        "mode": {
+          "enum": [
+            "shared_read",
+            "exclusive"
+          ]
+        }
+      }
+    },
+    "anchorRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "run_id",
+        "path",
+        "locator"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/anchorKind"
+        },
+        "run_id": {
+          "$ref": "#/$defs/runId"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "locator": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "rosterInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_root"
+      ],
+      "properties": {
+        "project_root": {
+          "$ref": "#/$defs/root"
+        },
+        "action": {
+          "enum": [
+            "inspect",
+            "bind",
+            "takeover"
+          ],
+          "default": "inspect"
+        },
+        "target_kinds": {
+          "$ref": "#/$defs/kinds",
+          "default": []
+        },
+        "max_posts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6
+        },
+        "reserved_member_slots": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1
+        },
+        "reserved_activations": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 2
+        },
+        "operation_id": {
+          "$ref": "#/$defs/id"
+        },
+        "proposal_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "recovery_ref": {
+          "$ref": "#/$defs/path"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "enum": [
+                  "bind",
+                  "takeover"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "operation_id",
+              "proposal_hash",
+              "target_kinds"
+            ],
+            "properties": {
+              "target_kinds": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "operation_id"
+                  ]
+                },
+                {
+                  "required": [
+                    "proposal_hash"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "const": "takeover"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "recovery_ref"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "recovery_ref"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "retryOf": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "dispatch_id",
+        "attempt_id",
+        "recovery_ref"
+      ],
+      "properties": {
+        "dispatch_id": {
+          "$ref": "#/$defs/dispatchId"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/attemptId"
+        },
+        "recovery_ref": {
+          "$ref": "#/$defs/path"
+        }
+      }
+    },
+    "dispatchInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_root",
+        "operation_id",
+        "post_id",
+        "route_id",
+        "target_ids",
+        "objective",
+        "evidence_required",
+        "prohibited"
+      ],
+      "properties": {
+        "project_root": {
+          "$ref": "#/$defs/root"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/id"
+        },
+        "post_id": {
+          "$ref": "#/$defs/id"
+        },
+        "route_id": {
+          "$ref": "#/$defs/routeId"
+        },
+        "target_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^T-[A-Za-z0-9_-]+$"
+          }
+        },
+        "objective": {
+          "$ref": "#/$defs/text"
+        },
+        "evidence_required": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/anchorKind"
+          }
+        },
+        "prohibited": {
+          "$ref": "#/$defs/strings"
+        },
+        "capability_needs": {
+          "$ref": "#/$defs/strings",
+          "default": []
+        },
+        "depends_on_tasks": {
+          "$ref": "#/$defs/strings",
+          "default": []
+        },
+        "resource_needs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/resource"
+          },
+          "default": []
+        },
+        "timebox_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1800000
+        },
+        "delivery_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 60000
+        },
+        "retry_of": {
+          "$ref": "#/$defs/retryOf",
+          "default": null
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "summary",
+        "reason",
+        "proposed_route_status",
+        "evidence_run_ids",
+        "anchor_refs",
+        "limitations",
+        "next_step"
+      ],
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/outcome"
+        },
+        "summary": {
+          "$ref": "#/$defs/text"
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "proposed_route_status": {
+          "$ref": "#/$defs/routeStatus"
+        },
+        "evidence_run_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/runId"
+          }
+        },
+        "anchor_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/anchorRef"
+          }
+        },
+        "limitations": {
+          "$ref": "#/$defs/strings"
+        },
+        "next_step": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "finding",
+                  "no_finding",
+                  "refuted",
+                  "failed"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "evidence_run_ids": {
+                "minItems": 1
+              },
+              "anchor_refs": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "finding"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed_route_status": {
+                "enum": [
+                  "active",
+                  "validated"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "no_finding"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed_route_status": {
+                "enum": [
+                  "active",
+                  "paused",
+                  "validated"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "refuted"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed_route_status": {
+                "const": "falsified"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed_route_status": {
+                "const": "blocked"
+              },
+              "next_step": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "budget_exhausted"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed_route_status": {
+                "const": "paused"
+              },
+              "next_step": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed_route_status": {
+                "enum": [
+                  "blocked",
+                  "paused"
+                ]
+              },
+              "next_step": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "cancelled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "proposed_route_status": {
+                "enum": [
+                  "paused",
+                  "superseded"
+                ]
+              },
+              "next_step": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "concludeInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_root",
+        "operation_id",
+        "dispatch_id",
+        "attempt_id",
+        "task_id",
+        "expected_revision",
+        "submission_ref",
+        "submission_sha256",
+        "review"
+      ],
+      "properties": {
+        "project_root": {
+          "$ref": "#/$defs/root"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/id"
+        },
+        "dispatch_id": {
+          "$ref": "#/$defs/dispatchId"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/attemptId"
+        },
+        "task_id": {
+          "$ref": "#/$defs/text"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "submission_ref": {
+          "$ref": "#/$defs/path"
+        },
+        "submission_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "review": {
+          "$ref": "#/$defs/review"
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "input"
+      ],
+      "properties": {
+        "tool": {
+          "enum": [
+            "rt_roster",
+            "rt_dispatch",
+            "rt_conclude"
+          ]
+        },
+        "input": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "rt_roster"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "input": {
+                "$ref": "#/$defs/rosterInput"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "rt_dispatch"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "input": {
+                "$ref": "#/$defs/dispatchInput"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "rt_conclude"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "input": {
+                "$ref": "#/$defs/concludeInput"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "reason",
+        "next_step"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/text"
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "next_step": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "failureData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "preflight",
+            "prepared",
+            "member_ready",
+            "task_created",
+            "assigned",
+            "delivered",
+            "integrating",
+            "facts_committed",
+            "needs_recovery"
+          ]
+        },
+        "dispatch_id": {
+          "$ref": "#/$defs/dispatchId"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/attemptId"
+        },
+        "task_id": {
+          "$ref": "#/$defs/text"
+        },
+        "member": {
+          "$ref": "#/$defs/text"
+        },
+        "route_id": {
+          "$ref": "#/$defs/routeId"
+        },
+        "actual_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contract_ref": {
+          "$ref": "#/$defs/path"
+        },
+        "work_dir": {
+          "$ref": "#/$defs/path"
+        },
+        "receipt_ref": {
+          "$ref": "#/$defs/path"
+        },
+        "recovery_ref": {
+          "$ref": "#/$defs/path"
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "code",
+        "operation_id",
+        "replayed",
+        "retryable",
+        "diagnostics",
+        "data"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "blocked",
+            "partial",
+            "error"
+          ]
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        },
+        "data": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ok"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "code": {
+                "const": null
+              },
+              "data": {
+                "type": "object"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/errorCode"
+              },
+              "diagnostics": {
+                "minItems": 1
+              },
+              "data": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/failureData"
+                  },
+                  {
+                    "$ref": "#/$defs/rosterData"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "post": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "post_id",
+        "state",
+        "required",
+        "optional",
+        "anchors_required",
+        "member",
+        "reason"
+      ],
+      "properties": {
+        "post_id": {
+          "$ref": "#/$defs/id"
+        },
+        "state": {
+          "enum": [
+            "ready",
+            "assigned",
+            "vacant",
+            "deferred",
+            "disabled"
+          ]
+        },
+        "required": {
+          "$ref": "#/$defs/strings"
+        },
+        "optional": {
+          "$ref": "#/$defs/strings"
+        },
+        "anchors_required": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/anchorKind"
+          }
+        },
+        "member": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "rosterData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "project_root",
+        "project_id",
+        "session_id",
+        "team_id",
+        "compatibility",
+        "posts",
+        "gaps",
+        "capacity",
+        "recommended_members",
+        "proposal_hash",
+        "binding_ref"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "inspect",
+            "bind",
+            "takeover"
+          ]
+        },
+        "project_root": {
+          "$ref": "#/$defs/root"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "team_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "compatibility": {
+          "enum": [
+            "compatible",
+            "blocked",
+            "unknown"
+          ]
+        },
+        "posts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/post"
+          }
+        },
+        "gaps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        },
+        "capacity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "remaining_member_slots",
+            "remaining_activations",
+            "reserved_member_slots",
+            "reserved_activations"
+          ],
+          "properties": {
+            "remaining_member_slots": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "remaining_activations": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "reserved_member_slots": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reserved_activations": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "recommended_members": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "proposal_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "binding_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "dispatchData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dispatch_id",
+        "attempt_id",
+        "task_id",
+        "member",
+        "route_id",
+        "revision",
+        "phase",
+        "contract_ref",
+        "work_dir",
+        "started_at"
+      ],
+      "properties": {
+        "dispatch_id": {
+          "$ref": "#/$defs/dispatchId"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/attemptId"
+        },
+        "task_id": {
+          "$ref": "#/$defs/text"
+        },
+        "member": {
+          "$ref": "#/$defs/text"
+        },
+        "route_id": {
+          "$ref": "#/$defs/routeId"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "phase": {
+          "const": "delivered"
+        },
+        "contract_ref": {
+          "$ref": "#/$defs/path"
+        },
+        "work_dir": {
+          "$ref": "#/$defs/path"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/date"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "concludeData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dispatch_id",
+        "attempt_id",
+        "task_id",
+        "phase",
+        "outcome",
+        "route_status",
+        "receipt_ref",
+        "checks",
+        "audit_written"
+      ],
+      "properties": {
+        "dispatch_id": {
+          "$ref": "#/$defs/dispatchId"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/attemptId"
+        },
+        "task_id": {
+          "$ref": "#/$defs/text"
+        },
+        "phase": {
+          "const": "completed"
+        },
+        "outcome": {
+          "$ref": "#/$defs/outcome"
+        },
+        "route_status": {
+          "$ref": "#/$defs/routeStatus"
+        },
+        "receipt_ref": {
+          "$ref": "#/$defs/path"
+        },
+        "audit_written": {
+          "type": "boolean"
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "status",
+              "output_ref",
+              "exit_code"
+            ],
+            "properties": {
+              "name": {
+                "$ref": "#/$defs/text"
+              },
+              "status": {
+                "const": "pass"
+              },
+              "output_ref": {
+                "$ref": "#/$defs/path"
+              },
+              "exit_code": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "output"
+      ],
+      "properties": {
+        "tool": {
+          "enum": [
+            "rt_roster",
+            "rt_dispatch",
+            "rt_conclude"
+          ]
+        },
+        "output": {
+          "$ref": "#/$defs/result"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "rt_roster"
+              },
+              "output": {
+                "properties": {
+                  "status": {
+                    "const": "ok"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "output": {
+                "properties": {
+                  "data": {
+                    "$ref": "#/$defs/rosterData"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "rt_dispatch"
+              },
+              "output": {
+                "properties": {
+                  "status": {
+                    "const": "ok"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "output": {
+                "properties": {
+                  "data": {
+                    "$ref": "#/$defs/dispatchData"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tool": {
+                "const": "rt_conclude"
+              },
+              "output": {
+                "properties": {
+                  "status": {
+                    "const": "ok"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "output": {
+                "properties": {
+                  "data": {
+                    "$ref": "#/$defs/concludeData"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+
+/**
+ * 规格的 `$defs` 映射，可直接交给 `validate.validateInput(schemaDefs, defName, value)`。
+ * @type {Record<string, object>}
+ */
+export const schemaDefs = SPEC.$defs
+
+/** `rt_roster` 入参（校验由本包自己做：raw JSON Schema 的工具没有宿主侧自动校验）。 */
+export const rosterInput = schemaDefs.rosterInput
+
+/** `rt_dispatch` 入参。 */
+export const dispatchInput = schemaDefs.dispatchInput
+
+/** `rt_conclude` 入参。 */
+export const concludeInput = schemaDefs.concludeInput
+
+/** 三个工具共用的返回信封（`$defs.result`）：`execute` 的返回值必须符合它。 */
+export const result = schemaDefs.result
+
+/** 三个工具的成功 data 形状（handler 与测试共用，避免手写重复）。 */
+export const rosterData = schemaDefs.rosterData
+export const dispatchData = schemaDefs.dispatchData
+export const concludeData = schemaDefs.concludeData
+
+/** 失败 data 与诊断的共用定义。 */
+export const failureData = schemaDefs.failureData
+export const diagnostic = schemaDefs.diagnostic
