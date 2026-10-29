@@ -254,6 +254,7 @@ type AdapterFactory = (input: Record<string, unknown>) => Promise<unknown>
  * 因此不改变任何字节，只把同一个对象贴回它本来的形状。
  */
 function resultOf<T>(value: unknown): T {
+  // 断言：T 由调用点按被调模块的真实返回形状给出，本函数只把同一个对象贴回它本来的形状。
   return value as T
 }
 
@@ -435,6 +436,7 @@ function replayEnvelope(stored: unknown): Envelope {
  * 转换反而会改变 `audit.jsonl` 的字节，而写入方接受未知值。
  */
 function auditColumn(value: unknown): string | null {
+  // 断言：写入方（audit.column）接受未知值并自己转文本；这里保持原值，不改变 audit.jsonl 字节。
   return value as string | null
 }
 
@@ -971,6 +973,8 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
     ? raw.operation_id
     : null
   let phase = 'preflight'
+  // 副作用分界线（见步骤 4 的长注释）：归档成功之后，任何失败都不能再报「什么都没发生」。
+  let archived = false
 
   try {
     const modules = resolveModules(ctx)
@@ -1267,6 +1271,13 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
       }
 
       /* ---- 步骤 4：归档 -------------------------------------------------- */
+      // ▲ 副作用分界线（编排契约「操作阶段与部分失败」）：
+      //   - 在此之前：前置拒绝 → `status=blocked`，语义是「什么都没发生」——没有新成员、新任务、
+      //     正式路线变更，也没有正式证据字节。台账 `re/team/operations/**` 只是本插件的幂等簿记
+      //     （每次 conclude 都会写），不算「正式事实」，不推进这条分界线。
+      //   - `archiveAttempt()` 成功之后：正式 `re/runs/**` 与回执目录里已经有字节，此后**任何**失败
+      //     一律 `status=partial`，并在 `data.phase` 带上阶段。Lead 读到 blocked 会以为可以原地重派；
+      //     读到 partial 才知道必须按「已有字节」处置（保留证据、同 operation ID 前移恢复）。
       phase = 'integrating'
       const archive = await archiveAttempt({
         modules,
@@ -1292,6 +1303,8 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
           }),
         }
       }
+      // 正式 re/runs/** 与回执目录已经有字节：从这一行之后，失败一律 partial。
+      archived = true
 
       /* ---- 步骤 5：基准比对 + seal ------------------------------------- */
       const loaded = resultOf<LoadedBaselineRead>(await modules.baseline.loadBaseline({
@@ -1303,7 +1316,9 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
         paths: modules.paths,
       }))
       if (loaded.ok !== true) {
-        return { envelope: failWithIssues(en, { code: loaded.code, operationId, issues: loaded.issues, data: { phase } }) }
+        return {
+          envelope: failWithIssues(en, { code: loaded.code, operationId, issues: loaded.issues, data: { phase }, status: 'partial' }),
+        }
       }
 
       const sealList = recordOf(await project.readSeals())
@@ -1314,6 +1329,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
             operationId,
             issues: [diag('RECOVERY_REQUIRED', `读不了 re/seals 清单：${sealList.reason ?? sealList.code ?? 'unknown'}`, '确认 re/seals 可读；读失败不能当作没有封存')],
             data: { phase },
+            status: 'partial',
           }),
         }
       }
@@ -1331,7 +1347,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
       }))
       if (compared.ok !== true) {
         return {
-          envelope: failWithIssues(en, { code: compared.code, operationId, issues: compared.issues, data: { phase } }),
+          envelope: failWithIssues(en, { code: compared.code, operationId, issues: compared.issues, data: { phase }, status: 'partial' }),
         }
       }
 
@@ -1358,6 +1374,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
             diagnostics: [
               diag('CHECK_FAILED', `seal 阶段失败（RUN ${sealed.run_id ?? 'unknown'}）：${sealed.stderr || sealed.code}`, '保留 stdout/stderr/exitCode 与阶段；修正项目记录后以同一 operation ID 重入，不完成任务'),
             ],
+            status: 'partial',
           }),
         }
       }
@@ -1437,6 +1454,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
               ),
             ],
             data: { phase, route_id: route.id },
+            status: 'partial',
           }),
         }
       }
@@ -1458,6 +1476,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
               ),
             ],
             data: { phase, route_id: route.id },
+            status: 'partial',
           }),
         }
       }
@@ -1490,6 +1509,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
               ),
             ],
             data: { phase, route_id: route.id },
+            status: 'partial',
           }),
         }
       }
@@ -1522,6 +1542,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
               ),
             ],
             data: { phase, route_id: route.id },
+            status: 'partial',
           }),
         }
       }
@@ -1599,6 +1620,7 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
                 task_id: input.task_id,
                 ...(actualRevision === undefined ? {} : { actual_revision: actualRevision }),
               },
+              status: 'partial',
             }),
           }
         }
@@ -1737,7 +1759,14 @@ export async function handleConclude(ctx: HandlerCtx, rawInput: unknown): Promis
       }
     }
   } catch (error) {
-    return { envelope: en.fromError(error, { operationId, data: { phase } }) }
+    // 归档之后才冒出来的未捕获异常同样不能报「什么都没发生」：显式把状态压成 partial。
+    return {
+      envelope: en.fromError(error, {
+        operationId,
+        data: { phase },
+        ...(archived ? { status: 'partial' as const } : {}),
+      }),
+    }
   }
 }
 
@@ -1761,7 +1790,12 @@ interface FailWithIssuesOptions {
   diagnostics?: readonly Diagnostic[]
 }
 
-/** 把「问题清单」折成一个信封：默认 blocked，`status` 为 partial/error 时改用对应状态。 */
+/**
+ * 把「问题清单」折成一个信封：默认 blocked，`status` 为 partial/error 时改用对应状态。
+ *
+ * `status` 不是装饰：编排契约要求「前置拒绝 → blocked；已持久化或触及宿主后失败 → partial」。
+ * 分界线见步骤 4 `archiveAttempt()` 处的长注释——归档之后的每个失败点都必须显式传 `partial`。
+ */
 function failWithIssues(envelope: EnvelopeModule, options: FailWithIssuesOptions): Envelope {
   const { code, operationId, issues, data, status, diagnostics: extra = [] } = options
   const diagnostics = [
@@ -2295,6 +2329,12 @@ async function archiveAttempt(input: ArchiveAttemptInput): Promise<ArchiveResult
     }
   }
 
+  // 循环内的失败状态：已经确认过**至少一个**产物的正式字节（复制或校验复用）→ partial。
+  // 这是 `archiveAttempt()` 内部那条「本函数自己写过的字节」的分界线：第一个产物落盘之前
+  // 失败仍然可以报 blocked（什么都没发生），之后就必须报 partial。
+  let formalized = 0
+  const failureStatus = (): 'partial' | 'blocked' => (formalized > 0 ? 'partial' : 'blocked')
+
   for (const artifact of submission.artifacts) {
     let source
     try {
@@ -2303,7 +2343,7 @@ async function archiveAttempt(input: ArchiveAttemptInput): Promise<ArchiveResult
       return {
         ok: false,
         code: 'SUBMISSION_INVALID',
-        status: 'blocked',
+        status: failureStatus(),
         issues: [diag('SUBMISSION_INVALID', `产物路径越界：${artifact.path}（${thrownMessage(error)}）`, 'artifacts 只能指向本 attempt 分配目录')],
       }
     }
@@ -2313,7 +2353,7 @@ async function archiveAttempt(input: ArchiveAttemptInput): Promise<ArchiveResult
       return {
         ok: false,
         code: 'SUBMISSION_INVALID',
-        status: 'blocked',
+        status: failureStatus(),
         issues: [diag('SUBMISSION_INVALID', `产物缺失或哈希不符：${artifact.path}（${thrownMessage(error)}）`, '重新核对原始产物；提交后不得改写该版本')],
       }
     }
@@ -2322,7 +2362,7 @@ async function archiveAttempt(input: ArchiveAttemptInput): Promise<ArchiveResult
       return {
         ok: false,
         code: 'SUBMISSION_INVALID',
-        status: 'blocked',
+        status: failureStatus(),
         issues: [
           diag(
             'SUBMISSION_INVALID',
@@ -2341,11 +2381,12 @@ async function archiveAttempt(input: ArchiveAttemptInput): Promise<ArchiveResult
         await modules.atomic.copyVerify(source, destination, { expectedSha256: artifact.sha256 })
       }
       mappingArtifacts.push({ source_path: artifact.path, archived_path: formal, sha256: artifact.sha256 })
+      formalized += 1
     } catch (error) {
       return {
         ok: false,
         code: 'BASELINE_MISMATCH',
-        status: 'blocked',
+        status: failureStatus(),
         issues: [diag('BASELINE_MISMATCH', `归档目标已存在且内容不一致：${formal}（${thrownMessage(error)}）`, '正式记录不得覆盖：保留既有字节，按新 RUN 归档新证据')],
       }
     }
