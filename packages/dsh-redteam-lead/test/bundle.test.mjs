@@ -468,11 +468,262 @@ test('src/tool-schema.mjs 与 docs/specs/rt-tools.schema.json 逐 $defs 无漂�
 })
 
 // ---------------------------------------------------------------------------
-// 4. 工具注册与路由接缝
+// 4. 注册用投影：output.schema 必须是宿主支持子集的 $defs.result 投影；
+//    入参必须是自包含（$ref 就地展开）的原始 JSON Schema
 // ---------------------------------------------------------------------------
 
+test('output.schema 投影与 $defs.result 对齐，且在宿主支持子集内', async () => {
+  const module = await import('../src/tool-schema.mjs')
+  const spec = JSON.parse(readFileSync(SPECS_SCHEMA, 'utf8'))
+  const resultDef = spec.$defs.result
+  const output = module.resultOutput
+
+  // 宿主 assertSupportedJsonSchema：$ref / allOf / 类型数组 / pattern 一律 UNSUPPORTED_SCHEMA
+  assert.deepEqual(hostSchemaViolations(output), [], 'resultOutput 必须在宿主支持子集内')
+  assert.deepEqual(collectRefs(output), [], 'resultOutput 不得含 $ref')
+
+  assert.equal(output.type, 'object')
+  assert.equal(output.additionalProperties, false)
+  assert.deepEqual(output.required, resultDef.required, '八个必填字段必须与 $defs.result 一致')
+  assert.deepEqual(Object.keys(output.properties).sort(), Object.keys(resultDef.properties).sort())
+  assert.equal(output.properties.schema_version.const, resultDef.properties.schema_version.const)
+  assert.equal(output.properties.schema_version.type, 'integer')
+  assert.deepEqual(output.properties.status.enum, resultDef.properties.status.enum)
+  // code：ok 必须 null、其余取 $defs.errorCode；投影用 oneOf 表达 string|null
+  assert.deepEqual(output.properties.code.oneOf[0].enum, spec.$defs.errorCode.enum, 'code 的枚举必须直接来自规格')
+  assert.deepEqual(output.properties.code.oneOf[1], { type: 'null' })
+  assert.deepEqual(output.properties.diagnostics.items.required, spec.$defs.diagnostic.required)
+  assert.deepEqual(
+    Object.keys(output.properties.diagnostics.items.properties).sort(),
+    Object.keys(spec.$defs.diagnostic.properties).sort(),
+  )
+  assert.equal(output.properties.diagnostics.items.additionalProperties, false)
+  assert.deepEqual(output.properties.data.oneOf, [{ type: 'object' }, { type: 'null' }])
+
+  // 宿主校验器必须真的能用它：合法信封零违规，坏信封要被抓住
+  const valid = {
+    schema_version: 1, status: 'ok', code: null, operation_id: null,
+    replayed: false, retryable: false, diagnostics: [], data: {},
+  }
+  assert.deepEqual(hostValueViolations(output, valid), [])
+  assert.ok(hostValueViolations(output, { ...valid, status: 'bogus' }).length > 0, 'status 枚举要挡')
+  assert.ok(hostValueViolations(output, { ...valid, code: 'NOPE' }).length > 0, '未经登记的错误码要挡')
+  assert.ok(hostValueViolations(output, { ...valid, extra: 1 }).length > 0, 'additionalProperties:false 要挡')
+  assert.ok(hostValueViolations(output, { ...valid, diagnostics: [{ code: 'X' }] }).length > 0, '诊断三字段必填')
+})
+
+test('三个入参 schema 在注册前展开 $ref（自包含），展开保留规格内容', async () => {
+  const module = await import('../src/tool-schema.mjs')
+  const spec = JSON.parse(readFileSync(SPECS_SCHEMA, 'utf8'))
+
+  for (const [exportName, defName] of [
+    ['rosterParameters', 'rosterInput'],
+    ['dispatchParameters', 'dispatchInput'],
+    ['concludeParameters', 'concludeInput'],
+  ]) {
+    const projected = module[exportName]
+    assert.deepEqual(collectRefs(projected), [], `${exportName} 不得残留 $ref（模型与严格 provider 解析不了）`)
+    assert.equal(projected.type, 'object')
+    assert.equal(projected.additionalProperties, false)
+    assert.deepEqual(projected.required, spec.$defs[defName].required, `${exportName}.required 必须与规格一致`)
+    assert.deepEqual(Object.keys(projected.properties).sort(), Object.keys(spec.$defs[defName].properties).sort())
+  }
+
+  // 嵌套 $ref 也要展开（抽查三层：kinds → items.enum、text → pattern、anchorRef → anchorKind）
+  assert.deepEqual(module.rosterParameters.properties.target_kinds.items.enum, spec.$defs.kinds.items.enum)
+  assert.equal(module.rosterParameters.properties.target_kinds.uniqueItems, true)
+  assert.equal(module.dispatchParameters.properties.prohibited.items.pattern, spec.$defs.text.pattern)
+  assert.deepEqual(
+    module.concludeParameters.properties.review.properties.anchor_refs.items.required,
+    spec.$defs.anchorRef.required,
+  )
+  assert.deepEqual(
+    module.concludeParameters.properties.review.properties.anchor_refs.items.properties.kind.enum,
+    spec.$defs.anchorKind.enum,
+  )
+  // 入参里用到的 $defs 闭包必须完整（不能展开成悬空对象）
+  assert.deepEqual(module.inlineRefs({ $ref: '#/$defs/dispatchId' }), spec.$defs.dispatchId)
+  assert.throws(() => module.inlineRefs({ $ref: '#/$defs/nope' }), /未定义/)
+})
+
+// ---------------------------------------------------------------------------
+// 5. 工具注册与路由接缝
+// ---------------------------------------------------------------------------
+
+/**
+ * 宿主 `assertSupportedJsonSchema` 的等价检查。
+ *
+ * 依据：`packages/core/tools/src/json-schema.ts`（E1 §C.2 引用的 `ctx.tools.register` 实现）。
+ * 宿主只接受 `type / oneOf / properties / required / additionalProperties / items / enum / const`
+ * 加注解；`$ref`、`allOf`、`anyOf`、`if/then/else`、`pattern`、类型数组都会让注册直接抛
+ * `UNSUPPORTED_SCHEMA`、整行插件不激活。这里把它写成测试守卫，避免交付一个「测试全绿但挂不上」的包。
+ *
+ * @param {unknown} schema
+ * @returns {string[]} 违规项（空 = 宿主会接受）
+ */
+function hostSchemaViolations(schema) {
+  const TYPES = ['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']
+  const SCALARS = ['string', 'number', 'integer', 'boolean', 'null']
+  const CONSTRAINT = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const'])
+  const ANNOTATION = new Set(['description', 'title', 'default', 'examples'])
+  const ONE_OF_SIBLINGS = ['properties', 'required', 'additionalProperties', 'items', 'enum', 'const']
+  const violations = []
+
+  const walk = (node, at) => {
+    if (node === null || typeof node !== 'object' || Array.isArray(node)) {
+      violations.push(`${at} must be a schema object`)
+      return
+    }
+    for (const key of Object.keys(node)) {
+      if (!CONSTRAINT.has(key) && !ANNOTATION.has(key)) violations.push(`${at}.${key} is not a supported keyword`)
+    }
+    const hasType = Object.hasOwn(node, 'type')
+    const hasOneOf = Object.hasOwn(node, 'oneOf')
+    if (hasType && hasOneOf) {
+      violations.push(`${at} cannot declare both type and oneOf`)
+      return
+    }
+    if (hasOneOf) {
+      for (const key of ONE_OF_SIBLINGS) {
+        if (Object.hasOwn(node, key)) violations.push(`${at}.${key} is not supported beside oneOf`)
+      }
+      if (!Array.isArray(node.oneOf) || node.oneOf.length < 2) {
+        violations.push(`${at}.oneOf must be an array of at least two schemas`)
+      } else {
+        node.oneOf.forEach((branch, index) => walk(branch, `${at}.oneOf[${index}]`))
+      }
+      return
+    }
+    if (!hasType) {
+      for (const key of ONE_OF_SIBLINGS) {
+        if (Object.hasOwn(node, key)) violations.push(`${at}.${key} requires type or oneOf`)
+      }
+      return
+    }
+    if (typeof node.type !== 'string' || !TYPES.includes(node.type)) {
+      violations.push(`${at}.type must be a single type string`)
+      return
+    }
+    if (Object.hasOwn(node, 'properties')) {
+      if (node.type !== 'object') violations.push(`${at}.properties is not supported on type "${node.type}"`)
+      else if (node.properties === null || typeof node.properties !== 'object' || Array.isArray(node.properties)) {
+        violations.push(`${at}.properties must be an object of schemas`)
+      } else {
+        for (const [key, value] of Object.entries(node.properties)) walk(value, `${at}.properties.${key}`)
+      }
+    }
+    if (Object.hasOwn(node, 'required')) {
+      if (node.type !== 'object') violations.push(`${at}.required is not supported on type "${node.type}"`)
+      else if (!Array.isArray(node.required) || node.required.some((entry) => typeof entry !== 'string')) {
+        violations.push(`${at}.required must be an array of strings`)
+      } else {
+        const declared = node.properties ?? {}
+        for (const key of node.required) {
+          if (!Object.hasOwn(declared, key)) violations.push(`${at}.required names "${key}" which is not in properties`)
+        }
+      }
+    }
+    if (Object.hasOwn(node, 'additionalProperties')) {
+      if (node.type !== 'object') violations.push(`${at}.additionalProperties is not supported on type "${node.type}"`)
+      else if (typeof node.additionalProperties !== 'boolean') violations.push(`${at}.additionalProperties must be a boolean`)
+    }
+    if (Object.hasOwn(node, 'items')) {
+      if (node.type !== 'array') violations.push(`${at}.items is not supported on type "${node.type}"`)
+      else walk(node.items, `${at}.items`)
+    }
+    for (const key of ['enum', 'const']) {
+      if (!Object.hasOwn(node, key)) continue
+      if (!SCALARS.includes(node.type)) {
+        violations.push(`${at}.${key} is not supported on type "${node.type}"`)
+        continue
+      }
+      const values = key === 'enum' ? node.enum : [node.const]
+      if (!Array.isArray(values) || values.length === 0) {
+        violations.push(`${at}.${key} must be a non-empty array`)
+        continue
+      }
+      for (const value of values) {
+        const matches =
+          node.type === 'string' ? typeof value === 'string'
+            : node.type === 'boolean' ? typeof value === 'boolean'
+              : node.type === 'null' ? value === null
+                : typeof value === 'number' && (node.type === 'number' || Number.isInteger(value))
+        if (!matches) violations.push(`${at}.${key} value ${JSON.stringify(value)} is not a ${node.type}`)
+      }
+    }
+  }
+
+  walk(schema, 'schema')
+  return violations
+}
+
+/**
+ * 宿主 `validateJsonSchemaValue` 的等价检查：`output.render` 之前的返回值校验。
+ * 用它断言「本包返回的每个信封都能通过宿主校验」，否则用户看到的是 `INVALID_TOOL_OUTPUT`。
+ *
+ * @param {unknown} schema 已通过 {@link hostSchemaViolations} 的 schema
+ * @param {unknown} value 待校验的值
+ * @returns {string[]} 违规项（空 = 宿主会接受）
+ */
+function hostValueViolations(schema, value) {
+  const isPlain = (candidate) => candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate)
+
+  /** 纯函数：返回该节点对当前值的全部违规（oneOf 必须按分支独立判断，不能共享累加器）。 */
+  const check = (node, current, path) => {
+    if (Object.hasOwn(node, 'oneOf')) {
+      let matched = 0
+      for (const branch of node.oneOf) if (check(branch, current, path).length === 0) matched += 1
+      return matched === 1 ? [] : [`${path} must match exactly one oneOf branch (matched ${matched})`]
+    }
+    if (!Object.hasOwn(node, 'type')) return []
+    switch (node.type) {
+      case 'object': {
+        if (!isPlain(current)) return [`${path} must be an object`]
+        const out = []
+        const properties = node.properties ?? {}
+        for (const key of node.required ?? []) {
+          if (!Object.hasOwn(current, key) || current[key] === undefined) out.push(`${path}.${key} is required`)
+        }
+        for (const [key, childSchema] of Object.entries(properties)) {
+          if (!Object.hasOwn(current, key)) continue
+          out.push(...check(childSchema, current[key], `${path}.${key}`))
+        }
+        if (node.additionalProperties === false) {
+          for (const key of Object.keys(current)) {
+            if (!Object.hasOwn(properties, key)) out.push(`${path}.${key} is not a declared property`)
+          }
+        }
+        return out
+      }
+      case 'array': {
+        if (!Array.isArray(current)) return [`${path} must be an array`]
+        if (!Object.hasOwn(node, 'items')) return []
+        return current.flatMap((item, index) => check(node.items, item, `${path}[${index}]`))
+      }
+      default: {
+        const matches =
+          node.type === 'string' ? typeof current === 'string'
+            : node.type === 'boolean' ? typeof current === 'boolean'
+              : node.type === 'null' ? current === null
+                : typeof current === 'number' && (node.type === 'number' || Number.isInteger(current))
+        if (!matches) return [`${path} must be a ${node.type}`]
+        if (Object.hasOwn(node, 'const') && current !== node.const) {
+          return [`${path} must equal ${JSON.stringify(node.const)}`]
+        }
+        if (Array.isArray(node.enum) && !node.enum.includes(current)) {
+          return [`${path} must be one of ${node.enum.map((entry) => JSON.stringify(entry)).join('、')}`]
+        }
+        return []
+      }
+    }
+  }
+
+  return check(schema, value, 'value')
+}
+
 /** 与 `$defs.result` 等价的信封断言（不依赖任何实现，按 schema 逐条对）。 */
-function assertResultEnvelope(envelope, errorCodes) {
+function assertResultEnvelope(envelope, context) {
+  const { errorCodes, resultOutput } = context
   assert.deepEqual(
     Object.keys(envelope).sort(),
     ['code', 'data', 'diagnostics', 'operation_id', 'replayed', 'retryable', 'schema_version', 'status'],
@@ -498,6 +749,8 @@ function assertResultEnvelope(envelope, errorCodes) {
     assert.ok(errorCodes.has(envelope.code), `非 ok 必须是稳定错误码，实际 ${String(envelope.code)}`)
     assert.ok(envelope.diagnostics.length >= 1, '非 ok 至少要一条诊断')
   }
+  // 宿主会在快照/冻结/渲染前按注册的 output.schema 再校验一次
+  assert.deepEqual(hostValueViolations(resultOutput, envelope), [], '返回的信封必须能通过宿主的 output.schema 校验')
 }
 
 /** 最小 Cordis 形状的假 ctx：只实现本插件用到的 `tools.register` 与 `get`。 */
@@ -536,7 +789,7 @@ async function importIndex(t) {
   }
 }
 
-test('三工具按 raw JSON Schema 注册，output.schema = $defs.result，render 全能', async (t) => {
+test('三工具注册：raw JSON Schema（自包含）、output.schema 为宿主子集投影、render 全能', async (t) => {
   const index = await importIndex(t)
   if (index === undefined) return
   const schema = await import('../src/tool-schema.mjs')
@@ -557,9 +810,12 @@ test('三工具按 raw JSON Schema 注册，output.schema = $defs.result，rende
     assert.ok(Array.isArray(definition.parameters.required) && definition.parameters.required.length > 0)
     assert.equal(typeof definition.description, 'string')
     assert.ok(definition.description.length > 40, 'description 是模型读的说明，不能敷衍')
+    // 入参必须自包含：悬空 $ref 模型解析不了
+    assert.deepEqual(collectRefs(definition.parameters), [], `${toolName}.parameters 不得残留 $ref`)
 
-    // 返回值形状：就是 $defs.result
-    assert.deepEqual(definition.output.schema, schema.result, `${toolName}.output.schema 必须逐字等于 $defs.result`)
+    // 返回值形状：宿主支持子集里的 $defs.result 投影（$ref/allOf/类型数组会让 register 直接抛）
+    assert.deepEqual(definition.output.schema, schema.resultOutput, `${toolName}.output.schema 必须逐字等于 resultOutput`)
+    assert.deepEqual(hostSchemaViolations(definition.output.schema), [], `${toolName}.output.schema 必须在宿主支持子集内`)
     assert.equal(typeof definition.output.render, 'function')
     assert.equal(typeof definition.execute, 'function')
 
@@ -589,7 +845,7 @@ test('三工具按 raw JSON Schema 注册，output.schema = $defs.result，rende
   // 合法入参经注册表 → 真 handler → 合规信封（当前 handler 是占位：TEAM_SERVICE_UNAVAILABLE）
   const roster = registered.get('rt_roster')
   const value = await roster.execute({ project_root: 'D:\\workSpace\\PJ\\case01' }, { signal: undefined })
-  assertResultEnvelope(value, errorCodes)
+  assertResultEnvelope(value, { errorCodes, resultOutput: schema.resultOutput })
   assert.equal(value.status, 'blocked')
   assert.equal(value.code, 'TEAM_SERVICE_UNAVAILABLE')
   assert.ok(value.diagnostics[0].next_step.includes('bin/doctor.mjs'), '缺服务诊断必须给出 doctor 入口')
@@ -641,7 +897,7 @@ test('非法入参 → INVALID_ARGUMENT 且 handler 完全没有被调用', asyn
 
   for (const { tool, args } of cases) {
     const value = await index.invokeTool({ tool, args, exec: {}, ctx, handlers })
-    assertResultEnvelope(value, errorCodes)
+    assertResultEnvelope(value, { errorCodes, resultOutput: schema.resultOutput })
     assert.equal(value.status, 'error', `${tool} ${JSON.stringify(args)} 应被拒绝`)
     assert.equal(value.code, 'INVALID_ARGUMENT')
     assert.ok(value.diagnostics[0].reason.length > 0)
@@ -656,7 +912,7 @@ test('非法入参 → INVALID_ARGUMENT 且 handler 完全没有被调用', asyn
     ctx,
     handlers,
   })
-  assertResultEnvelope(ok, errorCodes)
+  assertResultEnvelope(ok, { errorCodes, resultOutput: schema.resultOutput })
   assert.equal(ok.status, 'ok')
   assert.equal(calls.length, 1)
   assert.equal(calls[0].action, 'inspect', 'schema 的 default 只是注解，入口必须显式填 action=inspect')
@@ -676,7 +932,7 @@ test('handler 抛异常或返回不合规信封时，注册表只看到合法信
     ctx,
     handlers: { roster: async () => { throw new Error('boom') } },
   })
-  assertResultEnvelope(throwing, errorCodes)
+  assertResultEnvelope(throwing, { errorCodes, resultOutput: schema.resultOutput })
   assert.equal(throwing.status, 'error')
   assert.ok(errorCodes.has(throwing.code))
   assert.match(throwing.diagnostics[0].reason, /boom/)
@@ -693,7 +949,7 @@ test('handler 抛异常或返回不合规信封时，注册表只看到合法信
     ctx,
     handlers: { dispatch: async () => { throw new Error('boom') } },
   })
-  assertResultEnvelope(withOperation, errorCodes)
+  assertResultEnvelope(withOperation, { errorCodes, resultOutput: schema.resultOutput })
   assert.equal(withOperation.operation_id, 'op-echo', '失败信封也要回显 operation_id')
 
   const garbage = await index.invokeTool({
@@ -706,13 +962,13 @@ test('handler 抛异常或返回不合规信封时，注册表只看到合法信
     ctx,
     handlers: { dispatch: async () => ({ envelope: { status: 'ok' } }) },
   })
-  assertResultEnvelope(garbage, errorCodes)
+  assertResultEnvelope(garbage, { errorCodes, resultOutput: schema.resultOutput })
   assert.equal(garbage.status, 'error')
   assert.match(garbage.diagnostics[0].reason, /result/)
 })
 
 // ---------------------------------------------------------------------------
-// 5. 全包不得 import 任何 @deepseek-ai 包
+// 6. 全包不得 import 任何 @deepseek-ai 包
 // ---------------------------------------------------------------------------
 
 test('全包没有 @deepseek-ai 的 import / require', () => {
@@ -732,7 +988,7 @@ test('全包没有 @deepseek-ai 的 import / require', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 6. locale / icon（宿主只消费 meta.title 与 meta.description）
+// 7. locale / icon（宿主只消费 meta.title 与 meta.description）
 // ---------------------------------------------------------------------------
 
 test('locale 与 icon 满足宿主的显示元数据要求', async () => {

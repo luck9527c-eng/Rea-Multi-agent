@@ -54,7 +54,9 @@ import { handleDispatch } from './src/dispatch.mjs'
 import { handleConclude } from './src/conclude.mjs'
 
 // —— 包内 schema 副本（与 docs/specs/rt-tools.schema.json 有漂移测试）——
-import { schemaDefs, rosterInput, dispatchInput, concludeInput, result } from './src/tool-schema.mjs'
+// `*Parameters` 是展开 `$ref` 后的自包含入参 schema；`resultOutput` 是宿主支持子集里的
+// `$defs.result` 投影（`assertSupportedJsonSchema` 不认 `$ref`/`allOf`/类型数组）。
+import { schemaDefs, rosterParameters, dispatchParameters, concludeParameters, resultOutput } from './src/tool-schema.mjs'
 
 /** 插件名（插件清单/日志用）。 */
 export const name = 'redteam-lead-tools'
@@ -79,15 +81,18 @@ const DEFAULT_HANDLERS = Object.freeze({
 })
 
 /**
- * 三个工具的静态定义。`parameters` 直接用包内 schema 副本（raw JSON Schema 对象）。
- * `defName` 是 `$defs` 里的名字，用于本文件自己的入参校验与诊断。
+ * 三个工具的静态定义。`parameters` 是**自包含**的原始 JSON Schema（`$ref` 已就地展开），
+ * 注册进 `ctx.tools.register` 后直接进模型上下文。
+ *
+ * `defName` 是 `$defs` 里的名字，用于本文件自己的入参校验与诊断（本包校验用**完整规格**
+ * schema，不是注册用的展开副本）。
  */
 export const TOOLS = Object.freeze([
   {
     name: 'rt_roster',
     handler: 'roster',
     defName: 'rosterInput',
-    parameters: rosterInput,
+    parameters: rosterParameters,
     title: 'Inspect or bind the red-team roster',
     description:
       'Read-only roster diagnosis for a reverse-engineering project (action=inspect, default), or bind/takeover ' +
@@ -99,7 +104,7 @@ export const TOOLS = Object.freeze([
     name: 'rt_dispatch',
     handler: 'dispatch',
     defName: 'dispatchInput',
-    parameters: dispatchInput,
+    parameters: dispatchParameters,
     title: 'Dispatch one contract to a teammate',
     description:
       'Lead only. Persist one dispatch contract for a route and target set, spawn or reuse the teammate for a ' +
@@ -111,7 +116,7 @@ export const TOOLS = Object.freeze([
     name: 'rt_conclude',
     handler: 'conclude',
     defName: 'concludeInput',
-    parameters: concludeInput,
+    parameters: concludeParameters,
     title: 'Conclude one dispatch and complete its task',
     description:
       'Lead only. Validate one submission against its dispatch baseline and anchor set, run the project-skill ' +
@@ -462,10 +467,11 @@ export function apply(ctx, config = {}) {
     ctx.tools.register({
       name: spec.name,
       description: spec.description,
-      // 原始 JSON Schema：`defineTool` 的类型 DSL 在 link: 安装的 bundle 里不可用。
+      // 原始 JSON Schema（自包含、无 $ref）：`defineTool` 的类型 DSL 在 link: 安装的 bundle 里不可用。
       parameters: spec.parameters,
       output: {
-        schema: result,
+        // 必须是宿主支持子集里的 schema（$defs.result 的投影），否则 register() 直接抛 UNSUPPORTED_SCHEMA
+        schema: resultOutput,
         render: (_args, value) => renderResult(spec.name, value),
       },
       async execute(args, exec) {

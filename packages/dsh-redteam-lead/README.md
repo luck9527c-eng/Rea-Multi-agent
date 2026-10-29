@@ -110,6 +110,15 @@ cd $env:USERPROFILE\.dsh\profiles\desktop
   persona 行必须 `complete: false`，否则会把 `team:policy` 段吃掉。
 - **preset 里不声明 sandbox / approval 设置**：提供服务的插件若随 preset 泄漏到 root realm，注册表会把
   整棵 preset 判成 `broken`；权限属于 host 平面，不是本包职责。
+- **注册用的 schema 有两条宿主约束**（`packages/core/tools/src/json-schema.ts`）：
+  1. `output.schema` 只接受 `type / oneOf / properties / required / additionalProperties / items /
+     enum / const` + 注解这个子集；`$ref`、`allOf`、`anyOf`、`if/then/else`、`pattern`、类型数组
+     都会让注册直接抛 `UNSUPPORTED_SCHEMA`、整行插件不激活。所以注册的是
+     `src/tool-schema.mjs` 里的 `resultOutput`（`$defs.result` 的子集投影），完整条件约束仍由
+     `src/envelope.mjs` 与入口的严格校验保证。
+  2. `parameters` 会直接进模型上下文，所以注册前把 `$ref` 就地展开（`rosterParameters` /
+     `dispatchParameters` / `concludeParameters`），不留悬空引用。
+     这两条都有测试守卫（含宿主校验器的等价实现），改 schema 时先跑 `test/bundle.test.mjs`。
 
 ## 已知限制
 

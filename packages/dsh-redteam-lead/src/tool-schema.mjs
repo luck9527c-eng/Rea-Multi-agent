@@ -1346,3 +1346,120 @@ export const concludeData = schemaDefs.concludeData
 /** 失败 data 与诊断的共用定义。 */
 export const failureData = schemaDefs.failureData
 export const diagnostic = schemaDefs.diagnostic
+
+/** `$defs.errorCode` 的闭集（稳定错误码）。 */
+export const errorCodes = schemaDefs.errorCode.enum
+
+// ---------------------------------------------------------------------------
+// 注册用的两个投影（**不是**规格数据；与规格的一致性由 test/bundle.test.mjs 钉住）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把 `$ref: '#/$defs/<name>'` 就地展开，得到**自包含**的 schema（同层兄弟关键字叠加到展开结果上）。
+ *
+ * 为什么需要：工具 `parameters` 是直接进模型上下文的原始 JSON Schema。规格副本里的
+ * `$ref` 指向 `#/$defs/...`，如果不同时把整份 `$defs` 塞进去，它们就是悬空引用
+ * （模型与严格的 provider 都解析不了）。就地展开比塞整份 `$defs` 更小、也更可读。
+ *
+ * @param {unknown} schema 规格里的 schema 节点
+ * @param {Record<string, object>} [defs] `$defs` 映射
+ * @param {number} [depth] 递归深度（防环）
+ * @returns {unknown} 展开后的新对象（不改原 schema）
+ */
+export function inlineRefs(schema, defs = schemaDefs, depth = 0) {
+  if (depth > 64) throw new TypeError('schema $ref 展开过深（规格里不应有环）')
+  if (Array.isArray(schema)) return schema.map((item) => inlineRefs(item, defs, depth + 1))
+  if (schema === null || typeof schema !== 'object') return schema
+
+  if (typeof schema.$ref === 'string') {
+    const match = /^#\/\$defs\/([^/]+)$/.exec(schema.$ref)
+    if (match === null) throw new TypeError(`不支持的 $ref：${schema.$ref}`)
+    const target = defs[match[1]]
+    if (target === undefined) throw new TypeError(`$ref 指向未定义的定义：${schema.$ref}`)
+    const { $ref: _ignored, ...siblings } = schema
+    return inlineRefs({ ...target, ...siblings }, defs, depth + 1)
+  }
+
+  const out = {}
+  for (const [key, value] of Object.entries(schema)) out[key] = inlineRefs(value, defs, depth + 1)
+  return out
+}
+
+/** `rt_roster` 的注册用入参 schema（自包含，无 `$ref`）。 */
+export const rosterParameters = inlineRefs(rosterInput)
+
+/** `rt_dispatch` 的注册用入参 schema。 */
+export const dispatchParameters = inlineRefs(dispatchInput)
+
+/** `rt_conclude` 的注册用入参 schema。 */
+export const concludeParameters = inlineRefs(concludeInput)
+
+/**
+ * `output.schema` 的唯一合法形态：**宿主支持子集**里的 `$defs.result` 投影。
+ *
+ * 宿主 `ctx.tools.register()` 会用 `assertSupportedJsonSchema`
+ * （`packages/core/tools/src/json-schema.ts`，见 E1 §C.2）校验 `output.schema`，而这个子集只有
+ * `type` / `oneOf` / `properties` / `required` / `additionalProperties` / `items` / `enum` / `const`
+ * 加注解（description/title/default/examples）。以下写法会让注册**直接抛**
+ * `UNSUPPORTED_SCHEMA`、整行插件不激活：
+ *
+ * - `$ref` / `$defs`（规格里到处都是，所以 `$defs.result` 不能直接注册）；
+ * - `allOf` / `anyOf` / `not` / `if-then-else`（`result` 的 `ok ⇒ code=null` 条件分支就在这里）；
+ * - `type: ['string','null']` 这类**类型数组**、`pattern`、`minLength`、`minimum`、`format`。
+ *
+ * 因此这里给出投影：结构（八个字段、required、封闭）与 `$defs.result` 逐项一致；类型联合写成
+ * `oneOf`；`enum` 直接取自 `$defs.errorCode`，不另抄一份。表达不了的条件约束
+ * （`ok ⇒ code=null`、非 ok 的 data 必须是 failureData/rosterData）由
+ * `src/envelope.mjs` 的构造器与 `index.js` 的严格校验（完整 JSON Schema，含 if/then/else）保证 ——
+ * 宿主这层只当结构安全网。
+ */
+export const resultOutput = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'schema_version',
+    'status',
+    'code',
+    'operation_id',
+    'replayed',
+    'retryable',
+    'diagnostics',
+    'data',
+  ],
+  properties: {
+    schema_version: { type: 'integer', const: 1, description: '工具契约版本，恒为 1。' },
+    status: {
+      type: 'string',
+      enum: ['ok', 'blocked', 'partial', 'error'],
+      description: 'ok 成功；blocked 前置拒绝；partial 副作用可能已发生；error 非法参数/角色或未捕获异常。',
+    },
+    code: {
+      oneOf: [{ type: 'string', enum: [...errorCodes] }, { type: 'null' }],
+      description: 'ok 时必须为 null；其余取 $defs.errorCode 的稳定码。',
+    },
+    operation_id: {
+      oneOf: [{ type: 'string' }, { type: 'null' }],
+      description: '本次操作的 operation id；不涉及操作时为 null。',
+    },
+    replayed: { type: 'boolean', description: '是否为同一 operation 的重放结果。' },
+    retryable: { type: 'boolean', description: '是否允许以同一 operation_id 重入（不代表自动重试）。' },
+    diagnostics: {
+      type: 'array',
+      description: '每条诊断都必须给出原因与具体下一步。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['code', 'reason', 'next_step'],
+        properties: {
+          code: { type: 'string' },
+          reason: { type: 'string' },
+          next_step: { type: 'string' },
+        },
+      },
+    },
+    data: {
+      oneOf: [{ type: 'object' }, { type: 'null' }],
+      description: 'ok 时为对应工具的成功 data；非 ok 时为 failureData / rosterData / null。',
+    },
+  },
+}
