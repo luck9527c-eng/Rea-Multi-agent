@@ -19,8 +19,63 @@ import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/
 import { dirname, join } from 'node:path'
 
 import { ContractError } from './errors.js'
+import { thrownCode } from './guards.js'
 
-function conflict(message, nextStep, details) {
+/** 本模块用到的那一小撮 `fs/promises` 函数（测试可用替身替换，见 `options.io`）。 */
+export type AtomicIo = Pick<
+  typeof import('node:fs/promises'),
+  'mkdir' | 'readFile' | 'rename' | 'rm' | 'writeFile'
+>
+
+/** 可注入的 I/O 覆写（只给需要替换的函数即可）。 */
+export interface AtomicIoOptions {
+  io?: Partial<AtomicIo> | null
+}
+
+/** 「替换 / 独占创建」的有界重试参数。 */
+export interface AtomicRetryOptions {
+  attempts?: number
+  delayMs?: number
+  sleep?: (ms: number) => Promise<void>
+  codes?: readonly string[]
+}
+
+/** `writeJsonAtomic()` 的入参。 */
+export interface WriteJsonOptions extends AtomicRetryOptions, AtomicIoOptions {
+  ensureParent?: boolean
+}
+
+/** `writeJsonAtomic()` 的返回。 */
+export interface AtomicWriteResult {
+  path: string
+  sha256: string
+  bytes: number
+}
+
+/** `createExclusive()` 的入参。 */
+export interface CreateExclusiveOptions extends AtomicRetryOptions, AtomicIoOptions {}
+
+/** `createExclusive()` 的返回。 */
+export interface CreateExclusiveResult {
+  created: boolean
+  existed: boolean
+  sameContent: boolean
+}
+
+/** `copyVerify()` 的入参。 */
+export interface CopyVerifyOptions {
+  /** 调用方先前记录（例如提交哈希）的摘要，用于发现「校验后换内容」。 */
+  expectedSha256?: string
+  ensureParent?: boolean
+}
+
+/** `verifyFileHash()` / `copyVerify()` 的返回。 */
+export interface HashBytesResult {
+  sha256: string
+  bytes: number
+}
+
+function conflict(message: string, nextStep: string, details?: Record<string, unknown>): ContractError {
   return new ContractError({ code: 'OPERATION_CONFLICT', message, nextStep, details })
 }
 
@@ -32,7 +87,7 @@ function conflict(message, nextStep, details) {
  * 但重试面必须窄：`EEXIST`（幂等/冲突信号）、`ENOENT`（目标真的不存在）与哈希不一致
  * 都是**有意义的失败**，重试只会把确定性错误变成随机行为。
  */
-export const TRANSIENT_REPLACE_CODES = Object.freeze(['EPERM', 'EACCES', 'EBUSY'])
+export const TRANSIENT_REPLACE_CODES: readonly string[] = Object.freeze(['EPERM', 'EACCES', 'EBUSY'])
 
 /** 有界重试：最多尝试 3 次（含第一次）。 */
 export const DEFAULT_REPLACE_ATTEMPTS = 3
@@ -41,22 +96,22 @@ export const DEFAULT_REPLACE_ATTEMPTS = 3
 const DEFAULT_REPLACE_DELAY_MS = 5
 
 /** 默认 I/O 实现；测试可注入 `options.io`（形状与 `fs/promises` 子集一致）。 */
-const DEFAULT_IO = Object.freeze({ mkdir, readFile, rename, rm, writeFile })
+const DEFAULT_IO: AtomicIo = Object.freeze({ mkdir, readFile, rename, rm, writeFile })
 
-function ioOf(options = {}) {
+function ioOf(options: AtomicIoOptions = {}): AtomicIo {
   const io = options.io
   return io === undefined || io === null ? DEFAULT_IO : { ...DEFAULT_IO, ...io }
 }
 
-function sleepFor(ms) {
-  return new Promise((resolve) => {
+function sleepFor(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
     setTimeout(resolve, ms)
   })
 }
 
-function isTransientReplaceError(error, codes) {
-  const code = error?.code
-  return typeof code === 'string' && codes.includes(code)
+function isTransientReplaceError(error: unknown, codes: readonly string[]): boolean {
+  const code = thrownCode(error)
+  return code !== null && codes.includes(code)
 }
 
 /**
@@ -64,20 +119,18 @@ function isTransientReplaceError(error, codes) {
  *
  * 契约：只对 `codes`（默认 {@link TRANSIENT_REPLACE_CODES}）重试；最多 `attempts` 次；
  * 耗尽后抛**原始错误对象**（不包装、不改码、不吞）；非瞬时错误第一次就直接抛。
- *
- * @template T
- * @param {() => Promise<T>} run
- * @param {{ attempts?: number, delayMs?: number, sleep?: (ms: number) => Promise<void>,
- *           codes?: string[] }} [options]
- * @returns {Promise<T>}
  */
-async function replaceWithRetry(run, options = {}) {
-  const attempts = Number.isSafeInteger(options.attempts) && options.attempts > 0
-    ? options.attempts
-    : DEFAULT_REPLACE_ATTEMPTS
-  const delayMs = Number.isSafeInteger(options.delayMs) && options.delayMs >= 0
-    ? options.delayMs
-    : DEFAULT_REPLACE_DELAY_MS
+async function replaceWithRetry<T>(run: () => Promise<T>, options: AtomicRetryOptions = {}): Promise<T> {
+  const configuredAttempts = options.attempts
+  const attempts =
+    typeof configuredAttempts === 'number' && Number.isSafeInteger(configuredAttempts) && configuredAttempts > 0
+      ? configuredAttempts
+      : DEFAULT_REPLACE_ATTEMPTS
+  const configuredDelay = options.delayMs
+  const delayMs =
+    typeof configuredDelay === 'number' && Number.isSafeInteger(configuredDelay) && configuredDelay >= 0
+      ? configuredDelay
+      : DEFAULT_REPLACE_DELAY_MS
   const codes = Array.isArray(options.codes) ? options.codes : TRANSIENT_REPLACE_CODES
   const sleep = typeof options.sleep === 'function' ? options.sleep : sleepFor
 
@@ -93,30 +146,27 @@ async function replaceWithRetry(run, options = {}) {
 
 /**
  * 计算字节摘要。
- * @param {Buffer | Uint8Array} bytes
- * @returns {string} 小写十六进制 SHA256
+ * @returns 小写十六进制 SHA256
  */
-export function sha256Bytes(bytes) {
+export function sha256Bytes(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
 }
 
 /**
  * 流式计算文件摘要（大文件不整读进内存）。
- * @param {string} filePath
- * @returns {Promise<string>}
  */
-export async function sha256File(filePath) {
+export async function sha256File(filePath: string): Promise<string> {
   const hash = createHash('sha256')
   for await (const chunk of createReadStream(filePath)) hash.update(chunk)
   return hash.digest('hex')
 }
 
 /** 同目录唯一临时名：与目标同库同卷，保证 rename 是原子替换。 */
-function tempSibling(filePath) {
+function tempSibling(filePath: string): string {
   return join(dirname(filePath), `.${process.pid}-${randomBytes(6).toString('hex')}.tmp`)
 }
 
-async function ensureParent(filePath, io = DEFAULT_IO) {
+async function ensureParent(filePath: string, io: AtomicIo = DEFAULT_IO): Promise<void> {
   await io.mkdir(dirname(filePath), { recursive: true })
 }
 
@@ -128,13 +178,14 @@ async function ensureParent(filePath, io = DEFAULT_IO) {
  * `rename` 命中瞬时 `EPERM`/`EACCES`/`EBUSY` 时按短退避**有界**重试（默认 3 次）；
  * 其它错误不重试，耗尽后抛原始错误。
  *
- * @param {string} filePath 目标绝对路径
- * @param {unknown} value 可 JSON 序列化的值
- * @param {{ ensureParent?: boolean, attempts?: number, delayMs?: number,
- *           sleep?: (ms: number) => Promise<void>, codes?: string[], io?: object }} [options]
- * @returns {Promise<{ path: string, sha256: string, bytes: number }>}
+ * @param filePath 目标绝对路径
+ * @param value 可 JSON 序列化的值
  */
-export async function writeJsonAtomic(filePath, value, options = {}) {
+export async function writeJsonAtomic(
+  filePath: string,
+  value: unknown,
+  options: WriteJsonOptions = {},
+): Promise<AtomicWriteResult> {
   const { ensureParent: createParent = true } = options
   const io = ioOf(options)
   const text = `${JSON.stringify(value, null, 2)}\n`
@@ -163,13 +214,13 @@ export async function writeJsonAtomic(filePath, value, options = {}) {
  * `writeFile(..., {flag:'wx'})`（即 `O_EXCL`）命中瞬时 `EPERM`/`EACCES`/`EBUSY` 时有界重试；
  * `EEXIST` **绝不**重试（它是幂等/冲突信号，不是抖动）。
  *
- * @param {string} filePath 目标绝对路径
- * @param {string | Uint8Array} contents
- * @param {{ attempts?: number, delayMs?: number, sleep?: (ms: number) => Promise<void>,
- *           codes?: string[], io?: object }} [options]
- * @returns {Promise<{ created: boolean, existed: boolean, sameContent: boolean }>}
+ * @param filePath 目标绝对路径
  */
-export async function createExclusive(filePath, contents, options = {}) {
+export async function createExclusive(
+  filePath: string,
+  contents: string | Uint8Array,
+  options: CreateExclusiveOptions = {},
+): Promise<CreateExclusiveResult> {
   const io = ioOf(options)
   await ensureParent(filePath, io)
   const bytes = typeof contents === 'string' ? Buffer.from(contents, 'utf8') : contents
@@ -177,7 +228,7 @@ export async function createExclusive(filePath, contents, options = {}) {
     await replaceWithRetry(() => io.writeFile(filePath, bytes, { flag: 'wx' }), options)
     return { created: true, existed: false, sameContent: true }
   } catch (error) {
-    if (error?.code !== 'EEXIST') throw error
+    if (thrownCode(error) !== 'EEXIST') throw error
   }
 
   const existing = await io.readFile(filePath)
@@ -196,19 +247,17 @@ export async function createExclusive(filePath, contents, options = {}) {
  *
  * 这是「校验后换内容」的唯一检测点：复制完成、归档前后、读取提交前都应重新核对。
  *
- * @param {string} filePath
- * @param {string} expectedSha256 小写十六进制
- * @returns {Promise<{ sha256: string, bytes: number }>}
+ * @param expectedSha256 小写十六进制
  */
-export async function verifyFileHash(filePath, expectedSha256) {
-  let actual
+export async function verifyFileHash(filePath: string, expectedSha256: string): Promise<HashBytesResult> {
+  let actual: string
   try {
     actual = await sha256File(filePath)
   } catch (error) {
     throw conflict(
-      `无法读取待核对文件: ${filePath}（${error?.code ?? 'unknown'}）`,
+      `无法读取待核对文件: ${filePath}（${thrownCode(error) ?? 'unknown'}）`,
       '确认文件仍存在且可读；缺失即视为校验失败，不要继续后续步骤',
-      { path: filePath, code: error?.code ?? null },
+      { path: filePath, code: thrownCode(error) },
     )
   }
   if (actual !== expectedSha256) {
@@ -226,26 +275,24 @@ export async function verifyFileHash(filePath, expectedSha256) {
  * 复制并核对哈希：源哈希 → 同目录临时副本 → 校验副本字节 → 原子替换到目标 → 再核对目标。
  *
  * 任一步不符即冲突，且**目标位置不会出现错误字节**（临时文件已清理）。
- *
- * @param {string} sourcePath
- * @param {string} destPath
- * @param {{ expectedSha256?: string, ensureParent?: boolean }} [options]
- *   `expectedSha256` 是调用方先前记录（例如提交哈希）的摘要，用于发现「校验后换内容」。
- * @returns {Promise<{ sha256: string, bytes: number }>}
  */
-export async function copyVerify(sourcePath, destPath, options = {}) {
+export async function copyVerify(
+  sourcePath: string,
+  destPath: string,
+  options: CopyVerifyOptions = {},
+): Promise<HashBytesResult> {
   const { expectedSha256, ensureParent: createParent = true } = options
 
-  let sourceHash
-  let sourceSize
+  let sourceHash: string
+  let sourceSize: number
   try {
     sourceHash = await sha256File(sourcePath)
     sourceSize = (await stat(sourcePath)).size
   } catch (error) {
     throw conflict(
-      `无法读取源文件: ${sourcePath}（${error?.code ?? 'unknown'}）`,
+      `无法读取源文件: ${sourcePath}（${thrownCode(error) ?? 'unknown'}）`,
       '确认源文件存在且可读后重试',
-      { path: sourcePath, code: error?.code ?? null },
+      { path: sourcePath, code: thrownCode(error) },
     )
   }
 

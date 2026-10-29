@@ -3,8 +3,9 @@
 // 输入全部显式：需求名、执行者实际注册的完整工具名、工具清单快照、项目能力绑定。
 // 不读宿主注册表、不猜 provider 归属、不把族名/插件 ID/子串/前缀当成命中。
 import { defaultCatalog } from './catalog.js';
+import { isRecord, recordOf } from './guards.js';
 
-const COMBINATORS = ['any_tool', 'any_provider', 'all_capabilities'];
+const COMBINATORS: readonly string[] = ['any_tool', 'any_provider', 'all_capabilities'];
 const PROVIDER_FIELDS = [
   'tool_id',
   'entrypoint_id',
@@ -17,7 +18,7 @@ const PROVIDER_FIELDS = [
   'resource_needs',
 ];
 // 越具体的失败越先报告：环/非法绑定 > 未知族 > 未就绪 > 缺通道。
-const CODE_PRIORITY = {
+const CODE_PRIORITY: Record<string, number | undefined> = {
   INVALID_ARGUMENT: 3,
   UNKNOWN_CAPABILITY: 2,
   CAPABILITY_NOT_READY: 1,
@@ -26,23 +27,111 @@ const CODE_PRIORITY = {
 const NEXT_STEP_DEFAULT = '按岗位要求补齐执行者可用的完整工具名，或在 re/team/capabilities.json 登记可核验的 provider';
 const NEXT_STEP_BINDING = '在 re/team/capabilities.json 为该能力族登记 any_tool / any_provider / all_capabilities 之一';
 
-function isNonEmptyString(value) {
+/** 一条能力缺口（`missing[]` 的一项）。投到 `$defs.diagnostic` 时只取 `code/reason/next_step`。 */
+export interface CapabilityMissing {
+  capability: string;
+  code: string;
+  reason: string;
+  next_step: string;
+  missing_capabilities: string[];
+}
+
+/** provider 记录（9 字段齐备才算可核验）；字段值原样透传。 */
+export interface ProviderRecord {
+  tool_id: unknown;
+  entrypoint_id: unknown;
+  inventory_revision: unknown;
+  snapshot_ref: unknown;
+  snapshot_sha256: unknown;
+  transport_tools: unknown[];
+  invocation_ref: unknown;
+  readiness_ref: unknown;
+  resource_needs: unknown;
+}
+
+/** provider 的一次可用性登记（`providers[]` 的一项）。 */
+export type ProviderUse = ProviderRecord & { capability: string };
+
+/** 一处匹配成功的岗位能力。 */
+export interface MatchedCapability {
+  capability: string;
+  via: 'any_tool' | 'all_capabilities' | 'any_provider';
+  tool?: string;
+  parts?: MatchedCapability[];
+  provider?: ProviderRecord;
+}
+
+/** `matchCapabilities()` 的返回。 */
+export interface CapabilityMatch {
+  matched: MatchedCapability[];
+  missing: CapabilityMissing[];
+  providers: ProviderUse[];
+}
+
+/**
+ * 能力族定义（目录里的定义或 `re/team/capabilities.json` 的绑定）。
+ *
+ * 组合关键字都按 `unknown` 读：形状由下面的分支校验，校验前不假定类型。
+ */
+interface CapabilityDefinition extends Record<string, unknown> {
+  binding_required?: unknown;
+  any_tool?: unknown;
+  any_provider?: unknown;
+  all_capabilities?: unknown;
+}
+
+/** `definitionFor()` 的两种结果（`$ref` 式的「有定义」或「有错误」）。 */
+type DefinitionLookup =
+  | { error: CapabilityMissing }
+  | { definition: CapabilityDefinition; source: 'binding' | 'catalog' };
+
+/** `resolve()` 的两种结果。 */
+type Resolution =
+  | { ok: true; entry: MatchedCapability; providers: ProviderUse[] }
+  | { ok: false; code: string; reason: string; next_step: string; missing_capabilities: string[] };
+
+/** provider 结构核验的两种结果。 */
+type ProviderCheck = { ok: true; provider: ProviderRecord } | { ok: false; code: string; reason: string };
+
+function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function isMcpNamespace(name) {
+/** 数组判断（`Array.isArray` 的谓词版本，收窄成 `unknown[]` 而不是 `any[]`）。 */
+function isArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+/** 非空字符串数组（`every(isNonEmptyString)` 的谓词版本；判定与迁移前逐字一致）。 */
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => isNonEmptyString(item));
+}
+
+/** `Set.has` 只对字符串有意义；非字符串一律视为「未注册」（与 `has(非字符串) === false` 等价）。 */
+function hasTool(toolNames: Set<string>, name: unknown): boolean {
+  return typeof name === 'string' ? toolNames.has(name) : false;
+}
+
+function isMcpNamespace(name: string): boolean {
   return typeof name === 'string' && /^mcp:.+$/.test(name);
 }
 
-function familiesOf(bindings) {
-  if (bindings && typeof bindings === 'object' && bindings.families
-    && typeof bindings.families === 'object' && !Array.isArray(bindings.families)) {
-    return bindings.families;
+function familiesOf(bindings: unknown): Record<string, unknown> {
+  const record = isRecord(bindings) ? bindings : {};
+  const families = record.families;
+  if (isRecord(families) && !Array.isArray(families)) {
+    return families;
   }
   return {};
 }
 
-function missingEntry(capability, code, reason, nextStep, missingCapabilities = [capability]) {
+function missingEntry(
+  capability: string,
+  code: string,
+  reason: string,
+  nextStep: string,
+  missingCapabilities: string[] = [capability],
+): CapabilityMissing {
   return {
     capability,
     code,
@@ -52,7 +141,7 @@ function missingEntry(capability, code, reason, nextStep, missingCapabilities = 
   };
 }
 
-function worstCode(entries) {
+function worstCode(entries: Array<{ code: string }>): string {
   let worst = 'CAPABILITY_MISSING';
   for (const entry of entries) {
     if ((CODE_PRIORITY[entry.code] ?? 0) > (CODE_PRIORITY[worst] ?? 0)) worst = entry.code;
@@ -60,14 +149,16 @@ function worstCode(entries) {
   return worst;
 }
 
-function cloneProvider(provider) {
+function cloneProvider(provider: Record<string, unknown>): ProviderRecord {
+  // 调用点已通过 checkProvider 的结构核验（transport_tools 是非空数组），此处的兜底只影响类型。
+  const transportTools = isArray(provider.transport_tools) ? provider.transport_tools : [];
   return {
     tool_id: provider.tool_id,
     entrypoint_id: provider.entrypoint_id,
     inventory_revision: provider.inventory_revision,
     snapshot_ref: provider.snapshot_ref,
     snapshot_sha256: provider.snapshot_sha256,
-    transport_tools: [...provider.transport_tools],
+    transport_tools: [...transportTools],
     invocation_ref: provider.invocation_ref,
     readiness_ref: provider.readiness_ref,
     resource_needs: structuredClone(provider.resource_needs),
@@ -78,8 +169,8 @@ function cloneProvider(provider) {
  * 校验一条 any_provider 登记是否在结构上可核验、且执行者能用。
  * 只做结构性判断：不启动程序、不判断目标是否就绪。
  */
-function checkProvider(provider, toolNames, inventory) {
-  if (!provider || typeof provider !== 'object' || Array.isArray(provider)) {
+function checkProvider(provider: unknown, toolNames: Set<string>, inventory: unknown): ProviderCheck {
+  if (!isRecord(provider) || Array.isArray(provider)) {
     return { ok: false, code: 'CAPABILITY_MISSING', reason: 'provider 必须是对象' };
   }
   const absent = PROVIDER_FIELDS.filter((field) => provider[field] === undefined);
@@ -124,7 +215,7 @@ function checkProvider(provider, toolNames, inventory) {
     return { ok: false, code: 'CAPABILITY_MISSING', reason: 'provider.resource_needs 必须是数组' };
   }
 
-  if (!inventory || typeof inventory !== 'object') {
+  if (!isRecord(inventory)) {
     return {
       ok: false,
       code: 'CAPABILITY_NOT_READY',
@@ -145,14 +236,16 @@ function checkProvider(provider, toolNames, inventory) {
       reason: 'provider.snapshot_sha256 与清单快照哈希不一致',
     };
   }
-  if (!Array.isArray(inventory.tools)) {
+  const inventoryTools = inventory.tools;
+  if (!isArray(inventoryTools)) {
     return {
       ok: false,
       code: 'CAPABILITY_NOT_READY',
       reason: '工具清单缺少 tools 数组，无法核验 provider 归属',
     };
   }
-  const tool = inventory.tools.find((item) => item && item.id === provider.tool_id);
+  const tools = inventoryTools.map((item) => recordOf(item));
+  const tool = tools.find((item) => item.id === provider.tool_id);
   if (!tool) {
     return {
       ok: false,
@@ -160,21 +253,24 @@ function checkProvider(provider, toolNames, inventory) {
       reason: `工具清单 ${inventory.inventory_revision} 中找不到 tool_id=${provider.tool_id}`,
     };
   }
-  if (!Array.isArray(tool.entrypoints)) {
+  const entrypointsWire = tool.entrypoints;
+  if (!isArray(entrypointsWire)) {
     return {
       ok: false,
       code: 'CAPABILITY_NOT_READY',
       reason: `工具 ${provider.tool_id} 在清单中没有 entrypoints，无法核验 entrypoint_id`,
     };
   }
-  if (!tool.entrypoints.some((entry) => entry && entry.id === provider.entrypoint_id)) {
+  const entrypoints = entrypointsWire.map((entry) => recordOf(entry));
+  if (!entrypoints.some((entry) => entry.id === provider.entrypoint_id)) {
     return {
       ok: false,
       code: 'CAPABILITY_NOT_READY',
       reason: `工具 ${provider.tool_id} 的清单里没有 entrypoint_id=${provider.entrypoint_id}`,
     };
   }
-  const missingTransport = provider.transport_tools.filter((name) => !toolNames.has(name));
+  const transportTools = isArray(provider.transport_tools) ? provider.transport_tools : [];
+  const missingTransport = transportTools.filter((name) => !hasTool(toolNames, name));
   if (missingTransport.length > 0) {
     return {
       ok: false,
@@ -189,22 +285,26 @@ function checkProvider(provider, toolNames, inventory) {
 /**
  * 能力匹配纯函数。
  *
- * @param {string[]} needs 岗位 required 与任务 capability_needs 的并集（可含 mcp:<server>）
- * @param {string[]} toolNames 实际执行者注册的完整工具名
- * @param {object|null} inventory re/env/tools.json 的快照内容
- * @param {object|null} bindings re/team/capabilities.json 内容
- * @returns {{matched: object[], missing: object[], providers: object[]}}
+ * @param needs 岗位 required 与任务 capability_needs 的并集（可含 mcp:<server>）
+ * @param toolNames 实际执行者注册的完整工具名
+ * @param inventory re/env/tools.json 的快照内容
+ * @param bindings re/team/capabilities.json 内容
  */
-export function matchCapabilities(needs, toolNames, inventory, bindings) {
+export function matchCapabilities(
+  needs: unknown,
+  toolNames: unknown,
+  inventory: unknown,
+  bindings: unknown,
+): CapabilityMatch {
   const catalog = defaultCatalog();
-  const toolSet = new Set(Array.isArray(toolNames) ? toolNames.filter(isNonEmptyString) : []);
+  const toolSet = new Set(isArray(toolNames) ? toolNames.filter(isNonEmptyString) : []);
   const families = familiesOf(bindings);
-  const matched = [];
-  const missing = [];
-  const providers = [];
-  const stack = [];
+  const matched: MatchedCapability[] = [];
+  const missing: CapabilityMissing[] = [];
+  const providers: ProviderUse[] = [];
+  const stack: string[] = [];
 
-  function definitionFor(name) {
+  function definitionFor(name: string): DefinitionLookup {
     // 族的“已知性”只来自岗位目录或 mcp:<server> 动态命名空间。
     // 项目绑定只能覆盖已知族，不能凭空制造能力族。
     if (!Object.hasOwn(catalog.capabilities, name) && !isMcpNamespace(name)) {
@@ -219,12 +319,13 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
     }
     if (Object.hasOwn(families, name)) {
       const definition = families[name];
-      if (!definition || typeof definition !== 'object') {
+      if (!isRecord(definition)) {
         return {
           error: missingEntry(name, 'INVALID_ARGUMENT', `能力族 ${name} 的绑定不是对象`, NEXT_STEP_BINDING),
         };
       }
-      const present = COMBINATORS.filter((key) => definition[key] !== undefined);
+      const view: CapabilityDefinition = definition;
+      const present = COMBINATORS.filter((key) => view[key] !== undefined);
       if (present.length !== 1) {
         return {
           error: missingEntry(
@@ -235,7 +336,7 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
           ),
         };
       }
-      return { definition, source: 'binding' };
+      return { definition: view, source: 'binding' };
     }
     if (Object.hasOwn(catalog.capabilities, name)) {
       return { definition: catalog.capabilities[name], source: 'catalog' };
@@ -253,7 +354,7 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
     return { error: missingEntry(name, 'UNKNOWN_CAPABILITY', `未知能力族 ${name}`, NEXT_STEP_BINDING) };
   }
 
-  function resolve(name) {
+  function resolve(name: string): Resolution {
     if (stack.includes(name)) {
       return {
         ok: false,
@@ -264,14 +365,16 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
       };
     }
     const found = definitionFor(name);
-    if (found.error) return { ok: false, ...found.error };
+    if ('error' in found) return { ok: false, ...found.error };
     const definition = found.definition;
     const combinator = COMBINATORS.find((key) => definition[key] !== undefined);
-    const value = definition[combinator];
+    // `COMBINATORS` 里找不到时，JS 把 `definition[undefined]` 当作 `definition['undefined']`
+    // （结果为 undefined，落到下面的 any_provider 校验）；这里保留同一语义，不做硬断言。
+    const value = combinator === undefined ? definition['undefined'] : definition[combinator];
     const bindingRequired = found.source === 'catalog' && definition.binding_required === true;
 
     if (combinator === 'any_tool') {
-      if (!Array.isArray(value) || !value.every(isNonEmptyString)) {
+      if (!isStringArray(value)) {
         return {
           ok: false,
           code: 'INVALID_ARGUMENT',
@@ -303,7 +406,7 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
     }
 
     if (combinator === 'all_capabilities') {
-      if (!Array.isArray(value) || value.length === 0 || !value.every(isNonEmptyString)) {
+      if (!isStringArray(value) || value.length === 0) {
         return {
           ok: false,
           code: 'INVALID_ARGUMENT',
@@ -313,9 +416,9 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
         };
       }
       stack.push(name);
-      const parts = [];
-      const failures = [];
-      const childProviders = [];
+      const parts: MatchedCapability[] = [];
+      const failures: Array<{ ok: false; child: string; code: string; reason: string; next_step: string; missing_capabilities: string[] }> = [];
+      const childProviders: ProviderUse[] = [];
       for (const child of value) {
         const result = resolve(child);
         if (result.ok) {
@@ -336,7 +439,7 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
       const reason = `能力族 ${name} 需要全部满足：${value.join(', ')}；缺少：${failures
         .map((failure) => `${failure.child}（${failure.reason}）`)
         .join('；')}`;
-      const flattened = [];
+      const flattened: string[] = [];
       for (const failure of failures) {
         for (const leaf of failure.missing_capabilities ?? [failure.child]) {
           if (!flattened.includes(leaf)) flattened.push(leaf);
@@ -352,7 +455,7 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
     }
 
     // any_provider：OR（provider 之间），每个 provider 内部 AND。
-    if (!Array.isArray(value) || value.length === 0) {
+    if (!isArray(value) || value.length === 0) {
       return {
         ok: false,
         code: 'INVALID_ARGUMENT',
@@ -361,7 +464,7 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
         missing_capabilities: [name],
       };
     }
-    const failures = [];
+    const failures: Array<{ ok: false; code: string; reason: string }> = [];
     for (const candidate of value) {
       const checked = checkProvider(candidate, toolSet, inventory);
       if (checked.ok) {
@@ -382,8 +485,8 @@ export function matchCapabilities(needs, toolNames, inventory, bindings) {
     };
   }
 
-  const seenNeeds = new Set();
-  for (const rawNeed of Array.isArray(needs) ? needs : []) {
+  const seenNeeds = new Set<string>();
+  for (const rawNeed of isArray(needs) ? needs : []) {
     if (!isNonEmptyString(rawNeed) || seenNeeds.has(rawNeed)) continue;
     seenNeeds.add(rawNeed);
     const result = resolve(rawNeed);

@@ -17,6 +17,8 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { ContractError } from './errors.js'
+import { isRecord, thrownCode } from './guards.js'
+import type { Clock } from './types.js'
 import { writeJsonAtomic } from './atomic.js'
 
 /** 项目内台账目录。 */
@@ -26,7 +28,7 @@ export const OPERATIONS_DIR = 're/team/operations'
  * 操作阶段闭集，按契约表顺序（含 `completed`；失败态用 `needs_recovery`）。
  * 注意 `$defs.failureData` 的阶段集合另有 `preflight` 且不含 `completed`（见 envelope.mjs）。
  */
-export const OPERATION_PHASES = Object.freeze([
+export const OPERATION_PHASES: readonly string[] = Object.freeze([
   'prepared',
   'member_ready',
   'task_created',
@@ -42,12 +44,75 @@ export const OPERATION_PHASES = Object.freeze([
 const OPERATION_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,95}$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
 
-const DEFAULT_CLOCK = {
+const DEFAULT_CLOCK: Clock = {
   now: () => Date.now(),
   isoNow: () => new Date().toISOString(),
 }
 
-function normalizeClock(clock) {
+/** 一条台账历史记录。 */
+export interface OperationHistoryEntry {
+  phase: string
+  at: string
+}
+
+/**
+ * 台账记录。
+ *
+ * 写出去的是固定形状；读回来时只核对 `operation_id` 与 `phase`（见 `readRecord`），
+ * 其余字段按写入形状使用 —— 台账是本模块自己写的文件，不是外部输入。
+ */
+export interface OperationRecord extends Record<string, unknown> {
+  schema_version: number
+  operation_id: string
+  input_hash: string
+  phase: string
+  created_at: string
+  updated_at: string
+  history: OperationHistoryEntry[]
+  data: Record<string, unknown>
+  result: unknown
+}
+
+/** `prepare()` 的结果：`resumed` 表示复用既有台账，`replayed` 由响应丢失后的重放路径置位。 */
+export interface PreparedOperation {
+  record: OperationRecord
+  resumed: boolean
+  replayed: boolean
+}
+
+/**
+ * 可注入的时钟：`Clock` 形状。
+ *
+ * `now` 必填（`isoNow` 缺省时用它构造 ISO 时间戳）；`isoNow` 可缺省。
+ */
+export interface OperationClock {
+  now: () => number
+  isoNow?: () => string
+}
+
+/** `createOperationLedger()` 的入参。 */
+export interface OperationLedgerOptions {
+  root?: string
+  /** `Clock` 形状或 `() => number`；缺省用系统时钟。 */
+  clock?: OperationClock | (() => number) | null
+}
+
+/** 绑定到项目根的台账。 */
+export interface OperationLedger {
+  prepare: (
+    operationId: string,
+    inputHash: string,
+    phase?: string,
+    data?: unknown,
+  ) => Promise<PreparedOperation>
+  findById: (operationId: string) => Promise<OperationRecord | null>
+  advance: (operationId: string, phase: string, data?: unknown) => Promise<OperationRecord>
+  saveResult: (operationId: string, result: unknown) => Promise<OperationRecord>
+  replayResult: (operationId: string) => Promise<Record<string, unknown> | null>
+  recordPath: (operationId: string) => string
+}
+
+function normalizeClock(clock: OperationClock | (() => number) | null | undefined): Clock {
   if (!clock) return DEFAULT_CLOCK
   if (typeof clock === 'function') {
     return { now: clock, isoNow: () => new Date(clock()).toISOString() }
@@ -58,29 +123,33 @@ function normalizeClock(clock) {
   }
 }
 
-function invalid(message, nextStep) {
+function invalid(message: string, nextStep: string): ContractError {
   return new ContractError({ code: 'INVALID_ARGUMENT', message, nextStep })
 }
 
-function recoveryRequired(message, nextStep, details) {
+function recoveryRequired(
+  message: string,
+  nextStep: string,
+  details?: Record<string, unknown>,
+): ContractError {
   return new ContractError({ code: 'RECOVERY_REQUIRED', message, nextStep, details })
 }
 
-function assertOperationId(operationId) {
+function assertOperationId(operationId: unknown): string {
   if (typeof operationId !== 'string' || !OPERATION_ID_PATTERN.test(operationId)) {
     throw invalid(`operation_id 形状非法: ${JSON.stringify(operationId)}`, '使用 $defs.id 允许的小写字母/数字/下划线/短横线形状')
   }
   return operationId
 }
 
-function assertPhase(phase) {
-  if (!OPERATION_PHASES.includes(phase)) {
+function assertPhase(phase: unknown): string {
+  if (typeof phase !== 'string' || !OPERATION_PHASES.includes(phase)) {
     throw invalid(`未知操作阶段: ${JSON.stringify(phase)}`, `阶段只能取 ${OPERATION_PHASES.join('|')}`)
   }
   return phase
 }
 
-function assertInputHash(inputHash) {
+function assertInputHash(inputHash: unknown): string {
   if (typeof inputHash !== 'string' || !SHA256_PATTERN.test(inputHash)) {
     throw invalid(
       `规范化输入哈希必须是 64 位小写十六进制: ${JSON.stringify(inputHash)}`,
@@ -90,50 +159,46 @@ function assertInputHash(inputHash) {
   return inputHash
 }
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /**
  * 台账文件绝对路径。
- * @param {string} root 已规范化的绝对根
- * @param {string} operationId
- * @returns {string}
+ * @param root 已规范化的绝对根
  */
-export function operationRecordPath(root, operationId) {
+export function operationRecordPath(root: string, operationId: string): string {
   assertOperationId(operationId)
   return join(root, ...OPERATIONS_DIR.split('/'), `${operationId}.json`)
 }
 
 /**
  * 创建绑定到某个项目根的 operation 台账。
- *
- * @param {{ root: string, clock?: { now?: () => number, isoNow?: () => string } | (() => number) }} options
  */
-export function createOperationLedger(options = {}) {
+export function createOperationLedger(options: OperationLedgerOptions = {}): OperationLedger {
   const { root } = options
   if (typeof root !== 'string' || root.length === 0) {
     throw invalid('createOperationLedger 需要项目根', '传入 normalizeProjectRoot 的结果')
   }
   const clock = normalizeClock(options.clock)
-  const recordPath = (operationId) => operationRecordPath(root, operationId)
+  const recordPath = (operationId: string): string => operationRecordPath(root, operationId)
 
-  async function readRecord(operationId) {
+  async function readRecord(operationId: string): Promise<OperationRecord | null> {
     const filePath = recordPath(operationId)
-    let text
+    let text: string
     try {
       text = await readFile(filePath, 'utf8')
     } catch (error) {
-      if (error?.code === 'ENOENT') return null
+      if (thrownCode(error) === 'ENOENT') return null
       throw recoveryRequired(
-        `无法读取 operation 台账: ${operationId}（${error?.code ?? 'unknown'}）`,
+        `无法读取 operation 台账: ${operationId}（${thrownCode(error) ?? 'unknown'}）`,
         '确认项目内 re/team/operations 可读；台账异常时先核实再继续',
         { operation_id: operationId },
       )
     }
-    let record
+    let parsed: unknown
     try {
-      record = JSON.parse(text)
+      parsed = JSON.parse(text)
     } catch {
       throw recoveryRequired(
         `operation 台账不是合法 JSON: ${operationId}`,
@@ -141,17 +206,18 @@ export function createOperationLedger(options = {}) {
         { operation_id: operationId },
       )
     }
-    if (!isPlainObject(record) || record.operation_id !== operationId || typeof record.phase !== 'string') {
+    if (!isPlainObject(parsed) || parsed.operation_id !== operationId || typeof parsed.phase !== 'string') {
       throw recoveryRequired(
         `operation 台账内容与 operation_id 不符: ${operationId}`,
         '按恢复流程核实台账来源；不要覆盖台账',
         { operation_id: operationId },
       )
     }
-    return record
+    // 已核对 operation_id/phase 这两个身份字段；其余字段是 writeRecord 写出的固定形状。
+    return parsed as OperationRecord
   }
 
-  async function writeRecord(record) {
+  async function writeRecord(record: OperationRecord): Promise<OperationRecord> {
     await writeJsonAtomic(recordPath(record.operation_id), record)
     return record
   }
@@ -162,13 +228,16 @@ export function createOperationLedger(options = {}) {
    * 同 ID 同哈希 → 返回既有台账（`resumed: true`），不追加历史；
    * 同 ID 不同哈希 → `OPERATION_CONFLICT`。
    *
-   * @param {string} operationId
-   * @param {string} inputHash 规范化输入的 SHA256
-   * @param {string} [phase] 初始阶段，默认 prepared
-   * @param {object} [data] 该阶段已保存的内容（契约/基准/尝试身份等）
-   * @returns {Promise<{ record: object, resumed: boolean, replayed: boolean }>}
+   * @param inputHash 规范化输入的 SHA256
+   * @param phase 初始阶段，默认 prepared
+   * @param data 该阶段已保存的内容（契约/基准/尝试身份等）
    */
-  async function prepare(operationId, inputHash, phase = 'prepared', data = {}) {
+  async function prepare(
+    operationId: string,
+    inputHash: string,
+    phase = 'prepared',
+    data: unknown = {},
+  ): Promise<PreparedOperation> {
     assertOperationId(operationId)
     assertInputHash(inputHash)
     assertPhase(phase)
@@ -193,7 +262,7 @@ export function createOperationLedger(options = {}) {
     }
 
     const at = clock.isoNow()
-    const record = {
+    const record: OperationRecord = {
       schema_version: 1,
       operation_id: operationId,
       input_hash: inputHash,
@@ -210,23 +279,16 @@ export function createOperationLedger(options = {}) {
 
   /**
    * 按 ID 读取台账（不存在返回 null）。
-   * @param {string} operationId
-   * @returns {Promise<object | null>}
    */
-  async function findById(operationId) {
+  async function findById(operationId: string): Promise<OperationRecord | null> {
     assertOperationId(operationId)
     return readRecord(operationId)
   }
 
   /**
    * 推进阶段并把本步内容合并进台账（前序数据保留，便于恢复）。
-   *
-   * @param {string} operationId
-   * @param {string} phase
-   * @param {object} [data]
-   * @returns {Promise<object>} 更新后的台账
    */
-  async function advance(operationId, phase, data = {}) {
+  async function advance(operationId: string, phase: string, data: unknown = {}): Promise<OperationRecord> {
     assertOperationId(operationId)
     assertPhase(phase)
 
@@ -240,7 +302,7 @@ export function createOperationLedger(options = {}) {
     }
 
     const at = clock.isoNow()
-    const record = {
+    const record: OperationRecord = {
       ...existing,
       phase,
       updated_at: at,
@@ -253,11 +315,9 @@ export function createOperationLedger(options = {}) {
   /**
    * 保存该操作的最终信封（供响应丢失后重放）。
    *
-   * @param {string} operationId
-   * @param {object} result result 信封
-   * @returns {Promise<object>} 更新后的台账
+   * @param result result 信封
    */
-  async function saveResult(operationId, result) {
+  async function saveResult(operationId: string, result: unknown): Promise<OperationRecord> {
     assertOperationId(operationId)
     if (!isPlainObject(result)) throw invalid('saveResult 需要 result 信封对象', '传入 envelope.ok() 等构造的信封')
 
@@ -269,17 +329,14 @@ export function createOperationLedger(options = {}) {
         { operation_id: operationId },
       )
     }
-    const record = { ...existing, result, updated_at: clock.isoNow() }
+    const record: OperationRecord = { ...existing, result, updated_at: clock.isoNow() }
     return writeRecord(record)
   }
 
   /**
    * 重放已保存的结果：返回原信封并标记 `replayed=true`；尚未保存结果时返回 null。
-   *
-   * @param {string} operationId
-   * @returns {Promise<object | null>}
    */
-  async function replayResult(operationId) {
+  async function replayResult(operationId: string): Promise<Record<string, unknown> | null> {
     assertOperationId(operationId)
     const record = await readRecord(operationId)
     if (record === null || !isPlainObject(record.result)) return null
