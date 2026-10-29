@@ -6,10 +6,10 @@ import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { createTeamAdapter, readDeclaredCapacity } from '../src/team-adapter.mjs';
+import { createTeamAdapter, readDeclaredCapacity } from '../dist/team-adapter.js';
 import { createFakeTeam, HOST_CODES } from './helpers/fake-team.mjs';
 
-const ADAPTER_SOURCE = readFileSync(new URL('../src/team-adapter.mjs', import.meta.url), 'utf8');
+const ADAPTER_SOURCE = readFileSync(new URL('../src/team-adapter.ts', import.meta.url), 'utf8');
 
 /** 建一个临时项目根，可带初始文件；测试结束自动删除。 */
 function makeProject(t, files = {}) {

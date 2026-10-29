@@ -2,7 +2,9 @@ node_modules/
 *.log
 .DSH/
 tmp/
+# 构建产物一律忽略；但本包是 `link:` 安装的 bundle，`dist/` 必须随仓库提交（DECISIONS D28）。
 dist/
+!packages/dsh-redteam-lead/dist/
 
 # 子代理临时脚本
 .tmp-*

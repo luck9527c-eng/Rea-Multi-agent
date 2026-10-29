@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { resolveCaller } from '../src/identity.mjs'
+import { resolveCaller } from '../dist/identity.js'
 
 /** 契约级 teamAdapter 替身（形状见 SEAMS §3：永不 reject，失败用 {ok:false, code}）。 */
 function fakeAdapter(result) {

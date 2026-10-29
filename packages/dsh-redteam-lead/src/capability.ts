@@ -2,7 +2,7 @@
 //
 // 输入全部显式：需求名、执行者实际注册的完整工具名、工具清单快照、项目能力绑定。
 // 不读宿主注册表、不猜 provider 归属、不把族名/插件 ID/子串/前缀当成命中。
-import { defaultCatalog } from './catalog.mjs';
+import { defaultCatalog } from './catalog.js';
 
 const COMBINATORS = ['any_tool', 'any_provider', 'all_capabilities'];
 const PROVIDER_FIELDS = [

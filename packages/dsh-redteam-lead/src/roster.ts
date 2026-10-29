@@ -18,8 +18,8 @@
  */
 import { createHash } from 'node:crypto'
 
-import * as envelopeModule from './envelope.mjs'
-import * as bindingModule from './binding.mjs'
+import * as envelopeModule from './envelope.js'
+import * as bindingModule from './binding.js'
 
 const TOOL = 'rt_roster'
 const SHA256 = /^[0-9a-f]{64}$/u

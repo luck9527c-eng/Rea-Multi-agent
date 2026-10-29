@@ -9,7 +9,7 @@ import {
   operationInputHash,
   sortSetArrays,
   validateInput,
-} from '../src/validate.mjs'
+} from '../dist/validate.js'
 import { loadSpecJson } from './helpers/tmp.mjs'
 
 /** 规格里的 `$defs` 是唯一形状来源；测试直接读真文件，不自造 schema。 */

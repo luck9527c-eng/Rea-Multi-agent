@@ -12,7 +12,7 @@ import {
   computeDigests,
   readBinding,
   checkCompatibility,
-} from '../src/compatibility.mjs';
+} from '../dist/compatibility.js';
 
 const SKILL_ROOT = '.agents/skills/reverse-project-management';
 

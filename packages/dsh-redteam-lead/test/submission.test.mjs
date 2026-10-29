@@ -3,15 +3,15 @@ import assert from 'node:assert/strict'
 import * as fsp from 'node:fs/promises'
 import path from 'node:path'
 
-import * as atomic from '../src/atomic.mjs'
-import * as paths from '../src/paths.mjs'
+import * as atomic from '../dist/atomic.js'
+import * as paths from '../dist/paths.js'
 import { makeTempProject } from './helpers/host.mjs'
 import {
   SUBMISSION_FIELDS,
   attemptDir,
   readVerifiedSubmission,
   validateSubmission,
-} from '../src/submission.mjs'
+} from '../dist/submission.js'
 
 const SHA = (char) => char.repeat(64)
 

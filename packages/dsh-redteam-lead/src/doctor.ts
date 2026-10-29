@@ -36,6 +36,14 @@ export const SKILL_COPY_DIR = join('.agents', 'skills', 'reverse-project-managem
 export const RUNTIME_READY = 'unknown'
 
 /**
+ * 本包 `exports["."]` 的期望值。
+ *
+ * TS 迁移（DECISIONS D28）把可执行源码从包根 `index.js` 挪到 `dist/index.js`：宿主仍然只经
+ * `exports["."]` 找入口，所以自检断言的是这个声明，而不是某个硬编码的文件位置。
+ */
+const ENTRY_EXPORT = './dist/index.js'
+
+/**
  * 诊断用的稳定错误码。只取编排契约「稳定错误码」表里的码：
  * - 安装/项目配置不完整 → PROJECT_NOT_CONFIGURED
  * - 团队服务不可用 → TEAM_SERVICE_UNAVAILABLE
@@ -265,12 +273,12 @@ function checkBundle(recorder, bundleRoot) {
 
   const exportsMap = manifest.value.exports ?? {}
   const entry = exportsMap['.']
-  if (entry === './index.js') recorder.pass('bundle.exports', './index.js + ./locale/*.json')
+  if (entry === ENTRY_EXPORT) recorder.pass('bundle.exports', `${ENTRY_EXPORT} + ./locale/*.json`)
   else {
     recorder.fail('bundle.exports', {
       code: CODE_CONFIGURED,
-      detail: `exports["."] 是 ${JSON.stringify(entry)}，应为 "./index.js"`,
-      nextStep: '按宿主 bundle 形态声明 "exports": { ".": "./index.js", "./locale/*.json": "./locale/*.json" }',
+      detail: `exports["."] 是 ${JSON.stringify(entry)}，应为 "${ENTRY_EXPORT}"`,
+      nextStep: `按宿主 bundle 形态声明 "exports": { ".": "${ENTRY_EXPORT}", "./locale/*.json": "./locale/*.json" }`,
     })
   }
   if (exportsMap['./locale/*.json'] === undefined) {
@@ -282,13 +290,16 @@ function checkBundle(recorder, bundleRoot) {
     })
   } else recorder.pass('bundle.exports-locale', './locale/*.json')
 
-  facts.entry_present = isFile(join(bundleRoot, 'index.js'))
-  if (facts.entry_present) recorder.pass('bundle.entry', join(bundleRoot, 'index.js'))
+  // 入口以 manifest 声明的 exports["."] 为准（TS 迁移后是本包的 ./dist/index.js）；
+  // 探针要能诊断任意 bundle 目录，所以只按声明解析，不硬编码成 dist。
+  const entryPath = typeof entry === 'string' ? resolve(bundleRoot, entry) : join(bundleRoot, 'dist', 'index.js')
+  facts.entry_present = isFile(entryPath)
+  if (facts.entry_present) recorder.pass('bundle.entry', entryPath)
   else {
     recorder.fail('bundle.entry', {
       code: CODE_CONFIGURED,
-      detail: `入口文件不存在：${join(bundleRoot, 'index.js')}`,
-      nextStep: '从仓库 packages/dsh-redteam-lead/index.js 复制回来',
+      detail: `入口文件不存在：${entryPath}`,
+      nextStep: `从仓库 packages/dsh-redteam-lead 重建产物（npm run build，产出 ${ENTRY_EXPORT}），再重新 link: 安装本包`,
     })
   }
 
@@ -611,7 +622,7 @@ function envelope(status, { code = null, diagnostics = [], data }) {
  * @returns {{ envelope: object, exitCode: number, report: object | null }}
  */
 export function runDoctor(options = {}) {
-  // 默认 bundle 根 = 本文件所在 `src/` 的上一级（包根）。
+  // 默认 bundle 根 = 本文件所在目录的上一级（`dist/`→包根，`src/`→包根）。
   const bundleRoot = options.bundleRoot ?? dirname(dirname(fileURLToPath(import.meta.url)))
 
   if (options.help === true) {

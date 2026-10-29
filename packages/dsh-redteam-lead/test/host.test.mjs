@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { DEP_KEYS, makeClock, makeCtx, makeFakeTools, makeTempProject } from './helpers/host.mjs';
-import { CONTRACT_VERSION } from '../src/compatibility.mjs';
+import { CONTRACT_VERSION } from '../dist/compatibility.js';
 
 test('makeCtx 装配出 SEAMS 第 1 节的全部 deps 键（已实现的给真实模块，未实现的为 null）', (t) => {
   const ctx = makeCtx({ t });

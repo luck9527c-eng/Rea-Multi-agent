@@ -15,9 +15,9 @@ import * as fsp from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 
-import * as atomicModule from './atomic.mjs'
-import * as pathsModule from './paths.mjs'
-import { ContractError } from './errors.mjs'
+import * as atomicModule from './atomic.js'
+import * as pathsModule from './paths.js'
+import { ContractError } from './errors.js'
 
 /** 项目内固定路径（统一 `/`）。 */
 export const BINDING_PATH = 're/team/binding.json'

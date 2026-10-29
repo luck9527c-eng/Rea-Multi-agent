@@ -13,21 +13,51 @@
 import { appendFile, mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import { recordOf, thrownMessage } from './guards.js'
+import type { Clock } from './types.js'
+
 /** 项目内审计文件路径（统一 `/`）。 */
 export const AUDIT_PATH = 're/team/audit.jsonl'
 
 /**
  * 固定列顺序。缺省填 null，未知字段丢弃 —— 保证 JSONL 每行列一致、可直接被工具消费。
  */
-export const AUDIT_FIELDS = Object.freeze(['at', 'kind', 'route', 'task', 'member', 'requester', 'verdict'])
+export const AUDIT_FIELDS: readonly string[] = Object.freeze([
+  'at',
+  'kind',
+  'route',
+  'task',
+  'member',
+  'requester',
+  'verdict',
+])
 
-function isoNowOf(clock) {
-  if (clock && typeof clock.isoNow === 'function') return clock.isoNow()
+/** 一条审计记录：`kind` 必填，其余列可选（缺省写 null）。 */
+export interface AuditEntry {
+  kind: string
+  route?: string | null
+  task?: string | null
+  member?: string | null
+  requester?: string | null
+  verdict?: string | null
+  at?: string | null
+}
+
+/** 审计的时钟选项：`deps.clock` 形状，或一个返回毫秒的函数。 */
+export interface AuditOptions {
+  clock?: Pick<Clock, 'isoNow'> | (() => number)
+}
+
+/** 审计写入结果（**绝不抛出**）。 */
+export type AuditResult = { written: true; line: string } | { written: false; error: string }
+
+function isoNowOf(clock: AuditOptions['clock']): string {
+  if (clock && typeof clock === 'object' && typeof clock.isoNow === 'function') return clock.isoNow()
   if (typeof clock === 'function') return new Date(clock()).toISOString()
   return new Date().toISOString()
 }
 
-function column(value) {
+function column(value: unknown): string | null {
   if (value === undefined || value === null) return null
   if (typeof value === 'string') return value
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
@@ -38,14 +68,12 @@ function column(value) {
  * 追加一条审计记录。
  *
  * **绝不抛出**：任何失败都以 `{ written: false, error }` 返回，由调用方写入 `audit_written=false`。
- *
- * @param {string} root 已规范化的项目根
- * @param {{ kind: string, route?: string|null, task?: string|null, member?: string|null,
- *           requester?: string|null, verdict?: string|null, at?: string|null }} entry
- * @param {{ clock?: { isoNow?: () => string } | (() => number) }} [options]
- * @returns {Promise<{ written: true, line: string } | { written: false, error: string }>}
  */
-export async function appendAudit(root, entry, options = {}) {
+export async function appendAudit(
+  root: string,
+  entry: AuditEntry,
+  options: AuditOptions = {},
+): Promise<AuditResult> {
   try {
     if (typeof root !== 'string' || root.length === 0) {
       return { written: false, error: '缺少项目根，无法写入审计' }
@@ -58,9 +86,11 @@ export async function appendAudit(root, entry, options = {}) {
     }
 
     const at = typeof entry.at === 'string' && entry.at.length > 0 ? entry.at : isoNowOf(options.clock)
-    const record = {}
+    // 列清单是固定的七列，这里按列名读同一个条目对象（`entry` 的类型只声明了这七列）。
+    const source = recordOf(entry)
+    const record: Record<string, string | null> = {}
     for (const field of AUDIT_FIELDS) {
-      record[field] = field === 'at' ? at : column(entry[field])
+      record[field] = field === 'at' ? at : column(source[field])
     }
 
     const line = `${JSON.stringify(record)}\n`
@@ -70,6 +100,6 @@ export async function appendAudit(root, entry, options = {}) {
 
     return { written: true, line }
   } catch (error) {
-    return { written: false, error: error?.message ?? String(error) }
+    return { written: false, error: thrownMessage(error) }
   }
 }

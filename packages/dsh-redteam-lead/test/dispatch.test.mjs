@@ -10,9 +10,9 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, stat, symlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { handleDispatch } from '../src/dispatch.mjs'
-import * as contract from '../src/contract.mjs'
-import { validateInput } from '../src/validate.mjs'
+import { handleDispatch } from '../dist/dispatch.js'
+import * as contract from '../dist/contract.js'
+import { validateInput } from '../dist/validate.js'
 import { makeCtx, makeTempProject } from './helpers/host.mjs'
 
 const SCHEMA = JSON.parse(

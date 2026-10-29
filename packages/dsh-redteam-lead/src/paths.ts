@@ -12,20 +12,27 @@
  */
 
 import { lstat, readdir, realpath, stat } from 'node:fs/promises'
+import type { Stats } from 'node:fs'
 import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 
-import { ContractError } from './errors.mjs'
+import { ContractError } from './errors.js'
+import { thrownCode, thrownMessage } from './guards.js'
 
 /** 控制字符（含 NUL / 换行 / DEL）：Windows 上会被截断或被驱动层特殊解释。 */
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/
 
 const PATH_NEXT_STEP = '改用项目内以 / 分隔的相对路径（例如 re/team/binding.json），不要传绝对路径、.. 或盘符'
 
-function pathInvalid(message, nextStep = PATH_NEXT_STEP, details) {
+function pathInvalid(
+  message: string,
+  nextStep: string = PATH_NEXT_STEP,
+  details?: Record<string, unknown>,
+): ContractError {
   return new ContractError({ code: 'PATH_INVALID', message, nextStep, details })
 }
 
-function assertAbsoluteRoot(root) {
+/** `root` 必须是真实绝对路径（断言函数：通过后调用方拿到 `string`）。 */
+function assertAbsoluteRoot(root: unknown): asserts root is string {
   if (typeof root !== 'string' || root.length === 0 || !isAbsolute(root)) {
     throw pathInvalid(`项目根必须是真实绝对路径: ${JSON.stringify(root)}`, '先用 normalizeProjectRoot 得到规范根再拼路径')
   }
@@ -36,11 +43,9 @@ function assertAbsoluteRoot(root) {
  *
  * 通过时原样返回（调用方已保证 `/` 分隔、无空段），不做大小写或文本改写。
  *
- * @param {unknown} relativePath
- * @returns {string}
  * @throws {ContractError} code=PATH_INVALID
  */
-export function assertProjectRelative(relativePath) {
+export function assertProjectRelative(relativePath: unknown): string {
   if (typeof relativePath !== 'string' || relativePath.length === 0) {
     throw pathInvalid(`项目内路径必须是非空字符串: ${JSON.stringify(relativePath)}`)
   }
@@ -69,10 +74,8 @@ export function assertProjectRelative(relativePath) {
 
 /**
  * 非抛出版本，供快速判定。
- * @param {unknown} value
- * @returns {boolean}
  */
-export function isProjectRelative(value) {
+export function isProjectRelative(value: unknown): boolean {
   try {
     assertProjectRelative(value)
     return true
@@ -83,18 +86,15 @@ export function isProjectRelative(value) {
 
 /**
  * 把项目内相对路径解析为绝对路径（不做文件系统检查）。
- * @param {string} root 已规范化的绝对根
- * @param {unknown} relativePath
- * @returns {string}
  */
-export function resolveInProject(root, relativePath) {
+export function resolveInProject(root: unknown, relativePath: unknown): string {
   assertAbsoluteRoot(root)
   const validated = assertProjectRelative(relativePath)
   return join(root, ...validated.split('/'))
 }
 
 /** 目标是否在根内（Windows 上按大小写不敏感比较，避免盘符大小写造成假阴性）。 */
-function isWithin(rootReal, targetReal) {
+function isWithin(rootReal: string, targetReal: string): boolean {
   const relation = relative(rootReal, targetReal)
   if (relation === '') return true
   const folded = process.platform === 'win32' ? relation.toLowerCase() : relation
@@ -107,11 +107,9 @@ function isWithin(rootReal, targetReal) {
  *
  * 链接/重解析点会被解析到真实位置；调用方得到的是可比较的规范根。
  *
- * @param {unknown} projectRoot
- * @returns {Promise<string>}
  * @throws {ContractError} code=PATH_INVALID
  */
-export async function normalizeProjectRoot(projectRoot) {
+export async function normalizeProjectRoot(projectRoot: unknown): Promise<string> {
   if (typeof projectRoot !== 'string' || projectRoot.trim().length === 0) {
     throw pathInvalid('project_root 必须是非空字符串', '传入显式选择的本地分析目录绝对路径')
   }
@@ -119,22 +117,25 @@ export async function normalizeProjectRoot(projectRoot) {
     throw pathInvalid(`project_root 必须是绝对路径: ${projectRoot}`, '传入显式选择的本地分析目录绝对路径')
   }
 
-  let canonical
+  let canonical: string
   try {
     canonical = await realpath(projectRoot)
   } catch (error) {
     throw pathInvalid(
-      `project_root 无法解析为真实路径: ${projectRoot}（${error?.code ?? error?.message ?? 'unknown'}）`,
+      `project_root 无法解析为真实路径: ${projectRoot}（${thrownCode(error) ?? thrownMessage(error) ?? 'unknown'}）`,
       '确认目录存在、路径拼写正确且当前用户可访问',
-      { projectRoot, code: error?.code ?? null },
+      { projectRoot, code: thrownCode(error) },
     )
   }
 
-  let stats
+  let stats: Stats
   try {
     stats = await stat(canonical)
   } catch (error) {
-    throw pathInvalid(`project_root 无法读取: ${canonical}（${error?.code ?? 'unknown'}）`, '确认目录可访问')
+    throw pathInvalid(
+      `project_root 无法读取: ${canonical}（${thrownCode(error) ?? 'unknown'}）`,
+      '确认目录可访问',
+    )
   }
   if (!stats.isDirectory()) {
     throw pathInvalid(`project_root 不是目录: ${canonical}`, '传入分析项目根目录，而不是文件')
@@ -142,12 +143,13 @@ export async function normalizeProjectRoot(projectRoot) {
   return canonical
 }
 
-async function lstatOrNull(target) {
+async function lstatOrNull(target: string): Promise<Stats | null> {
   try {
     return await lstat(target)
   } catch (error) {
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null
-    throw pathInvalid(`无法检查路径组件: ${target}（${error?.code ?? 'unknown'}）`, '确认路径及其祖先可访问')
+    const code = thrownCode(error)
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null
+    throw pathInvalid(`无法检查路径组件: ${target}（${code ?? 'unknown'}）`, '确认路径及其祖先可访问')
   }
 }
 
@@ -155,12 +157,9 @@ async function lstatOrNull(target) {
  * 写入前的路径安全检查：逐级确认祖先与现有目标不是链接/重解析点，
  * 且最深的已存在祖先真实路径仍在根内。返回写目标绝对路径。
  *
- * @param {string} root 已规范化的绝对根
- * @param {unknown} relativePath
- * @returns {Promise<string>} 目标绝对路径
  * @throws {ContractError} code=PATH_INVALID
  */
-export async function assertSafeWriteTarget(root, relativePath) {
+export async function assertSafeWriteTarget(root: unknown, relativePath: unknown): Promise<string> {
   assertAbsoluteRoot(root)
   const validated = assertProjectRelative(relativePath)
   const segments = validated.split('/')
@@ -208,12 +207,8 @@ export async function assertSafeWriteTarget(root, relativePath) {
  * 大小写折叠碰撞：若存在仅大小写不同的既有条目则返回该条目名，否则 null。
  *
  * 完全同名不算碰撞（那是同一个条目，由调用方决定覆盖语义）。
- *
- * @param {Iterable<string>} existingNames 目录现有条目名
- * @param {string} candidate 待写入的最后一段名字
- * @returns {string | null}
  */
-export function findCaseCollision(existingNames, candidate) {
+export function findCaseCollision(existingNames: Iterable<unknown>, candidate: unknown): string | null {
   const names = [...existingNames]
   if (typeof candidate !== 'string' || candidate.length === 0) return null
   if (names.includes(candidate)) return null
@@ -229,23 +224,21 @@ export function findCaseCollision(existingNames, candidate) {
  *
  * 尚不存在的层级无需检查（更深的层级也不可能已存在）。
  *
- * @param {string} root 已规范化的绝对根
- * @param {unknown} relativePath
- * @returns {Promise<void>}
  * @throws {ContractError} code=PATH_INVALID
  */
-export async function assertNoCaseCollision(root, relativePath) {
+export async function assertNoCaseCollision(root: unknown, relativePath: unknown): Promise<void> {
   assertAbsoluteRoot(root)
   const validated = assertProjectRelative(relativePath)
 
   let current = root
   for (const segment of validated.split('/')) {
-    let names
+    let names: string[]
     try {
       names = await readdir(current)
     } catch (error) {
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return
-      throw pathInvalid(`无法列出目录以检查大小写碰撞: ${current}（${error?.code ?? 'unknown'}）`, '确认目录可访问')
+      const code = thrownCode(error)
+      if (code === 'ENOENT' || code === 'ENOTDIR') return
+      throw pathInvalid(`无法列出目录以检查大小写碰撞: ${current}（${code ?? 'unknown'}）`, '确认目录可访问')
     }
     const collision = findCaseCollision(names, segment)
     if (collision !== null) {

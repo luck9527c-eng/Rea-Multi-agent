@@ -326,15 +326,15 @@ test('--bundle 指向不存在的目录：退出码 1，诊断点名路径', asy
 })
 
 test('doctor 只依赖 node 内建与 T2 自己的 doctor 模块（不 import index.js / 适配器）', async () => {
-  for (const relative of [join('bin', 'doctor.mjs'), join('src', 'doctor.mjs')]) {
+  for (const relative of [join('bin', 'doctor.mjs'), join('src', 'doctor.ts')]) {
     const text = await readFile(join(PACKAGE_ROOT, relative), 'utf8')
     const specifiers = [...text.matchAll(/from\s+['"]([^'"]+)['"]/g)].map((match) => match[1])
     for (const specifier of specifiers) {
       const allowed =
         specifier.startsWith('node:') ||
-        specifier === './doctor.mjs' ||
-        specifier === '../src/doctor.mjs'
-      assert.ok(allowed, `${relative} 只能 import node:* 与 ./doctor.mjs，出现了：${specifier}`)
+        specifier === './doctor.js' ||
+        specifier === '../dist/doctor.js'
+      assert.ok(allowed, `${relative} 只能 import node:* 与 doctor 模块自身，出现了：${specifier}`)
     }
   }
 })

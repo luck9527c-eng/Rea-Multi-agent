@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdir, realpath, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError } from '../src/errors.mjs'
+import { ContractError } from '../dist/errors.js'
 import {
   assertNoCaseCollision,
   assertProjectRelative,
@@ -12,7 +12,7 @@ import {
   isProjectRelative,
   normalizeProjectRoot,
   resolveInProject,
-} from '../src/paths.mjs'
+} from '../dist/paths.js'
 import { makeTempProject, removeTree } from './helpers/tmp.mjs'
 
 /** 断言抛出 PATH_INVALID 契约错误。 */

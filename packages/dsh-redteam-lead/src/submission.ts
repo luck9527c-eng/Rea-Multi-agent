@@ -13,7 +13,7 @@
  * 是纯函数，可单独测试。
  */
 
-import { isProjectRelative } from './paths.mjs'
+import { isProjectRelative } from './paths.js'
 
 /** 提交记录版本。 */
 export const SUBMISSION_SCHEMA_VERSION = 1

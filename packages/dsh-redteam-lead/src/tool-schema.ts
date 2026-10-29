@@ -11,6 +11,8 @@
  * @module @local/dsh-redteam-lead/tool-schema
  */
 
+import { recordOf } from './guards.js'
+
 /** 规格文件的完整内容（含 `$schema` / `$id` / `$defs`），逐字复制。 */
 const SPEC =
 {
@@ -1366,22 +1368,23 @@ export const errorCodes = schemaDefs.errorCode.enum
  * @param {number} [depth] 递归深度（防环）
  * @returns {unknown} 展开后的新对象（不改原 schema）
  */
-export function inlineRefs(schema, defs = schemaDefs, depth = 0) {
+export function inlineRefs(schema: unknown, defs: Record<string, unknown> = schemaDefs, depth = 0): unknown {
   if (depth > 64) throw new TypeError('schema $ref 展开过深（规格里不应有环）')
   if (Array.isArray(schema)) return schema.map((item) => inlineRefs(item, defs, depth + 1))
   if (schema === null || typeof schema !== 'object') return schema
 
-  if (typeof schema.$ref === 'string') {
-    const match = /^#\/\$defs\/([^/]+)$/.exec(schema.$ref)
-    if (match === null) throw new TypeError(`不支持的 $ref：${schema.$ref}`)
+  const view = recordOf(schema)
+  if (typeof view.$ref === 'string') {
+    const match = /^#\/\$defs\/([^/]+)$/.exec(view.$ref)
+    if (match === null) throw new TypeError(`不支持的 $ref：${view.$ref}`)
     const target = defs[match[1]]
-    if (target === undefined) throw new TypeError(`$ref 指向未定义的定义：${schema.$ref}`)
-    const { $ref: _ignored, ...siblings } = schema
-    return inlineRefs({ ...target, ...siblings }, defs, depth + 1)
+    if (target === undefined) throw new TypeError(`$ref 指向未定义的定义：${view.$ref}`)
+    const { $ref: _ignored, ...siblings } = view
+    return inlineRefs({ ...recordOf(target), ...siblings }, defs, depth + 1)
   }
 
-  const out = {}
-  for (const [key, value] of Object.entries(schema)) out[key] = inlineRefs(value, defs, depth + 1)
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(view)) out[key] = inlineRefs(value, defs, depth + 1)
   return out
 }
 

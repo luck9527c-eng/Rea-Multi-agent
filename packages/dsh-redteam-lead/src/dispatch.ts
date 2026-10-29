@@ -22,9 +22,9 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError, isErrorCode } from './errors.mjs'
-import * as resourceDefaults from './resources.mjs'
-import * as contractDefaults from './contract.mjs'
+import { ContractError, isErrorCode } from './errors.js'
+import * as resourceDefaults from './resources.js'
+import * as contractDefaults from './contract.js'
 
 /** `$defs.id` */
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,95}$/u

@@ -16,8 +16,8 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError } from './errors.mjs'
-import { writeJsonAtomic } from './atomic.mjs'
+import { ContractError } from './errors.js'
+import { writeJsonAtomic } from './atomic.js'
 
 /** 项目内台账目录。 */
 export const OPERATIONS_DIR = 're/team/operations'

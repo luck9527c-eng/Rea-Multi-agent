@@ -12,7 +12,7 @@
  * 不读文件、不碰 adapter；调用方负责取 RUN 的 artifacts 清单。
  */
 
-import { isProjectRelative } from './paths.mjs'
+import { isProjectRelative } from './paths.js'
 
 /** 六类锚点，顺序与 `$defs.anchorKind` 一致。 */
 export const ANCHOR_KINDS = Object.freeze([

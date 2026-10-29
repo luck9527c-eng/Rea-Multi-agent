@@ -269,12 +269,12 @@ test('package.json 满足 bundle 清单要求，dsh.bundle.patch 指向存在的
   assert.equal(manifest.version, '0.1.0')
 
   // exports：入口 + locale（每个 locale 文件都必须能通过 exports 解析，DECISIONS D16）
-  assert.equal(manifest.exports?.['.'], './index.js')
+  assert.equal(manifest.exports?.['.'], './dist/index.js')
   assert.equal(manifest.exports?.['./locale/*.json'], './locale/*.json')
 
-  // files：ticket 要求的六项
+  // files：ticket 要求的五项（TS 迁移后入口在 dist/，源码不进发布清单）
   const files = manifest.files ?? []
-  for (const entry of ['index.js', 'src', 'bin', 'cordis.patch.yml', 'locale', 'icon.svg']) {
+  for (const entry of ['dist', 'bin', 'cordis.patch.yml', 'locale', 'icon.svg']) {
     assert.ok(files.includes(entry), `files 必须列出 ${entry}`)
   }
 
@@ -430,7 +430,7 @@ function collectRefs(node, out = []) {
 }
 
 test('src/tool-schema.mjs 与 docs/specs/rt-tools.schema.json 逐 $defs 无漂移', async () => {
-  const module = await import('../src/tool-schema.mjs')
+  const module = await import('../dist/tool-schema.js')
   const spec = JSON.parse(readFileSync(SPECS_SCHEMA, 'utf8'))
 
   for (const name of REQUIRED_DEFS) {
@@ -473,7 +473,7 @@ test('src/tool-schema.mjs 与 docs/specs/rt-tools.schema.json 逐 $defs 无漂�
 // ---------------------------------------------------------------------------
 
 test('output.schema 投影与 $defs.result 对齐，且在宿主支持子集内', async () => {
-  const module = await import('../src/tool-schema.mjs')
+  const module = await import('../dist/tool-schema.js')
   const spec = JSON.parse(readFileSync(SPECS_SCHEMA, 'utf8'))
   const resultDef = spec.$defs.result
   const output = module.resultOutput
@@ -513,7 +513,7 @@ test('output.schema 投影与 $defs.result 对齐，且在宿主支持子集内'
 })
 
 test('三个入参 schema 在注册前展开 $ref（自包含），展开保留规格内容', async () => {
-  const module = await import('../src/tool-schema.mjs')
+  const module = await import('../dist/tool-schema.js')
   const spec = JSON.parse(readFileSync(SPECS_SCHEMA, 'utf8'))
 
   for (const [exportName, defName] of [
@@ -778,7 +778,7 @@ function fakeCtx() {
 /** 动态导入入口；兄弟 ticket（T1/T3/T4）还没合入时按契约 skip，不造假 stub。 */
 async function importIndex(t) {
   try {
-    return await import('../index.js')
+    return await import('../dist/index.js')
   } catch (error) {
     if (error?.code === 'ERR_MODULE_NOT_FOUND') {
       const missing = String(error.message).split('\n').find((line) => line.includes('Cannot find')) ?? error.message
@@ -792,7 +792,7 @@ async function importIndex(t) {
 test('三工具注册：raw JSON Schema（自包含）、output.schema 为宿主子集投影、render 全能', async (t) => {
   const index = await importIndex(t)
   if (index === undefined) return
-  const schema = await import('../src/tool-schema.mjs')
+  const schema = await import('../dist/tool-schema.js')
   const errorCodes = new Set(schema.schemaDefs.errorCode.enum)
 
   assert.equal(typeof index.apply, 'function')
@@ -856,7 +856,7 @@ test('三工具注册：raw JSON Schema（自包含）、output.schema 为宿主
 test('非法入参 → INVALID_ARGUMENT 且 handler 完全没有被调用', async (t) => {
   const index = await importIndex(t)
   if (index === undefined) return
-  const schema = await import('../src/tool-schema.mjs')
+  const schema = await import('../dist/tool-schema.js')
   const errorCodes = new Set(schema.schemaDefs.errorCode.enum)
   const { ctx } = fakeCtx()
 
@@ -921,7 +921,7 @@ test('非法入参 → INVALID_ARGUMENT 且 handler 完全没有被调用', asyn
 test('handler 抛异常或返回不合规信封时，注册表只看到合法信封（不抛栈）', async (t) => {
   const index = await importIndex(t)
   if (index === undefined) return
-  const schema = await import('../src/tool-schema.mjs')
+  const schema = await import('../dist/tool-schema.js')
   const errorCodes = new Set(schema.schemaDefs.errorCode.enum)
   const { ctx } = fakeCtx()
 
@@ -1019,7 +1019,7 @@ test('locale 与 icon 满足宿主的显示元数据要求', async () => {
 })
 
 test('不碰既有 redteam preset 与 @local/dsh-rea-plugin', () => {
-  for (const file of [join(PACKAGE_ROOT, 'cordis.patch.yml'), join(PACKAGE_ROOT, 'index.js')]) {
+  for (const file of [join(PACKAGE_ROOT, 'cordis.patch.yml'), join(PACKAGE_ROOT, 'dist', 'index.js')]) {
     const text = readFileSync(file, 'utf8')
     assert.ok(!text.includes('dsh-rea-plugin'), `${relative(PACKAGE_ROOT, file)} 不得引用既有 bundle`)
     assert.ok(!text.includes('rt_scan_command'), '既有包的工具名不得出现在本包 patch/入口里')

@@ -15,8 +15,55 @@ import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 
-import { ContractError } from './errors.mjs'
+import { ContractError } from './errors.js'
+import { isRecord, thrownCode } from './guards.js'
 
+/** 锁记录（wire 形状：已知字段可选，其余按索引读取）。 */
+export interface LockRecord {
+  schema_version?: number
+  project?: string
+  session?: string
+  owner_nonce?: string
+  pid?: number
+  process_start_ms?: number
+  operation?: string | null
+  acquired_at?: string
+  expires_at?: string | null
+  [key: string]: unknown
+}
+
+/** `ownProcessIdentity()` 可注入的时钟。 */
+export interface OwnProcessOptions {
+  now?: () => number
+  uptime?: () => number
+}
+
+/** 过期/失联判定可注入的探针（测试用假进程表）。 */
+export interface StaleOptions {
+  now?: number | (() => number)
+  isAlive?: (pid: number) => boolean
+  processStart?: (pid: number) => number | null
+}
+
+/** `acquire()` 的入参。 */
+export interface AcquireOptions {
+  session?: string
+  operation?: string | null
+  ownerNonce?: string
+  now?: number | (() => number)
+  ttlMs?: number | null
+  pid?: number
+  processStartMs?: number
+  isAlive?: (pid: number) => boolean
+  processStart?: (pid: number) => number | null
+}
+
+/** `release()` 的入参。 */
+export interface ReleaseOptions {
+  ownerNonce?: string
+  force?: boolean
+  recoveryRef?: string
+}
 /** 项目内锁路径（统一 `/`）。 */
 export const LOCK_PATH = 're/team/lock'
 
@@ -26,11 +73,11 @@ const START_TOLERANCE_MS = 1000
 /** `$defs.id` */
 const OPERATION_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,95}$/
 
-function lockPathOf(root) {
+function lockPathOf(root: string): string {
   return join(root, ...LOCK_PATH.split('/'))
 }
 
-function invalid(message, nextStep) {
+function invalid(message: string, nextStep: string): ContractError {
   return new ContractError({ code: 'INVALID_ARGUMENT', message, nextStep })
 }
 
@@ -42,7 +89,7 @@ function invalid(message, nextStep) {
  * @param {{ now?: () => number, uptime?: () => number }} [options]
  * @returns {{ pid: number, start_ms: number }}
  */
-export function ownProcessIdentity(options = {}) {
+export function ownProcessIdentity(options: OwnProcessOptions = {}): { pid: number; start_ms: number } {
   const { now = Date.now, uptime = () => process.uptime() } = options
   return { pid: process.pid, start_ms: Math.round(now() - uptime() * 1000) }
 }
@@ -52,17 +99,17 @@ export function ownProcessIdentity(options = {}) {
  * @param {number} pid
  * @returns {boolean}
  */
-export function isProcessAlive(pid) {
+export function isProcessAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
     return true
   } catch (error) {
-    return error?.code === 'EPERM'
+    return thrownCode(error) === 'EPERM'
   }
 }
 
-function nowMsOf(now) {
+function nowMsOf(now: number | (() => number) | null | undefined): number {
   if (typeof now === 'function') return now()
   return typeof now === 'number' ? now : Date.now()
 }
@@ -74,7 +121,7 @@ function nowMsOf(now) {
  * @param {{ now?: number | (() => number), isAlive?: (pid: number) => boolean, processStart?: (pid: number) => number | null }} [options]
  * @returns {string[]} `expired` / `process_dead` / `pid_reused`
  */
-export function staleReasons(record, options = {}) {
+export function staleReasons(record: LockRecord | null, options: StaleOptions = {}): string[] {
   if (!record || typeof record !== 'object') return []
   const { isAlive = isProcessAlive, processStart } = options
   const nowMs = nowMsOf(options.now)
@@ -88,7 +135,8 @@ export function staleReasons(record, options = {}) {
   const alive = typeof record.pid === 'number' ? isAlive(record.pid) : false
   if (typeof record.pid === 'number' && !alive) reasons.push('process_dead')
 
-  if (alive && typeof processStart === 'function' && typeof record.process_start_ms === 'number') {
+  // 多出的 `typeof record.pid === 'number'` 只为让类型收窄成立：alive 为真时 pid 必然已是数字，运行期不改变任何分支。
+  if (alive && typeof processStart === 'function' && typeof record.process_start_ms === 'number' && typeof record.pid === 'number') {
     const actual = processStart(record.pid)
     if (typeof actual === 'number' && Math.abs(actual - record.process_start_ms) > START_TOLERANCE_MS) {
       reasons.push('pid_reused')
@@ -104,7 +152,7 @@ export function staleReasons(record, options = {}) {
  * @param {object} [options] 同 `staleReasons`
  * @returns {boolean}
  */
-export function isStale(record, options = {}) {
+export function isStale(record: LockRecord | null, options: StaleOptions = {}): boolean {
   return staleReasons(record, options).length > 0
 }
 
@@ -114,20 +162,20 @@ export function isStale(record, options = {}) {
  * @returns {Promise<object | null>} 无锁返回 null
  * @throws {ContractError} 内容损坏时 `RECOVERY_REQUIRED`
  */
-export async function readLock(root) {
+export async function readLock(root: string): Promise<LockRecord | null> {
   let text
   try {
     text = await readFile(lockPathOf(root), 'utf8')
   } catch (error) {
-    if (error?.code === 'ENOENT') return null
+    if (thrownCode(error) === 'ENOENT') return null
     throw new ContractError({
       code: 'RECOVERY_REQUIRED',
-      message: `无法读取项目锁: ${LOCK_PATH}（${error?.code ?? 'unknown'}）`,
+      message: `无法读取项目锁: ${LOCK_PATH}（${thrownCode(error) ?? 'unknown'}）`,
       nextStep: '确认项目根可读；锁文件异常时先按恢复记录核实再处理',
     })
   }
 
-  let record
+  let record: unknown
   try {
     record = JSON.parse(text)
   } catch {
@@ -138,7 +186,7 @@ export async function readLock(root) {
       details: { path: LOCK_PATH },
     })
   }
-  if (!record || typeof record !== 'object' || typeof record.owner_nonce !== 'string') {
+  if (!isRecord(record) || typeof record.owner_nonce !== 'string') {
     throw new ContractError({
       code: 'RECOVERY_REQUIRED',
       message: `项目锁内容缺少 owner_nonce: ${LOCK_PATH}`,
@@ -166,7 +214,7 @@ export async function readLock(root) {
  * @returns {Promise<{ acquired: true, record: object }>}
  * @throws {ContractError} `PROJECT_BUSY`（已被持有）或 `RECOVERY_REQUIRED`（锁损坏）
  */
-export async function acquire(root, options = {}) {
+export async function acquire(root: string, options: AcquireOptions = {}): Promise<{ acquired: true; record: LockRecord }> {
   if (typeof root !== 'string' || !isAbsolute(root)) {
     throw new ContractError({
       code: 'PATH_INVALID',
@@ -209,11 +257,11 @@ export async function acquire(root, options = {}) {
   try {
     await writeFile(lockPath, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' })
   } catch (error) {
-    if (error?.code !== 'EEXIST') throw error
+    if (thrownCode(error) !== 'EEXIST') throw error
     const holder = await readLock(root) // 损坏时抛出 RECOVERY_REQUIRED：绝不当成没锁
     throw new ContractError({
       code: 'PROJECT_BUSY',
-      message: `项目锁已被持有: ${LOCK_PATH}（session=${holder.session} operation=${holder.operation ?? 'null'} pid=${holder.pid}）`,
+      message: `项目锁已被持有: ${LOCK_PATH}（session=${String(holder?.session)} operation=${holder?.operation ?? 'null'} pid=${String(holder?.pid)}）`,
       nextStep:
         '等待持锁操作结束；只有核实原进程/Lead 不再写且恢复记录已保存后，才用 release({force:true, recoveryRef}) 显式清理',
       details: {
@@ -236,11 +284,11 @@ export async function acquire(root, options = {}) {
  * @param {{ ownerNonce?: string, force?: boolean, recoveryRef?: string }} [options]
  * @returns {Promise<{ released: boolean, forced: boolean, previous: object | null }>}
  */
-export async function release(root, options = {}) {
+export async function release(root: string, options: ReleaseOptions = {}): Promise<{ released: boolean; forced: boolean; previous: LockRecord | null }> {
   const { ownerNonce, force = false, recoveryRef } = options
   const lockPath = lockPathOf(root)
 
-  let previous
+  let previous: LockRecord | null
   try {
     previous = await readLock(root)
   } catch (error) {

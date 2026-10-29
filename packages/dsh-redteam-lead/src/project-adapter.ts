@@ -25,7 +25,7 @@ import { existsSync } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-import { CONTRACT_VERSION, SKILL_COPY_RELATIVE, computeDigests } from './compatibility.mjs';
+import { CONTRACT_VERSION, SKILL_COPY_RELATIVE, computeDigests } from './compatibility.js';
 
 const CHECK_FAILED = 'CHECK_FAILED';
 const PROJECT_NOT_CONFIGURED = 'PROJECT_NOT_CONFIGURED';

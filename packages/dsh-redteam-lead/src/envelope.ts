@@ -17,19 +17,24 @@
  * 用于把未捕获异常兜底成合法信封（不带栈）。
  */
 
-import { ContractError, isContractError, isErrorCode } from './errors.mjs'
+import { ContractError, isContractError, isErrorCode } from './errors.js'
+import { recordOf } from './guards.js'
+import type { Diagnostic, Envelope, ResultStatus } from './types.js'
 
 /** 契约版本号。 */
 export const SCHEMA_VERSION = 1
 
 /** 允许的四种状态。 */
-export const RESULT_STATUSES = Object.freeze(['ok', 'blocked', 'partial', 'error'])
+export const RESULT_STATUSES: readonly ResultStatus[] = Object.freeze(['ok', 'blocked', 'partial', 'error'])
+
+/** 非 ok 的三种状态（`defaultStatusFor` 的值域）。 */
+export type FailureStatus = 'error' | 'blocked' | 'partial'
 
 /**
  * `$defs.failureData` 的 phase 闭集（契约「操作阶段与部分失败」）。
  * 与 operation 台账的阶段相比多 `preflight`、不含 `completed`：失败时不可能已经是 completed。
  */
-export const FAILURE_PHASES = Object.freeze([
+export const FAILURE_PHASES: readonly string[] = Object.freeze([
   'preflight',
   'prepared',
   'member_ready',
@@ -50,11 +55,8 @@ const OPERATION_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,95}$/
  * - `error`：输入与权限（非法参数/角色）。
  * - `blocked`：接入与派发前置，以及未触及宿主的收口校验拒绝 —— 无新成员/任务/正式路线变更。
  * - `partial`：交付与恢复阶段的失败 —— 副作用可能已发生。
- *
- * @param {string} code 稳定错误码
- * @returns {'error' | 'blocked' | 'partial'}
  */
-export function defaultStatusFor(code) {
+export function defaultStatusFor(code: string): FailureStatus {
   switch (code) {
     case 'INVALID_ARGUMENT':
     case 'ROLE_REQUIRED':
@@ -92,7 +94,7 @@ export function defaultStatusFor(code) {
   }
 }
 
-function nonEmpty(text) {
+function nonEmpty(text: unknown): text is string {
   return typeof text === 'string' && text.trim().length > 0
 }
 
@@ -101,13 +103,8 @@ function nonEmpty(text) {
  *
  * 注意：`$defs.diagnostic` 的 `code` 是任意非空文本，不是 `errorCode` 枚举 ——
  * `ok` 信封里记录审计失败等旁路问题时可以用非稳定码（例如 `AUDIT_WRITE_FAILED`）。
- *
- * @param {string} code
- * @param {string} reason 具体对象与原因
- * @param {string} nextStep 具体下一步
- * @returns {{ code: string, reason: string, next_step: string }}
  */
-export function diagnostic(code, reason, nextStep) {
+export function diagnostic(code: string, reason: string, nextStep: string): Diagnostic {
   if (!nonEmpty(code)) throw new ContractError({ code: 'INVALID_ARGUMENT', message: '诊断缺少 code' })
   if (!nonEmpty(reason)) throw new ContractError({ code: 'INVALID_ARGUMENT', message: '诊断缺少 reason（原因）' })
   if (!nonEmpty(nextStep)) {
@@ -116,7 +113,7 @@ export function diagnostic(code, reason, nextStep) {
   return { code, reason, next_step: nextStep }
 }
 
-function normalizeOperationId(operationId) {
+function normalizeOperationId(operationId: unknown): string | null {
   if (operationId === null || operationId === undefined) return null
   if (typeof operationId === 'string' && OPERATION_ID_PATTERN.test(operationId)) return operationId
   throw new ContractError({
@@ -126,23 +123,37 @@ function normalizeOperationId(operationId) {
   })
 }
 
-function assertFailureData(data) {
+function assertFailureData(data: unknown): object | null {
   if (data === null || data === undefined) return null
   if (typeof data !== 'object' || Array.isArray(data)) {
     throw new ContractError({ code: 'INVALID_ARGUMENT', message: '非 ok 信封的 data 只能是对象或 null' })
   }
-  if (Object.hasOwn(data, 'phase') && !FAILURE_PHASES.includes(data.phase)) {
+  // 上一行已排除 null 与数组：这里按记录读单个字段是安全的，不做属性之外的假设。
+  const record = data as Record<string, unknown>
+  const phase = record.phase
+  if (Object.hasOwn(record, 'phase') && !(typeof phase === 'string' && FAILURE_PHASES.includes(phase))) {
     throw new ContractError({
       code: 'INVALID_ARGUMENT',
-      message: `data.phase 不在契约枚举内: ${JSON.stringify(data.phase)}`,
+      message: `data.phase 不在契约枚举内: ${JSON.stringify(phase)}`,
       nextStep: `phase 只能取 ${FAILURE_PHASES.join('|')}`,
     })
   }
   return data
 }
 
+/** `assemble` 的入参。 */
+interface AssembleInput {
+  code: string | null
+  operationId: unknown
+  replayed: boolean | undefined
+  retryable: boolean | undefined
+  diagnostics: Diagnostic[]
+  data: object | null
+}
+
 /** 组装最终信封；字段顺序固定，便于人读与 diff。 */
-function assemble(status, { code, operationId, replayed, retryable, diagnostics, data }) {
+function assemble(status: ResultStatus, input: AssembleInput): Envelope {
+  const { code, operationId, replayed, retryable, diagnostics, data } = input
   return {
     schema_version: SCHEMA_VERSION,
     status,
@@ -155,17 +166,17 @@ function assemble(status, { code, operationId, replayed, retryable, diagnostics,
   }
 }
 
-/**
- * `status=ok` 信封。
- * @param {{
- *   operationId?: string | null,
- *   data: object,
- *   diagnostics?: Array<{ code: string, reason: string, next_step: string }>,
- *   replayed?: boolean,
- *   retryable?: boolean,
- * }} options
- */
-export function ok(options = {}) {
+/** `ok()` 的入参：`data` 由运行期检查保证是对象，故这里先收 `unknown`。 */
+export interface OkOptions {
+  operationId?: unknown
+  data?: unknown
+  diagnostics?: readonly Diagnostic[]
+  replayed?: boolean
+  retryable?: boolean
+}
+
+/** `ok` 信封。 */
+export function ok(options: OkOptions = {}): Envelope {
   const { operationId = null, data, diagnostics = [], replayed = false, retryable = false } = options
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
     throw new ContractError({
@@ -184,8 +195,20 @@ export function ok(options = {}) {
   })
 }
 
+/** 三种非 ok 态的公共入参。 */
+export interface FailOptions {
+  code?: unknown
+  operationId?: unknown
+  reason?: unknown
+  nextStep?: unknown
+  diagnostics?: readonly Diagnostic[]
+  data?: unknown
+  replayed?: boolean
+  retryable?: boolean
+}
+
 /** 三种非 ok 态的公共构造。 */
-function fail(status, options = {}) {
+function fail(status: ResultStatus, options: FailOptions = {}): Envelope {
   const {
     code,
     operationId = null,
@@ -226,42 +249,43 @@ function fail(status, options = {}) {
   })
 }
 
-/**
- * `status=blocked`：前置拒绝，无新成员/任务/正式路线变更。
- * @param {object} options
- */
-export function blocked(options = {}) {
+/** `status=blocked`：前置拒绝，无新成员/任务/正式路线变更。 */
+export function blocked(options: FailOptions = {}): Envelope {
   return fail('blocked', options)
 }
 
-/**
- * `status=partial`：副作用可能已发生，`data` 应带已知的 dispatch/task/member/阶段。
- * @param {object} options
- */
-export function partial(options = {}) {
+/** `status=partial`：副作用可能已发生，`data` 应带已知的 dispatch/task/member/阶段。 */
+export function partial(options: FailOptions = {}): Envelope {
   return fail('partial', options)
 }
 
-/**
- * `status=error`：非法参数/角色等调用方错误。
- * @param {object} options
- */
-export function error(options = {}) {
+/** `status=error`：非法参数/角色等调用方错误。 */
+export function error(options: FailOptions = {}): Envelope {
   return fail('error', options)
 }
 
 const UNKNOWN_EXCEPTION_NEXT_STEP =
   '按诊断中的原始异常定位宿主/脚本问题后，以同一 operation ID 重入；不要重试未修复的同一请求'
 
-function describeThrown(thrown) {
+function describeThrown(thrown: unknown): string {
   if (thrown instanceof Error) return thrown.message || thrown.name || '未知异常'
   if (thrown === undefined) return '未知异常（抛出物为 undefined）'
   if (thrown === null) return '未知异常（抛出物为 null）'
   if (typeof thrown === 'object') {
-    const message = thrown.message
+    const message = recordOf(thrown).message
     return typeof message === 'string' && message ? message : JSON.stringify(thrown)
   }
   return String(thrown)
+}
+
+/** `fromError()` 的入参。 */
+export interface FromErrorOptions {
+  operationId?: unknown
+  code?: unknown
+  status?: ResultStatus
+  data?: unknown
+  retryable?: boolean
+  diagnostics?: readonly Diagnostic[]
 }
 
 /**
@@ -274,19 +298,8 @@ function describeThrown(thrown) {
  * 注意：`ContractError.details` 无法进入信封 —— `$defs.diagnostic` 只有三个字段且
  * `additionalProperties=false`。需要机器消费的细节请放进 `options.data`（failureData 形状），
  * 需要人读的具体对象请写进 `message`。
- *
- * @param {unknown} thrown
- * @param {{
- *   operationId?: string | null,
- *   code?: string,
- *   status?: 'error' | 'blocked' | 'partial',
- *   data?: object | null,
- *   retryable?: boolean,
- *   diagnostics?: Array<{ code: string, reason: string, next_step: string }>,
- * }} [options]
- * @returns {object} result 信封
  */
-export function fromError(thrown, options = {}) {
+export function fromError(thrown: unknown, options: FromErrorOptions = {}): Envelope {
   const {
     operationId = null,
     code: codeOverride,
@@ -301,9 +314,8 @@ export function fromError(thrown, options = {}) {
   // 调用方可能传错码；兜底成已登记码，保证 fromError 本身绝不抛。
   const code = isErrorCode(requested) ? requested : 'RECOVERY_REQUIRED'
 
-  let status =
-    statusOverride ??
-    (isContract && thrown.status ? thrown.status : isContract ? defaultStatusFor(code) : 'error')
+  let status: ResultStatus =
+    statusOverride ?? (isContract && thrown.status ? thrown.status : isContract ? defaultStatusFor(code) : 'error')
   if (!RESULT_STATUSES.includes(status) || status === 'ok') status = 'error'
 
   const reason = isContract ? thrown.message : `未捕获异常：${describeThrown(thrown)}`

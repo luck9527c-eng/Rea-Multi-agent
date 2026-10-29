@@ -18,7 +18,7 @@ import { createReadStream } from 'node:fs'
 import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-import { ContractError } from './errors.mjs'
+import { ContractError } from './errors.js'
 
 function conflict(message, nextStep, details) {
   return new ContractError({ code: 'OPERATION_CONFLICT', message, nextStep, details })

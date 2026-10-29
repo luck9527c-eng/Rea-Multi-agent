@@ -24,8 +24,8 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError } from './errors.mjs'
-import * as defaultPaths from './paths.mjs'
+import { ContractError } from './errors.js'
+import * as defaultPaths from './paths.js'
 
 /** 不可变契约目录。 */
 export const DISPATCHES_DIR = 're/team/dispatches'

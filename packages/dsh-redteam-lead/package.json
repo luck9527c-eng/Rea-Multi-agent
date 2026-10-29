@@ -5,13 +5,13 @@
   "type": "module",
   "description": "红队指挥（redteam-lead）preset + rt_roster/rt_dispatch/rt_conclude 工具面 + 只读 doctor：零运行时依赖、纯 ESM、不 import 任何 @deepseek-ai 包。",
   "exports": {
-    ".": "./index.js",
+    ".": "./dist/index.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
+  "main": "./dist/index.js",
   "files": [
-    "index.js",
-    "src",
+    "dist",
     "bin",
     "cordis.patch.yml",
     "locale",

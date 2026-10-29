@@ -28,44 +28,44 @@ import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // —— 内核（T1）：信封、错误码、校验、路径、原子写、锁、身份、操作台账、审计 ——
-import * as envelope from './src/envelope.mjs'
-import * as errors from './src/errors.mjs'
-import * as validate from './src/validate.mjs'
-import * as paths from './src/paths.mjs'
-import * as atomic from './src/atomic.mjs'
-import * as lock from './src/lock.mjs'
-import * as identity from './src/identity.mjs'
-import * as operation from './src/operation.mjs'
-import * as audit from './src/audit.mjs'
+import * as envelope from './envelope.js'
+import * as errors from './errors.js'
+import * as validate from './validate.js'
+import * as paths from './paths.js'
+import * as atomic from './atomic.js'
+import * as lock from './lock.js'
+import * as identity from './identity.js'
+import * as operation from './operation.js'
+import * as audit from './audit.js'
 
 // —— 岗位目录 / 能力 / 预算（T3）——
-import * as catalog from './src/catalog.mjs'
-import * as capability from './src/capability.mjs'
-import * as capacity from './src/capacity.mjs'
+import * as catalog from './catalog.js'
+import * as capability from './capability.js'
+import * as capacity from './capacity.js'
 
 // —— 项目/会话记录（T5–T7）：绑定、派发契约、资源、提交、锚点、基准 ——
 // 这六个都是**纯模块命名空间**（SEAMS §1 的第一种形状），由 handler 直接调用其导出函数。
-import * as binding from './src/binding.mjs'
-import * as contract from './src/contract.mjs'
-import * as resources from './src/resources.mjs'
-import * as submission from './src/submission.mjs'
-import * as anchors from './src/anchors.mjs'
-import * as baseline from './src/baseline.mjs'
+import * as binding from './binding.js'
+import * as contract from './contract.js'
+import * as resources from './resources.js'
+import * as submission from './submission.js'
+import * as anchors from './anchors.js'
+import * as baseline from './baseline.js'
 
 // —— 适配器（T4）：团队服务、项目 skill CLI、兼容性摘要 ——
-import { createTeamAdapter } from './src/team-adapter.mjs'
-import { createProjectAdapter } from './src/project-adapter.mjs'
-import * as compatibility from './src/compatibility.mjs'
+import { createTeamAdapter } from './team-adapter.js'
+import { createProjectAdapter } from './project-adapter.js'
+import * as compatibility from './compatibility.js'
 
 // —— 本包的 handler（T5/T6/T7 整体替换这三个文件，不改本文件）——
-import { handleRoster } from './src/roster.mjs'
-import { handleDispatch } from './src/dispatch.mjs'
-import { handleConclude } from './src/conclude.mjs'
+import { handleRoster } from './roster.js'
+import { handleDispatch } from './dispatch.js'
+import { handleConclude } from './conclude.js'
 
 // —— 包内 schema 副本（与 docs/specs/rt-tools.schema.json 有漂移测试）——
 // `*Parameters` 是展开 `$ref` 后的自包含入参 schema；`resultOutput` 是宿主支持子集里的
 // `$defs.result` 投影（`assertSupportedJsonSchema` 不认 `$ref`/`allOf`/类型数组）。
-import { schemaDefs, rosterParameters, dispatchParameters, concludeParameters, resultOutput } from './src/tool-schema.mjs'
+import { schemaDefs, rosterParameters, dispatchParameters, concludeParameters, resultOutput } from './tool-schema.js'
 
 /** 插件名（插件清单/日志用）。 */
 export const name = 'redteam-lead-tools'
@@ -76,8 +76,8 @@ export const name = 'redteam-lead-tools'
  */
 export const inject = ['tools']
 
-/** 本包根目录（doctor 入口与 `config.bundleRoot` 共用）。 */
-const BUNDLE_ROOT = dirname(fileURLToPath(import.meta.url))
+/** 本包根目录（doctor 入口与 `config.bundleRoot` 共用；`dist/` 的上一级就是包根）。 */
+const BUNDLE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 
 /** `config.presetId`：本包只服务这一个 preset。 */
 const PRESET_ID = 'redteam-lead'

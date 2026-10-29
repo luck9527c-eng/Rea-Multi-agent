@@ -32,7 +32,7 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError } from './errors.mjs'
+import { ContractError } from './errors.js'
 
 /** 项目内资源记录路径（统一 `/`）。 */
 export const RESOURCES_PATH = 're/team/resources.json'

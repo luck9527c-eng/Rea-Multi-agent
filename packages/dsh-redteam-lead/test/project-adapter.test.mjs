@@ -7,9 +7,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { createProjectAdapter } from '../src/project-adapter.mjs';
+import { createProjectAdapter } from '../dist/project-adapter.js';
 
-const ADAPTER_SOURCE = readFileSync(new URL('../src/project-adapter.mjs', import.meta.url), 'utf8');
+const ADAPTER_SOURCE = readFileSync(new URL('../src/project-adapter.ts', import.meta.url), 'utf8');
 const SKILL_ROOT = '.agents/skills/reverse-project-management';
 const PYTHON = 'C:/Python312/python.exe';
 

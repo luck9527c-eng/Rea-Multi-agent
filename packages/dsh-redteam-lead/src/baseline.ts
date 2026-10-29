@@ -17,9 +17,9 @@
 import { isAbsolute } from 'node:path'
 import * as fsp from 'node:fs/promises'
 
-import * as atomicModule from './atomic.mjs'
-import * as defaultPaths from './paths.mjs'
-import { isProjectRelative } from './paths.mjs'
+import * as atomicModule from './atomic.js'
+import * as defaultPaths from './paths.js'
+import { isProjectRelative } from './paths.js'
 
 /** 基准快照目录（本插件所有，见 SEAMS §7）。 */
 export const BASELINE_DIR = 're/team/baselines'

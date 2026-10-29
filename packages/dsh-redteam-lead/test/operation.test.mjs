@@ -3,14 +3,14 @@ import assert from 'node:assert/strict'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { ContractError } from '../src/errors.mjs'
-import { ok } from '../src/envelope.mjs'
+import { ContractError } from '../dist/errors.js'
+import { ok } from '../dist/envelope.js'
 import {
   OPERATION_PHASES,
   OPERATIONS_DIR,
   createOperationLedger,
   operationRecordPath,
-} from '../src/operation.mjs'
+} from '../dist/operation.js'
 import { makeTempProject } from './helpers/tmp.mjs'
 
 const HASH_A = 'a'.repeat(64)
