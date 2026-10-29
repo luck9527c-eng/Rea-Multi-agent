@@ -306,7 +306,7 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 归档失败、epoch 竞争、旧 epoch 提议失效这三条路径），否则是拿行为风险换行数。本次修复 pass 不做，记录在此：
 下次动 `roster.ts` 时优先处理。
 
-## D37 — 已知缺口：已封存产物被篡改时，**本包自己的 baseline 比对抓不到**
+## D37 — 已封存产物被篡改时，**本包自己的 baseline 比对抓不到**（原为已知缺口，**T17 已实现**）
 
 > 来源：L3 第三轮（失败构造）实测 + 事后核对代码。原始证据见
 > `docs/verify/records/20261029-session-040cb6df.md` §4.8 / §9.2。
@@ -319,7 +319,7 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 对不上（`r2-s6c-rt_conclude.txt`：「产物缺失或哈希不符…文件哈希与预期不一致」），根本走不到 baseline 比对，
 更走不到最后的 `check --hashes`。这是**更早**的失败，属可接受的 fail-fast。
 
-### 代码事实（这才是缺口所在）
+### 代码事实（T17 之前的状态，保留为出处）
 
 1. `src/dispatch.ts:1744-1760`：真实派发路径的 `captureBaseline({ targetIds, … })` **从不传 `artifacts`**，
    所以 `re/team/baselines/<D>.json` 的 `artifacts` 恒为 `[]`。L3 回执对得上：
@@ -333,7 +333,7 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 （实测 `r2-s6c-precheck-after-tamper.txt`：`ERROR: RUN-L3-001: artifact/script hash mismatch: …`，退出码 1），
 而那时**路线文件已回写、INDEX 已刷新、封存已复用**，失败会是 `partial`（带已落盘的副作用）而不是前置拒绝。
 
-### 裁决：本次不实现，按 `not-run` 缺口记录
+### 当时的裁决：本次不实现，按 `not-run` 缺口记录
 
 加"对已封存 RUN 的产物重算哈希"不是一行判断，而是给 `baseline` 引入新的语义（要覆盖:既有 seal 只校验复用的
 路径、大项目全量哈希的成本、以及"产物在 seal 之后被合法补正"的处置），必须配自己的失败注入测试。塞进一个
@@ -342,8 +342,28 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 **这条缺口没有自动化用例覆盖，也不该写一条"断言我们抓不到"的用例把它固化。** 已在
 `docs/verify/acceptance-status.md` 的「矩阵外的已知缺口」里登记为 `G3`，并已转成
 [`tickets/T17-baseline-artifacts.md`](tickets/T17-baseline-artifacts.md)（Lead 复核后立项：派发侧真的冻结
-依赖产物身份 + 收口侧在写盘之前比对）。T17 落地时这条 D37 应随之改成"已实现"，并由 T17 补它自己那条
-"`SUBMISSION_INVALID`（提交自报的产物变了）vs `BASELINE_MISMATCH`（依赖的既有证据变了）"的区分记录。
+依赖产物身份 + 收口侧在写盘之前比对）。
+
+### 落地：T17（本条缺口已实现）
+
+1. **派发侧真的冻结依赖产物**（`src/dispatch.ts` 的 `dependentArtifacts()` / `dependedSealedRunIds()`）：
+   对本次派发**依赖的既有已封存 RUN**，把它们 `run.json` 里声明的每个 `{path, sha256}` 冻进
+   `re/team/baselines/<D>.json` 的 `artifacts`。「依赖」只从**本路线**取：
+   `route.dependency_runs`（插件扩展）∪ `route.evidence`（skill 字段）∪ 本路线在本次目标上已封存的 RUN
+   （「目标已有 seal」背后的既有证据）。只冻**已封存**的（未封存产物仍可合法补正），
+   **不扫别的路线的 RUN** —— 契约要求「其他路线正常新增 seal 不使旧快照失效」。首次目标无任何已封存 RUN 时
+   `artifacts: []` 仍是正确值。读不到 seal 清单、或路线声明的依赖 RUN 已封存却读不到 / 产物登记残缺 →
+   派发 fail-closed（`RECOVERY_REQUIRED`），不能假装「没有依赖产物」。
+2. **收口侧在写盘之前比对**（`src/conclude.ts`）：`loadBaseline()` + `compareBaseline()` 从「归档之后」
+   前移到**归档之前**（基准比对成为步骤 4，归档成为步骤 5，seal 成为步骤 6）。篡改被依赖的已封存产物因此
+   得到 `BASELINE_MISMATCH` + `status=blocked`，且**零写盘**：路线未回写、INDEX 未刷新、任务未完成、
+   回执目录都没产生。L3 那种「跑到最后 `check --hashes` 才发现、项目停在半整合状态」的路径不再存在。
+   `preexisting_seals` 仍然只比 seal 文件自身的 `path`+`sha256`（那部分语义没变）。
+3. **用例**：`test/baseline-artifacts.test.mjs` 三条（冻结了什么/没冻什么、篡改 → 写盘前 `BASELINE_MISMATCH`
+   且零写盘、别的路线新增 seal 不误伤）；`test/conclude.test.mjs` 的 `BASELINE_MISMATCH` 与
+   `RECOVERY_REQUIRED`（快照读不到）用例改为断言「写盘前拒绝」的 `blocked`。
+4. `docs/verify/acceptance-status.md` 的 `G3` 行由验收总表维护者回填（`pass` + 指向
+   `test/baseline-artifacts.test.mjs`）；T17 只改实现、测试与本文件。
 
 ## D38 — `checks/check-hashes.json` 的 `audit_pending: true` 是**预期行为**
 
@@ -363,3 +383,24 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 判定：任何时候看到 `check-hashes` 的 `audit_pending: true` 且 `exit_code: 0`，都按预期行为处理；只有
 `audit_written: false` 才是需要报告的异常（那条路径 L1 有覆盖：`audit.test.mjs` /
 `conclude.test.mjs`「审计写失败 → ok + audit_written=false 且有诊断」）。
+
+## D39 — 两个「内容变了」的码不是一回事：`SUBMISSION_INVALID` vs `BASELINE_MISMATCH`
+
+> 来源：D37 的 L3 实测（`session-040cb6df`，`r2-s6c-rt_conclude.txt`）+ T17 补全后的收口序列。
+
+| | `SUBMISSION_INVALID` | `BASELINE_MISMATCH` |
+|---|---|---|
+| 抓的是 | **本次提交自报**的产物：`submission.artifacts` 的 path 缺失 / 哈希不符，或该 path 未在该 RUN 的 `artifacts` 里登记 | **派发时依赖的既有证据**：快照里的目标字节、既有 seal 的 `path`+`sha256`、**所依赖既有已封存 RUN 的产物字节** |
+| 期望值来源 | 提交自己声明的 `sha256` / RUN 登记的正式位置 | 派发时冻结的快照（`re/team/baselines/<D>.json`） |
+| 触发点 | 步骤 2（提交文件自身哈希、交叉核对与形状）与步骤 5 的归档复核（`verifyFileHash`） | **步骤 4**（`archiveAttempt()` 之前） |
+| 语义 | 「你交回来的东西不是你说的那份」 | 「你动手之前依据的那份证据被改了」 |
+
+两者都是拒绝，但**码不同、触发点不同，不能互相替代**：
+
+- 篡改一个**在本提交里**的产物 → `SUBMISSION_INVALID`（更早的 fail-fast；这就是 L3 第 6c 步观察到的那个码，
+  当时根本没走到 baseline 比对）；
+- 篡改一个**不在本提交里、但被本次派发依赖**的已封存产物 → 只有 `BASELINE_MISMATCH` 能发现，由 T17 的
+  `baseline.artifacts` 负责，且现在已经排到归档之前。
+
+回归时若看到「篡改依赖产物却报 `SUBMISSION_INVALID`」，说明快照里的 `artifacts` 又空了（回到 D37 的缺口），
+或者被篡改的文件恰好也在本次提交的 `artifacts` 里（合法的更早 fail-fast）。
