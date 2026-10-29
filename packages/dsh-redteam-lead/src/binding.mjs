@@ -53,7 +53,7 @@ const RECOVERY_SIGNALS = Object.freeze([
   {
     code: 'RECOVERY_RISK_MISSING',
     label: '剩余风险与限制',
-    pattern: /风险|残留|限制|遗留|risk|residual|limitation/iu,
+    pattern: /风险|残留|限制|risk|residual|limitation/iu,
   },
 ])
 
