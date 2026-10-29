@@ -1034,7 +1034,7 @@ async function runRoster(ctx, deps, input, env) {
     return { envelope: env.ok({ operationId: null, data, retryable: false }), root, audit }
   }
 
-  const shared = { env, root, projectId, session, request, proposal, data, audit, deps, projectRoot: root }
+  const shared = { env, root, projectId, session, request, proposal, data, audit, deps }
   if (action === 'bind') return bindProject(ctx, shared)
   return takeoverProject(ctx, shared)
 }
@@ -1083,6 +1083,7 @@ async function bindProject(ctx, shared) {
   }
 
   // 幂等重放：同一 operation_id 已有结果 → 原样返回（不重复追加历史/审计）。
+  // 但**同一 ID 改了输入**必须报 OPERATION_CONFLICT（契约「操作阶段与部分失败」）。
   if (ledger !== null) {
     const recorded = await ledger.findById(operationId)
     if (recorded !== null) {
@@ -1093,6 +1094,31 @@ async function bindProject(ctx, shared) {
             code: 'PROJECT_SESSION_MISMATCH',
             operationId,
             diagnostics: [env.diagnostic('PROJECT_SESSION_MISMATCH', mismatch, '跨会话接管请用 action=takeover，并换用新的 operation_id')],
+          }),
+          root,
+          audit,
+        }
+      }
+      const recordedEpoch = Number.isSafeInteger(recorded.data?.input_epoch)
+        ? recorded.data.input_epoch
+        : null
+      const expected = operationInputHash(deps, request.raw, {
+        action: 'bind',
+        root,
+        session,
+        epoch: recordedEpoch,
+      })
+      if (expected !== null && recorded.input_hash !== expected) {
+        return {
+          envelope: env.blocked({
+            code: 'OPERATION_CONFLICT',
+            operationId,
+            data: { ...data, binding_ref: null },
+            diagnostics: [env.diagnostic(
+              'OPERATION_CONFLICT',
+              `同一 operation_id 的输入已改变（已存 input_hash=${String(recorded.input_hash)}）`,
+              '同一 ID 必须保持原输入与提案；换了提议（新的 proposal_hash/target_kinds/预算）请用新的 operation_id',
+            )],
           }),
           root,
           audit,
@@ -1206,6 +1232,7 @@ async function bindProject(ctx, shared) {
           session_id: session.session_id,
           team_id: session.team_id,
           epoch: existing?.binding?.epoch ?? null,
+          input_epoch: existing?.binding?.epoch ?? null,
           proposal_hash: proposal.proposalHash,
         })
       }
@@ -1356,23 +1383,9 @@ async function takeoverProject(ctx, shared) {
   }
 
   const oldEpoch = Number.isSafeInteger(existing.binding.epoch) ? existing.binding.epoch : 1
-  if (request.proposalHash !== proposal.proposalHash) {
-    return {
-      envelope: env.blocked({
-        code: 'OPERATION_CONFLICT',
-        operationId,
-        data: { ...data, binding_ref: null },
-        diagnostics: [env.diagnostic(
-          'OPERATION_CONFLICT',
-          `proposal_hash 与当前目录/能力映射/预算/绑定不符（接管前必须针对 epoch=${oldEpoch} 的绑定重新 inspect）`,
-          NEXT_STEP_REPROPOSE,
-        )],
-      }),
-      root,
-      audit,
-    }
-  }
 
+  // 幂等重放先于「提议是否过期」检查：接管已经改过 epoch，同一请求的重放不能被误判成冲突
+  // （契约「操作阶段与部分失败」）。同一 ID 改了输入仍在下面报 OPERATION_CONFLICT。
   const ledger = await ledgerFor(deps, root)
   if (ledger !== null) {
     const recorded = await ledger.findById(operationId)
@@ -1389,8 +1402,50 @@ async function takeoverProject(ctx, shared) {
           audit,
         }
       }
+      const recordedEpoch = Number.isSafeInteger(recorded.data?.input_epoch)
+        ? recorded.data.input_epoch
+        : null
+      const expected = operationInputHash(deps, request.raw, {
+        action: 'takeover',
+        root,
+        session,
+        epoch: recordedEpoch,
+      })
+      if (expected !== null && recorded.input_hash !== expected) {
+        return {
+          envelope: env.blocked({
+            code: 'OPERATION_CONFLICT',
+            operationId,
+            data: { ...data, binding_ref: null },
+            diagnostics: [env.diagnostic(
+              'OPERATION_CONFLICT',
+              `同一 operation_id 的输入已改变（已存 input_hash=${String(recorded.input_hash)}）`,
+              '同一 ID 必须保持原输入与提案；换了 recovery_ref/提议请用新的 operation_id',
+            )],
+          }),
+          root,
+          audit,
+        }
+      }
       const replay = await ledger.replayResult(operationId)
       if (replay !== null) return { envelope: replay, root, audit: null }
+    }
+  }
+
+  if (request.proposalHash !== proposal.proposalHash) {
+    return {
+      envelope: env.blocked({
+        code: 'OPERATION_CONFLICT',
+        operationId,
+        data: { ...data, binding_ref: null },
+        diagnostics: [env.diagnostic(
+          'OPERATION_CONFLICT',
+          `proposal_hash 与当前目录/能力映射/预算/绑定不符（接管前必须针对 epoch=${oldEpoch} 的绑定重新 inspect）`,
+          NEXT_STEP_REPROPOSE,
+        )],
+      }),
+      root,
+      audit,
     }
   }
 
@@ -1435,6 +1490,7 @@ async function takeoverProject(ctx, shared) {
           session_id: session.session_id,
           team_id: session.team_id,
           epoch: oldEpoch,
+          input_epoch: oldEpoch,
           recovery_ref: request.recoveryRef,
           proposal_hash: proposal.proposalHash,
         })

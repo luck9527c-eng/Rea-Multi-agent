@@ -426,6 +426,33 @@ test('bind 重放同一 operation_id：返回原结果 replayed=true，不重复
   assert.equal(audit.length, auditAfterBind.length, '重放不得追加第二条审计')
 })
 
+test('同一 operation_id 换了提议内容 → OPERATION_CONFLICT，不假装重放', async (t) => {
+  const project = makeTempProject({ t })
+  const ctx = leadCtx(t, project)
+
+  const binary = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  const first = await handleRoster(ctx, input(project.root, {
+    action: 'bind',
+    target_kinds: ['binary'],
+    operation_id: 'op-bind-same-id',
+    proposal_hash: binary.envelope.data.proposal_hash,
+  }))
+  assert.equal(first.envelope.status, 'ok')
+
+  const game = await handleRoster(ctx, input(project.root, { target_kinds: ['game'] }))
+  const second = await handleRoster(ctx, input(project.root, {
+    action: 'bind',
+    target_kinds: ['game'],
+    operation_id: 'op-bind-same-id',
+    proposal_hash: game.envelope.data.proposal_hash,
+  }))
+
+  assert.equal(second.envelope.status, 'blocked')
+  assert.equal(second.envelope.code, 'OPERATION_CONFLICT')
+  assert.notEqual(second.envelope.replayed, true)
+  assert.equal((await readJson(project.root, 're/team/binding.json')).template_id, 'binary')
+})
+
 test('bind 拒绝篡改/过期的 proposal_hash，并且不写盘', async (t) => {
   const project = makeTempProject({ t })
   const ctx = leadCtx(t, project)
@@ -802,6 +829,42 @@ test('没有项目适配器时兼容性是 unknown：inspect 给缺口，bind �
   assert.equal(envelope.status, 'blocked')
   assert.equal(envelope.code, 'SKILL_INCOMPATIBLE')
   await assert.rejects(readFile(path.join(project.root, 're', 'team', 'binding.json')))
+})
+
+test('takeover 重放同一 operation_id：返回原结果且不再换 epoch；改 recovery_ref 则冲突', async (t) => {
+  const project = makeTempProject({ t })
+  const ctx = await bindFresh(t, project)
+  project.write('re/team/recovery/a.md', GOOD_RECOVERY)
+  project.write('re/team/recovery/b.md', GOOD_RECOVERY)
+
+  const inspected = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  const request = input(project.root, {
+    action: 'takeover',
+    target_kinds: ['binary'],
+    operation_id: 'op-takeover-replay',
+    proposal_hash: inspected.envelope.data.proposal_hash,
+    recovery_ref: 're/team/recovery/a.md',
+  })
+
+  const first = await handleRoster(ctx, request)
+  assert.equal(first.envelope.status, 'ok', JSON.stringify(first.envelope.diagnostics))
+  const auditAfter = (await readText(project.root, 're/team/audit.jsonl')).trim().split('\n').length
+
+  const second = await handleRoster(ctx, request)
+  assert.equal(second.envelope.status, 'ok')
+  assert.equal(second.envelope.replayed, true)
+  assert.deepEqual(second.envelope.data, first.envelope.data)
+  assert.equal((await readJson(project.root, 're/team/binding.json')).epoch, 2, '重放不得再增 epoch')
+  await assert.rejects(readdir(path.join(project.root, 're', 'team', 'history', 'epoch-2')))
+  assert.equal((await readText(project.root, 're/team/audit.jsonl')).trim().split('\n').length, auditAfter)
+
+  const changed = await handleRoster(ctx, input(project.root, {
+    ...request,
+    recovery_ref: 're/team/recovery/b.md',
+  }))
+  assert.equal(changed.envelope.status, 'blocked')
+  assert.equal(changed.envelope.code, 'OPERATION_CONFLICT')
+  assert.equal((await readJson(project.root, 're/team/binding.json')).epoch, 2)
 })
 
 test('takeover 成功：epoch+1、旧 binding/roster 归档、dispatch 与事实层保留', async (t) => {
