@@ -6,15 +6,17 @@
  * 1. **身份只来自 `deps.identity.resolveCaller(ctx)`**：入参自报的 `role` 一律忽略。
  *    inspect 允许 Lead 与真实 teammate；bind/takeover 仅 Lead（D4：宿主工具层不做角色检查，
  *    本包必须自己做）。
- * 2. **inspect 零副作用**：不建成员、不建任务、不写 binding/roster；只允许 best-effort 审计。
+ * 2. **inspect 零副作用**：不建成员、不建任务、不写 binding/roster，**也不写审计**
+ *    （编排契约「roster inspect 不落盘」；审计只属于 bind/takeover 这类有后果的操作）。
  * 3. **容量口径照 DECISIONS D25**：上限未声明（`activations.known === false`）→ 传 `null` 让
  *    `planBudget` 延后 + `CAPACITY_UNKNOWN`；上限已声明 → 传**声明上限**（不是不可观测的占用），
  *    并把 `cap.gaps` 原样并入 `gaps` 作非阻塞诊断。`rosterData.capacity` 只投影 schema 的 4 个
  *    字段，未知用 `null`，`known` 不上线（D19）。
  *
- * 提议哈希（`proposal_hash`）绑定：提议内容（岗位需求 + 目标类别 + 预算参数）、岗位目录版本、
- * 能力映射版本、规则/脚本/目录摘要、以及**当前绑定**（epoch/session/team/摘要）。宿主计数
- * **不进**哈希 —— bind 在项目锁内重读计数，资源不足时要求重新提议（不能沿旧快照超配）。
+ * 提议哈希（`proposal_hash`）绑定：提议内容（岗位需求 + 目标类别 + 预算参数 + **已解析的容量声明**
+ * `maxMembers`/`maxActiveSubagents`）、岗位目录版本、能力映射版本、规则/脚本/目录摘要、以及
+ * **当前绑定**（epoch/session/team/摘要）。宿主**占用计数**（`used`/`remaining`）**不进**哈希 ——
+ * bind 在项目锁内重读计数，资源不足时要求重新提议（不能沿旧快照超配）。
  */
 import { createHash } from 'node:crypto'
 
@@ -22,6 +24,7 @@ import * as envelopeModule from './envelope.js'
 import * as bindingModule from './binding.js'
 import type { SessionMatchResult } from './binding.js'
 import type { ActivationSlots, CapacityGap, MemberSlots } from './team-adapter.js'
+import { toolNamesFromSchemas } from './capability.js'
 import { isRecord, recordOf, thrownMessage } from './guards.js'
 import type { Deps, Diagnostic, Envelope, HandlerCtx, HandlerResult } from './types.js'
 
@@ -260,6 +263,11 @@ type ToolsReport =
  *
  * 别的 agent 作用域里可见不算本执行者能调用；宿主不提供注册表时 `available:false`，
  * 由调用方降级成「未核对」的明确缺口，绝不假装已核对。
+ *
+ * `schemas()` 的返回值形状由 `capability.toolNamesFromSchemas()` 一处解析（宿主真实形状是
+ * **schema 对象数组**，名字在元素的 `.name` 上 —— 曾按「名字为键的对象」读，数组下标被当成
+ * 工具名，真会话里所有岗位都判 `vacant`，见 T15）。这里只判断「容器认不认得出」：
+ * 认不出（`null`/字符串/数字…）→ 未核对；认得出但零个可见工具 → 真的零个工具。
  */
 function toolsFor(ctx: unknown): ToolsReport {
   const holder = recordOf(ctx)
@@ -282,11 +290,13 @@ function toolsFor(ctx: unknown): ToolsReport {
       reason: `工具注册表查询失败：${error instanceof Error ? error.message : String(error)}`,
     }
   }
-  if (!schemas || typeof schemas !== 'object' || Array.isArray(schemas)) {
+  // `isRecord` 收数组（数组也是对象），所以这里只挡「根本不是对象」的返回值；
+  // 旧实现把数组本身当成不可用，正是 T15 的另一半错误。
+  if (!isRecord(schemas)) {
     return { available: false, names: [], reason: '工具注册表没有返回该执行者的 schema 映射' }
   }
   const names: string[] = []
-  for (const name of Object.keys(schemas).sort()) {
+  for (const name of toolNamesFromSchemas(schemas)) {
     if (typeof service.get === 'function') {
       let schema: unknown = null
       try {
@@ -480,6 +490,26 @@ function bindingStateOf(bindingFile: unknown) {
   }
 }
 
+/** 已解析的容量声明（只有上限，不含宿主占用计数）。进提议指纹。 */
+interface DeclaredBudget {
+  max_members: number | null
+  max_active_subagents: number | null
+}
+
+/**
+ * 从 `capacity()` 的结果里取**声明上限**。
+ *
+ * 只取 `total`（`declared.maxMembers` / `declared.maxActiveSubagents`）：`used`/`remaining`
+ * 是宿主计数，按契约在 bind 的锁内重读，不进哈希；`known` 混了「有没有声明」与
+ * 「数不数得到占用」，同样不进哈希（未声明 → `null` 已经表达清楚）。
+ */
+function declaredBudgetOf(cap: CapacityReport): DeclaredBudget {
+  return {
+    max_members: typeof cap.memberSlots.total === 'number' ? cap.memberSlots.total : null,
+    max_active_subagents: typeof cap.activations.total === 'number' ? cap.activations.total : null,
+  }
+}
+
 /** `proposalFingerprint()` 的入参（每个字段都只是被 JSON 化进哈希，故按未知收）。 */
 interface ProposalFingerprintInput {
   projectRoot: unknown
@@ -489,6 +519,7 @@ interface ProposalFingerprintInput {
   catalogVersion: unknown
   capabilityVersion: unknown
   budget: unknown
+  declaredBudget: unknown
   staticPosts: unknown
   digests: ProjectDigests
   bindingState: unknown
@@ -496,7 +527,14 @@ interface ProposalFingerprintInput {
 }
 
 /**
- * 提议指纹：确定性内容，不含宿主计数（计数在 bind 时于锁内重读）。
+ * 提议指纹：确定性内容，不含**宿主占用计数**（`used`/`remaining` 在 bind 时于锁内重读）。
+ *
+ * `declared_budget` 是**已解析的容量声明**（`maxMembers`/`maxActiveSubagents`），不是计数：
+ * 它决定 `planBudget()` 把哪些岗位判 `deferred`，因此属于「提议内容 + 预算」，必须进哈希 ——
+ * 否则容量声明在 inspect 之后被改动时，bind 会静默沿旧提议落盘（T15 的 L3 证据
+ * s2-rt_roster-capacity2.txt 与 capacity8 同 hash 就是这条漏项）。声明时间/声明人不进哈希：
+ * 同样的数字重新声明一次不算换了提议。
+ *
  * `proposal_hash = sha256(按键排序的 JSON(指纹))`。
  */
 function proposalFingerprint(input: ProposalFingerprintInput) {
@@ -510,6 +548,7 @@ function proposalFingerprint(input: ProposalFingerprintInput) {
     catalog: { version: input.catalogVersion, digest: input.digests.catalogDigest },
     capability: input.capabilityVersion,
     budget: input.budget,
+    declared_budget: input.declaredBudget,
     posts: input.staticPosts,
     digests: input.digests,
     binding: input.bindingState,
@@ -695,6 +734,7 @@ interface ProposalSuccess {
   recommendedMembers: unknown
   capabilityVersion?: CapabilityVersion
   budget?: ProposalBudget
+  declaredBudget?: DeclaredBudget
   digests?: ProjectDigests
   bindingFile?: unknown
   proposalHash: string | null
@@ -883,6 +923,7 @@ async function assembleProposal(
     reserved_member_slots: request.reservedMemberSlots,
     reserved_activations: request.reservedActivations,
   }
+  const declaredBudget = declaredBudgetOf(cap)
   const digests = compatibility?.digests ?? { ruleDigest: null, scriptDigest: null, catalogDigest: null }
   const proposalHash = proposalHashOf(deps, proposalFingerprint({
     projectRoot: root,
@@ -892,6 +933,7 @@ async function assembleProposal(
     catalogVersion: template.catalogVersion,
     capabilityVersion,
     budget,
+    declaredBudget,
     staticPosts: stablePosts([...template.composed.posts, ...template.composed.reserved_posts]),
     digests,
     bindingState: bindingStateOf(bindingFile),
@@ -910,6 +952,7 @@ async function assembleProposal(
     recommendedMembers: plan.recommended_members,
     capabilityVersion,
     budget,
+    declaredBudget,
     digests,
     bindingFile,
     proposalHash,
@@ -1066,10 +1109,11 @@ export async function handleRoster(ctx: HandlerCtx, rawInput: unknown): Promise<
   const env = deps.envelope
   const input: Record<string, unknown> = isRecord(rawInput) ? rawInput : {}
   const operationId = sanitizeOperationId(input.operation_id)
+  const action = isNonEmptyString(input.action) ? input.action : 'inspect'
 
   let outcome: RosterOutcome
   try {
-    outcome = await runRoster(ctx, deps, input, env)
+    outcome = await runRoster(ctx, deps, input, env, action)
   } catch (thrown) {
     outcome = {
       envelope: env.fromError(thrown, { operationId }),
@@ -1078,8 +1122,10 @@ export async function handleRoster(ctx: HandlerCtx, rawInput: unknown): Promise<
     }
   }
 
-  // 审计 best-effort：写失败不逆转判定，只在信封里补一条诊断（不回滚已写的记录）。
-  if (outcome.audit && outcome.root && outcome.envelope.replayed !== true) {
+  // 审计 best-effort，且**只属于有后果的操作**：编排契约写「roster inspect 不落盘」，
+  // 所以 inspect（成功与拒绝）都不写审计，bind/takeover 仍然写。写失败不逆转判定，
+  // 只在信封里补一条诊断（不回滚已写的记录）。
+  if (action !== 'inspect' && outcome.audit && outcome.root && outcome.envelope.replayed !== true) {
     const written = await appendRosterAudit(deps, outcome)
     if (written && written.written !== true) {
       outcome.envelope.diagnostics = [...outcome.envelope.diagnostics, env.diagnostic(
@@ -1112,9 +1158,17 @@ async function appendRosterAudit(deps: RosterDeps, outcome: RosterOutcome): Prom
 
 /**
  * 主流程。返回 `{envelope, root, audit}`；只有知道项目根之后才可能写审计。
+ *
+ * `action` 由 `handleRoster()` 解析后传入：那里要据此决定「这次调用到底该不该落盘审计」
+ * （inspect 不落盘），默认值与解析规则只在那一处。
  */
-async function runRoster(ctx: HandlerCtx, deps: RosterDeps, input: Record<string, unknown>, env: EnvelopeModule): Promise<RosterOutcome> {
-  const action = isNonEmptyString(input.action) ? input.action : 'inspect'
+async function runRoster(
+  ctx: HandlerCtx,
+  deps: RosterDeps,
+  input: Record<string, unknown>,
+  env: EnvelopeModule,
+  action: string,
+): Promise<RosterOutcome> {
   const operationId = sanitizeOperationId(input.operation_id)
   const kinds = stringList(input.target_kinds)
   const request: RosterRequest = {
@@ -1471,7 +1525,7 @@ async function bindProject(ctx: HandlerCtx, shared: SharedState): Promise<Roster
         data: { ...data, binding_ref: null },
         diagnostics: [env.diagnostic(
           'OPERATION_CONFLICT',
-          `proposal_hash 与当前目录/能力映射/预算/绑定不符（当前目录版本=${String(proposal.catalogVersion)}，能力映射 revision=${String(recordOf(proposal.capabilityVersion).revision)}，绑定 epoch=${String(existing?.binding?.epoch ?? 'none')}，预算 max_posts=${String(recordOf(proposal.budget).max_posts)}）`,
+          `proposal_hash 与当前目录/能力映射/预算/绑定不符（当前目录版本=${String(proposal.catalogVersion)}，能力映射 revision=${String(recordOf(proposal.capabilityVersion).revision)}，绑定 epoch=${String(existing?.binding?.epoch ?? 'none')}，预算 max_posts=${String(recordOf(proposal.budget).max_posts)}/maxMembers=${String(recordOf(proposal.declaredBudget).max_members)}/maxActiveSubagents=${String(recordOf(proposal.declaredBudget).max_active_subagents)}）`,
           NEXT_STEP_REPROPOSE,
         )],
       }),
@@ -1530,7 +1584,7 @@ async function bindProject(ctx: HandlerCtx, shared: SharedState): Promise<Roster
             operationId,
             diagnostics: [env.diagnostic(
               'OPERATION_CONFLICT',
-              '锁内重算的提议与 proposal_hash 不一致：目录/规则/能力映射/绑定在 inspect 之后发生了变化',
+              '锁内重算的提议与 proposal_hash 不一致：目录/规则/能力映射/预算/绑定在 inspect 之后发生了变化',
               NEXT_STEP_REPROPOSE,
             )],
           }),

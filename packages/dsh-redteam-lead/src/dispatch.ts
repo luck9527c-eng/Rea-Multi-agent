@@ -23,6 +23,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { ContractError, isErrorCode } from './errors.js'
+import { toolNamesFromSchemas } from './capability.js'
 import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js'
 import * as pathsModule from './paths.js'
 import * as resourceDefaults from './resources.js'
@@ -645,15 +646,19 @@ function bindingSnapshot(binding: unknown): BindingSnapshot | null {
   }
 }
 
-/** 已注册工具名（从实际执行者取，不猜）。 */
+/**
+ * 已注册工具名（从实际执行者取，不猜）。
+ *
+ * `schemas()` 的返回值形状只在 `capability.toolNamesFromSchemas()` 一处解析：宿主真实形状是
+ * **schema 对象数组**（名字在元素的 `.name` 上），对它做 `Object.keys` 只会拿到
+ * `["0","1",…]`，真会话里每个能力族都据此判缺失（T15）。
+ */
 function toolNamesOf(ctx: unknown): string[] {
   const view = recordOf(ctx)
   const tools = recordOf(view.services).tools
   if (isRecord(tools) && typeof tools.schemas === 'function') {
     try {
-      const schemas: unknown = tools.schemas(recordOf(view.exec).agent) ?? {}
-      // `Object.keys` 自己会做 ToObject；显式 `Object(...)` 只为把静态类型收敛，行为不变。
-      return Object.keys(Object(schemas))
+      return toolNamesFromSchemas(tools.schemas(recordOf(view.exec).agent))
     } catch {
       return []
     }

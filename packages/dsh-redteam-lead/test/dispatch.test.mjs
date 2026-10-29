@@ -337,6 +337,26 @@ test('未声明容量 → CAPACITY_UNKNOWN；席位不足 → CAPACITY_EXHAUSTED
   assert.deepEqual(await teamFiles(exhausted.project.root), beforeExhausted)
 })
 
+test('执行者注册表是数组形状（宿主真实形状）时派发不再被 CAPABILITY_MISSING 拦下', async (t) => {
+  // T15 回归：宿主 `tools.schemas(agent)` 返回 schema 对象数组（名字在元素的 `.name` 上）。
+  // 旧实现 `Object.keys()` 数组只拿到 ["0","1",…]，于是真会话里任何派发都在 preflight 被
+  // CAPABILITY_MISSING 拒（L3 证据 s3-rt_dispatch.txt）。
+  const { project, ctx, team, input } = setup(t)
+  const schemas = ctx.services.tools.schemas(ctx.exec.agent)
+  assert.ok(Array.isArray(schemas), '替身必须返回数组（宿主真实形状）')
+  const registryNames = schemas.map((schema) => schema.name)
+  for (const name of ['read', 'write', 'glob', 'grep']) {
+    assert.ok(registryNames.includes(name), `注册表里必须有 ${name}`)
+  }
+  assert.equal(registryNames.some((name) => /^\d+$/u.test(name)), false, '注册表里不得有下标字符串')
+
+  const { envelope } = await handleDispatch(ctx, input())
+  assert.notEqual(envelope.code, 'CAPABILITY_MISSING')
+  assertEnvelopeShape(envelope, { expectStatus: 'ok' })
+  assert.equal(envelope.data.phase, 'delivered')
+  assert.equal(team.callsFor('spawnTeammate').length, 1)
+})
+
 test('缺必需能力 → CAPABILITY_MISSING，且不建成员/任务', async (t) => {
   const { project, ctx, team, input } = setup(t, {
     tools: { default: { read: {}, glob: {}, grep: {} } },
@@ -347,6 +367,13 @@ test('缺必需能力 → CAPABILITY_MISSING，且不建成员/任务', async (t
   assertEnvelopeShape(envelope, { expectStatus: 'blocked' })
   assert.equal(envelope.code, 'CAPABILITY_MISSING')
   assert.match(envelope.diagnostics[0].reason, /fs|file-write/u)
+  // 放宽解析不得把真实缺口吃掉：缺失的仍是具体工具名，而不是「注册表不可用」的未核对降级。
+  assert.match(envelope.diagnostics[0].reason, /write/u)
+  assert.equal(
+    envelope.diagnostics.some((entry) => /未核对|注册表不可用/u.test(entry.reason)),
+    false,
+    '注册表可用时缺口必须是「缺工具」，不得退回未核对',
+  )
   assert.equal(team.callsFor('spawnTeammate').length, 0)
   assert.equal(team.callsFor('createTask').length, 0)
   assert.deepEqual(await teamFiles(project.root), before)

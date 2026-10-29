@@ -13,7 +13,8 @@
  * - `ctx.services.agentTeams` = `createFakeTeam(...).service`（`team: null` 时不挂，用于
  *   `TEAM_SERVICE_UNAVAILABLE` 分支）；
  * - `ctx.services.tools` = 假工具注册表（`schemas(agent)` / `get(name, agent)`），用于
- *   「工具可见性从实际执行者取」的测试；
+ *   「工具可见性从实际执行者取」的测试；**`schemas()` 返回宿主真实形状**（schema 对象数组，
+ *   名字在 `.name` 上，见 `makeFakeTools` 的注释），不是按名字为键的对象；
  * - `ctx.deps.teamAdapter` = **真实** `src/team-adapter.mjs` 套在假宿主上（所以映射逻辑被测到）；
  * - `ctx.deps.projectAdapter` = `test/helpers/fake-project.mjs` 替身；
  * - `ctx.deps.compatibility` = **真实** `src/compatibility.mjs` 模块；
@@ -144,28 +145,51 @@ export function makeClock(start = Date.UTC(2026, 0, 1, 0, 0, 0)) {
 
 /**
  * 假工具注册表：按 agent 名字给不同工具集，用来测「工具可见性从实际执行者取」。
+ *
+ * **返回的是宿主真实形状**：`schemas(agent)` → *schema 对象数组*，工具名在元素的 `.name` 上。
+ * 宿主源码（`_dsh-tools.js` 的 `schemas(scope)`）是
+ * `[...view(scope).visible.values()].map((definition) => this.schemaOf(definition, true))`，
+ * 而 `schemaOf()` 投影出的正是 `{name, description, parameters}`。对数组做 `Object.keys` 只会
+ * 得到 `["0","1",…]` —— T15 真会话里所有派发被判 `CAPABILITY_MISSING` 就是这个原因。
+ * 替身必须照抄这个形状，否则测试会继续给错的契约背书。
+ *
+ * `spec` 只是**声明工具的方式**（按 agent 名字分组、值是该工具的 parameters schema），
+ * 不是 `schemas()` 的返回值形状。
+ *
+ * `{ name: {...} }` 这种按名字为键的**返回值**属于旧形状：由
+ * `host.test.mjs`「按名字为键的旧形状仍然被解析」那条用例单独覆盖，不走这个替身。
+ *
  * @param {Record<string, Record<string, object>|string[]>} [spec] `{lead: {...}, 'rt-scout': {...}, default: {...}}`
  */
 export function makeFakeTools(spec = {}) {
   const byName = spec ?? {};
   const fallback = byName.default ?? {};
-  function mapFor(agent) {
+  function definitionMapFor(agent) {
     const key = agent && typeof agent === 'object' ? agent.name : undefined;
     return (key !== undefined && byName[key] !== undefined ? byName[key] : fallback) ?? {};
   }
+  /** 宿主 `schemaOf()` 的投影（`name` 来自注册名，其余是声明里的参数 schema）。 */
+  function schemaOf(name, parameters) {
+    const source = parameters && typeof parameters === 'object' && !Array.isArray(parameters) ? parameters : {};
+    return { name, description: `${name}（测试替身）`, parameters: { ...source } };
+  }
+  function schemasOf(agent) {
+    const definitions = definitionMapFor(agent);
+    return Object.keys(definitions).map((name) => schemaOf(name, definitions[name]));
+  }
   return {
     schemas(agent) {
-      return { ...mapFor(agent) };
+      return schemasOf(agent);
     },
     get(name, agent) {
-      const map = mapFor(agent);
-      return map[name] ?? null;
+      const definitions = definitionMapFor(agent);
+      return definitions[name] === undefined ? null : schemaOf(name, definitions[name]);
     },
     names(agent) {
-      return Object.keys(mapFor(agent));
+      return schemasOf(agent).map((schema) => schema.name);
     },
     has(name, agent) {
-      return mapFor(agent)[name] !== undefined;
+      return definitionMapFor(agent)[name] !== undefined;
     },
   };
 }
