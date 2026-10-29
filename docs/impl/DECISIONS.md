@@ -262,3 +262,46 @@ ctx.tools.register() 会用 host 的 `assertSupportedJsonSchema` 校验，**支�
 因此 seal 失败通常**不是**"这个 RUN 有问题"，而是项目里别处已经不一致（旧目标哈希变了、旧 seal 被删、
 某条路线缺锚点……）。处置顺序：按 skill 修记录 → 用**同一个 operation ID** 重入（D29 的前向恢复），
 **不要**重封存、不要为了让 seal 过去而放宽 `check` 门槛、不要删旧证据。
+
+## D33 — 已知缺口：`spawnTeammate` 之后没有 bootstrap 就绪预检（只记录，不实现）
+
+编排契约 §167 要求：派发后先做一次**无害的**就绪预检（bootstrap 是否真的把成员拉起来），失败按 `partial` 返回。
+
+**现状：没有这个载体。** `contract.ts` 里生成 `bootstrap` 的那一段只是一条写进契约/提示的字符串；`rt_dispatch`
+在 `spawnTeammate` 成功后直接 `createTask` → `reassign`，中间没有任何"预检 + 失败 partial"的步骤。后果：成员
+拉不起来时，错误要等到任务/消息环节才暴露，而不是在派发当场暴露。
+
+**裁决：本次（审查修复 pass）不实现，按已知缺口记录**（验收表 `G1` 行，`not-run`）。理由：加预检要改派发的
+阶段机（`prepared → member_ready → task_created`）与 `rt_dispatch` 的 `partial` 语义，属于重构级改动，必须带
+自己的失败注入测试；塞进一个修复 pass 会变成"顺手改行为"。
+
+## D34 — 已知缺口：用户故事 14/15 在插件里没有载体（只记录，不实现）
+
+- 用户故事 14：「派发后必须立刻找到下一件可独立推进的事」；
+- 用户故事 15：「只有真的无路可走时才允许 `wait_agent`」。
+
+**现状：插件侧没有可断言的判据。** `rt_dispatch` 只负责投递契约并回一段 `next_step` 建议文本；它既不知道
+Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一件事"的状态位。`wait_agent` 是 Lead 活跃循环里的
+动作，插件既不拦截也不校验时机——所以这两条既不能判 `pass`，也不该假装有实现。
+
+**裁决：不实现，按已知缺口记录**（验收表 `G2` 行，`not-run`）。真要做需要一条 Lead 侧的"待办清单"事实层
+加 `wait_agent` 前的检查钩子，那是新工具/新契约，超出本次修复范围。
+
+## D35 — `scripts/l3-verify.mjs` 与 `docs/examples/tools.md` 重写不是范围蔓延
+
+审查把这两项列为 scope creep。**两项都保留**，理由记在这里，下一位审查者不必再复议：
+
+- **`scripts/l3-verify.mjs`**：第三层验收在规格里是**强制**的（A01–A44 里有 18 行要 L3），但原来是纯人工、
+  没有任何机读证据。这个脚本只做一件事：把项目侧事实（文件枚举 + 字节 + sha256）采成 JSON 并 diff，让
+  "零副作用 / 有副作用"变成可判定的事实。它不生成清单、不改项目、不替人判 `pass`——它只是把**已经要求的
+  人工层**变成可执行，属于补齐验收手段，不是加功能。
+- **`docs/examples/tools.md` 的重写**：该文件记录的"源 JSON SHA256"必须等于 `docs/examples/tools.json` 的
+  真实字节摘要，A42 的用例就是断言这一条。旧文件的哈希与字节不符（陈旧），不改就与规格自相矛盾；重写只是
+  让文档与它记录的源字节一致，没有改规格、没有改 JSON。
+
+## D36 — 已知技术债：`roster.ts` 的 `bindProject` / `takeoverProject` 重复
+
+两者在"epoch 递增、旧 binding/roster/resources 归档到 `re/team/history/epoch-N`、提议校验、审计"上有大段
+重复。审查同意应当合并成一个内部的 `applyBinding(epoch + 1)` 之类函数，但**合并必须先有测试覆盖**（尤其
+归档失败、epoch 竞争、旧 epoch 提议失效这三条路径），否则是拿行为风险换行数。本次修复 pass 不做，记录在此：
+下次动 `roster.ts` 时优先处理。
