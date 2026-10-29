@@ -38,6 +38,15 @@ const RECOVERY_REQUIRED = 'RECOVERY_REQUIRED';
 
 const DEFAULT_TIMEOUT_MS = 120000;
 
+/**
+ * 默认布局的判定口径：skill 的 `validate()` 从 `re/targets.json` 开始读，
+ * `inventory()`/`check`/`seal` 也只认 `re/{routes,runs,conditions,env,seals}`。
+ * 因此 v0 只把「`re/` 是目录 + `re/targets.json` 是文件」当成默认布局；
+ * 其余一律 `NON_DEFAULT_LAYOUT`（返回可读缺口，绝不静默另建目录）。
+ */
+const DEFAULT_LAYOUT = 'default';
+const NON_DEFAULT_LAYOUT = 'non-default';
+
 const ROUTE_ID = /^R-[A-Za-z0-9_-]+$/u;
 const RUN_ID = /^RUN-[A-Za-z0-9_-]+$/u;
 
@@ -443,7 +452,34 @@ async function isDirectory(target: string): Promise<boolean> {
   }
 }
 
+/** 布局分类结果：`kind` 是 `'default'`/`'non-default'`，`missing` 是非默认布局缺的锚点。 */
+interface LayoutClassification {
+  kind: string;
+  missing: string[];
+}
+
+/**
+ * 分类项目的记录布局（只读，不建目录）。
+ *
+ * 只看两个锚点：`re/` 是目录、`re/targets.json` 是文件。缺任何一个就判非默认布局——
+ * 这时真实 CLI 也会在 `re/targets.json` 上失败，插件必须自己先给出可读缺口。
+ *
+ * @param {string} projectRoot 项目根（已 resolve）
+ * @returns {Promise<{kind: string, missing: string[]}>}
+ */
+async function classifyLayout(projectRoot: string): Promise<LayoutClassification> {
+  const recordsDir = path.join(projectRoot, 're');
+  const manifest = path.join(recordsDir, 'targets.json');
+  const dirPresent = await isDirectory(recordsDir);
+  const manifestPresent = await isFile(manifest);
+  const missing: string[] = [];
+  if (!dirPresent) missing.push(existsSync(recordsDir) ? 're/ 不是目录' : 're/ 目录');
+  if (!manifestPresent) missing.push('re/targets.json（正式记录清单）');
+  return { kind: missing.length === 0 ? DEFAULT_LAYOUT : NON_DEFAULT_LAYOUT, missing };
+}
+
 /** 递归列出目录下所有 `.json` 文件（相对路径用 `/`）。 */
+
 async function walkJson(root: string, prefix = ''): Promise<string[]> {
   let entries;
   try {
@@ -733,6 +769,18 @@ export function createProjectAdapter(options: ProjectAdapterOptions = {}): Proje
       const projectRoot = root(input.projectRoot);
       if (projectRoot === undefined) return invalid('probe', 'probe 需要 projectRoot');
       const gaps: ProbeGap[] = [];
+      // 布局先判：非默认布局时后面几项（副本、Python）仍然要如实报告，不因为布局不对就短路。
+      const layout = await classifyLayout(projectRoot);
+      if (layout.kind !== DEFAULT_LAYOUT) {
+        gaps.push({
+          code: 'PROJECT_LAYOUT_UNSUPPORTED',
+          blocking: true,
+          detail: `项目不是 skill 默认布局：缺少 ${layout.missing.join('、')}`,
+          nextStep: 'v0 只支持 skill 默认布局（re/targets.json + re/{routes,runs,conditions,env,seals}）；'
+            + '把正式记录放回 re/ 并按 skill 规则重跑 index 后再接入；不要另建一个 re/、'
+            + '也不要让 INDEX 指向挪走的目录（D8：不覆盖项目副本与历史）',
+        });
+      }
       const skillCopy = path.join(projectRoot, ...SKILL_COPY_RELATIVE.split('/'));
       const indexPresent = await isFile(path.join(projectRoot, 'INDEX.md'));
       if (!indexPresent) {
@@ -834,7 +882,7 @@ export function createProjectAdapter(options: ProjectAdapterOptions = {}): Proje
           schemaVersion,
         },
         skillCopyPath: SKILL_COPY_RELATIVE,
-        layoutKind: 'default',
+        layoutKind: layout.kind,
         ruleDigest: digests.ruleDigest,
         scriptDigest: digests.scriptDigest,
         catalogDigest: digests.catalogDigest,

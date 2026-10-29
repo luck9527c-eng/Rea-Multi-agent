@@ -9,8 +9,9 @@
  * - 克隆到新根 → 摘要不变（内容指纹与路径无关），改规则/脚本后要求重新做兼容检查（A36）；
  * - probe 是只读检查，不落盘。
  *
- * 非默认布局：真实 CLI 会以具体错误拒绝，但 `probe()` 目前**不**给布局缺口 —— 这是
- * T8 报告的实现缺陷；这里既断言"不会假称可用"的可观察行为，也用 skip 记录未满足的 A05 要求。
+ * 非默认布局：`probe()` 必须**自己**把布局分类出来（`layoutKind: 'non-default'`）并给出
+ * blocking 的 `PROJECT_LAYOUT_UNSUPPORTED` 缺口 + 可读下一步；真实 CLI 另外会以具体错误拒绝。
+ * 两条路径都要能证明「不假称项目可用」。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -191,7 +192,7 @@ test('缺 Python：PYTHON_MISSING（blocking）点名解释器，check 明确失
   })
 })
 
-test('非默认布局：真实 CLI 以具体错误拒绝，插件不会假称项目可用（A05）', async (t) => {
+test('非默认布局：probe 与真实 CLI 都不得假称项目可用（A05）', async (t) => {
   const env = await environment()
   if (!env.ok) return t.skip(env.reason)
   await withProject(t, async ({ root }) => {
@@ -201,11 +202,11 @@ test('非默认布局：真实 CLI 以具体错误拒绝，插件不会假称项
 
     const adapter = createProjectAdapter({ projectRoot: root })
     const probe = await adapter.probe()
-    t.diagnostic(
-      '实现缺陷（T8 报告）：probe() 把 layoutKind 恒置为 "default"，移动 re/ 后仍无布局缺口；'
-      + 'A05 要求的"非默认布局给出具体缺口"目前只能由 check 的硬失败兜住。',
-    )
-    assert.equal(probe.ok, true)
+    assert.equal(probe.ok, false, '布局不符时 probe 必须报 not ok，不能假称可用')
+    assert.equal(probe.compatibility.layoutKind, 'non-default')
+    const layoutGap = probe.gaps.find((gap) => gap.code === 'PROJECT_LAYOUT_UNSUPPORTED')
+    assert.ok(layoutGap, `必须报 PROJECT_LAYOUT_UNSUPPORTED（实际：${probe.gaps.map((gap) => gap.code).join(',')}）`)
+    assert.equal(layoutGap.blocking, true)
 
     const checked = await adapter.check({ hashes: true })
     assert.equal(checked.ok, false, '非默认布局下不得返回 check 成功')
@@ -218,14 +219,37 @@ test('非默认布局：真实 CLI 以具体错误拒绝，插件不会假称项
   })
 })
 
-test('非默认布局：probe 应给出布局缺口（A05 未满足，记录为 skip）', async (t) => {
+test('非默认布局：probe 分类布局、给出 blocking 缺口与可读下一步，且不静默另建 re/（A05）', async (t) => {
   const env = await environment()
   if (!env.ok) return t.skip(env.reason)
-  return t.skip(
-    '实现缺陷：src/project-adapter.ts 的 probe() 把 compatibility.layoutKind 恒置为 "default"，'
-    + '并把 re/ 之外的记录目录当作无缺口；A05 要求的"非默认布局返回可读缺口"尚未实现。'
-    + '本用例保留为验收缺口（不伪造通过）。',
-  )
+  await withProject(t, async ({ root }) => {
+    await project(root)
+    // skill 的默认布局是 re/ + re/targets.json；这里把记录目录整体挪走，模拟"非默认布局"。
+    await rename(path.join(root, 're'), path.join(root, 'records'))
+    const movedManifest = path.join(root, 'records', 'targets.json')
+    const movedDigest = sha256File(movedManifest)
+
+    const adapter = createProjectAdapter({ projectRoot: root })
+    const probe = await adapter.probe()
+
+    assert.equal(probe.compatibility.layoutKind, 'non-default', '布局必须按实际目录分类，不能恒为 default')
+    assert.equal(probe.ok, false, '非默认布局是 blocking 缺口')
+    const gap = probe.gaps.find((item) => item.code === 'PROJECT_LAYOUT_UNSUPPORTED')
+    assert.ok(gap, `必须报 PROJECT_LAYOUT_UNSUPPORTED（实际：${probe.gaps.map((item) => item.code).join(',')}）`)
+    assert.equal(gap.blocking, true, '布局缺口必须阻塞（不能降级成提示）')
+    assert.match(gap.detail, /re[\\/]targets\.json/u, '缺口要点名默认布局缺了什么')
+    assert.match(gap.nextStep, /默认布局/u, '下一步必须说明 v0 只支持默认布局')
+    assert.match(gap.nextStep, /不要/u, '下一步必须写清禁止的动作（不静默另建/不覆盖历史）')
+
+    // 只读：不建 re/、不改挪走的记录、不碰 INDEX。
+    assert.equal(existsSync(path.join(root, 're')), false, 'probe 不得静默另建 re/')
+    assert.equal(sha256File(movedManifest), movedDigest, 'probe 不改写挪走的正式记录')
+
+    // 布局缺口不掩盖其余兼容性结论：副本本身仍然合格。
+    assert.equal(probe.compatibility.skillCopyPresent, true)
+    assert.equal(probe.compatibility.hasTeamRules, true)
+    assert.equal(probe.compatibility.pythonOk, true)
+  })
 })
 
 test('克隆到新根：摘要与路径无关；改规则/脚本后要求重新做兼容检查，旧绑定保留（A36）', async (t) => {

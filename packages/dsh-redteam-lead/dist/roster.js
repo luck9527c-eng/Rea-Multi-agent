@@ -148,7 +148,7 @@ async function probeProject(deps, root, env) {
         && compatibility.layoutKind !== undefined
         && compatibility.layoutKind !== null
         && compatibility.layoutKind !== 'default';
-    if (layoutUnsupported) {
+    if (layoutUnsupported && !gaps.some((gap) => gap.code === 'PROJECT_LAYOUT_UNSUPPORTED')) {
         gaps.push(env.diagnostic('PROJECT_LAYOUT_UNSUPPORTED', `项目副本布局是 ${String(compatibility.layoutKind)}（阻塞）：v0 只支持 skill 默认布局`, '改用 skill 默认布局，或把项目副本按团队规则迁移后再接入；不要静默另建目录'));
     }
     const digests = {
