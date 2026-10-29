@@ -252,6 +252,8 @@ export interface CaptureBaselineInput {
     paths?: typeof defaultPaths;
     now?: unknown;
     dependencyRunIds?: readonly string[];
+    /** 所依赖既有已封存 RUN 的产物身份（T17）：`[{path, sha256}]`。 */
+    artifacts?: unknown;
 }
 /** `captureBaseline` 的产物：失败带稳定码，成功带内联基准。 */
 export type BaselineCapture = {

@@ -102,4 +102,24 @@ export declare function impactProblems(impactJson: unknown, routeId: unknown): I
  * （本函数仍做形状兜底）。缺装配时返回最小合法错误信封，不抛。
  */
 export declare function handleDispatch(ctx: HandlerCtx, input: unknown): Promise<HandlerResult>;
+/** `dependedSealedRunIds()` 的入参：全是从已读记录投影出来的纯数据。 */
+interface DependedRunInput {
+    routeId: string;
+    /** 路线声明的 RUN（`dependency_runs` ∪ `evidence`）。 */
+    declared: readonly string[];
+    /** 当前 seal 清单里的 RUN 封存。 */
+    sealed: readonly string[];
+    targetIds: readonly string[];
+    /** 已读到的 RUN 记录（只含已封存的，按 `run_id` 索引）。 */
+    runs: ReadonlyArray<{
+        run_id: string;
+        record: unknown;
+    }>;
+}
+/**
+ * 纯决策：本次派发真正要冻结的**已封存 RUN**。
+ *
+ * 只读已读到的记录，不做 I/O；`runs` 里没有的 RUN 一律当作「不冻结」（未封存/读不到）。
+ */
+export declare function dependedSealedRunIds(input: DependedRunInput): string[];
 export {};

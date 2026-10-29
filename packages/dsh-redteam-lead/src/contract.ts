@@ -305,6 +305,8 @@ export interface CaptureBaselineInput {
   paths?: typeof defaultPaths
   now?: unknown
   dependencyRunIds?: readonly string[]
+  /** 所依赖既有已封存 RUN 的产物身份（T17）：`[{path, sha256}]`。 */
+  artifacts?: unknown
 }
 
 /** `captureBaseline` 的产物：失败带稳定码，成功带内联基准。 */
@@ -1073,6 +1075,11 @@ function sealTargetId(sealPath: unknown): string | null {
   return matched === null ? null : matched[1]
 }
 
+/** `isProjectRelative()` 的类型守卫版本（产物 `path` 参与后续构造，需要收成 `string`）。 */
+function isProjectRelativePath(value: unknown): value is string {
+  return typeof value === 'string' && defaultPaths.isProjectRelative(value)
+}
+
 function baselineFailure(reason: string, nextStep: string): BaselineCapture {
   return {
     ok: false,
@@ -1198,12 +1205,26 @@ export async function captureBaseline(input: CaptureBaselineInput): Promise<Base
   }
   preexisting.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
 
+  // 所依赖既有已封存 RUN 的产物身份（T17）：与 T7 的 `baseline.mjs` 同形，收口侧才能哈希它。
+  const artifacts: { path: string; sha256: string }[] = []
+  for (const artifact of Array.isArray(input.artifacts) ? input.artifacts : []) {
+    const view = recordOf(artifact)
+    if (!isProjectRelativePath(view.path) || typeof view.sha256 !== 'string' || !SHA256.test(view.sha256)) {
+      return baselineFailure(
+        `依赖产物身份不合法：${JSON.stringify(artifact).slice(0, 200)}`,
+        '给 {path, sha256}（path 为项目内相对路径，sha256 为 64 位小写十六进制）',
+      )
+    }
+    artifacts.push({ path: view.path, sha256: view.sha256 })
+  }
+
   return {
     ok: true,
     baseline_ref: {
       frozen_at: now,
       targets: frozen,
       preexisting_seals: preexisting,
+      artifacts,
       dependency_runs: [...wantedRunSeals].sort(),
       seal_scan: {
         total: Array.isArray(sealsView.seals) ? sealsView.seals.length : 0,

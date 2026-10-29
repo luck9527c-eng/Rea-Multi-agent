@@ -38,6 +38,10 @@ const TARGET_ID = /^T-[A-Za-z0-9_-]+$/u
 const ATTEMPT_ID = /^A-[0-9]{6}$/u
 const DISPATCH_ID = /^D-[a-z0-9][a-z0-9_-]{0,63}$/u
 const SHA256 = /^[0-9a-f]{64}$/u
+const RUN_ID = /^RUN-[A-Za-z0-9_-]+$/u
+
+/** RUN 的 seal 文件（`re/seals/runs/<RUN>.json`）；目标封存 `re/seals/targets/T-*.json` 不带 RUN 身份。 */
+const RUN_SEAL_PATH = /^re\/seals\/runs\/(RUN-[A-Za-z0-9_-]+)\.json$/u
 
 /** `$defs.anchorKind` */
 const ANCHOR_KINDS = Object.freeze([
@@ -1351,6 +1355,180 @@ async function readFrozenDigests(projectAdapter: ProjectAdapterLike, root: strin
   return { ok: true, digests: { ruleDigest, scriptDigest, catalogDigest } }
 }
 
+// ---------------------------------------------------------------------------
+// T17：冻结「所依赖的既有已封存产物的身份」
+//
+// 编排契约「锚点与封存绑定」要求派发前冻结三类东西：目标字节、相关既有 seal 的路径与字节，
+// **以及所依赖产物的身份**。第三类以前从来没被填过（`baseline.artifacts` 恒为 `[]`），于是
+// 「已封存产物被篡改」在收口侧没有任何比对能发现它 —— 只能等最后一步 `check --hashes`，
+// 而那时路线已回写、INDEX 已刷新。这里就是那第三类的事实来源。
+//
+// 「依赖的 RUN」的判据（**路线域**，不是全项目）：
+//   1. `route.dependency_runs` —— 插件扩展的显式依赖；
+//   2. `route.evidence` —— skill 里路线自己登记的 RUN；
+//   3. 本路线**自己**在该目标上已封存的 RUN —— 「目标已有 seal」背后的既有证据。
+// 只冻结**已封存**的：未封存 RUN 的产物还不是不可变事实（封存前允许补正），冻它会让基准
+// 无谓失效。也**不**扫别的路线的 RUN：契约要求「其他路线正常新增 seal 不使旧快照失效」。
+// ---------------------------------------------------------------------------
+
+/** 路线记录里声明的 RUN 引用（`dependency_runs` / `evidence` 都按未知形状读）。 */
+function declaredRunIds(route: RouteRecord): string[] {
+  const ids: string[] = []
+  const lists: unknown[] = [route.dependency_runs, route.evidence]
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue
+    const values: unknown[] = list
+    for (const value of values) {
+      if (typeof value !== 'string') continue
+      const id = value.trim()
+      if (!RUN_ID.test(id) || ids.includes(id)) continue
+      ids.push(id)
+    }
+  }
+  return ids
+}
+
+/** 当前 seal 清单里的 RUN 封存（只认 `re/seals/runs/<RUN>.json`）。 */
+function sealedRunIds(seals: unknown): string[] {
+  const ids: string[] = []
+  const list: unknown[] = Array.isArray(seals) ? seals : []
+  for (const seal of list) {
+    const sealPath = recordOf(seal).path
+    if (typeof sealPath !== 'string') continue
+    const matched = RUN_SEAL_PATH.exec(sealPath)
+    if (matched === null || ids.includes(matched[1])) continue
+    ids.push(matched[1])
+  }
+  return ids
+}
+
+/** RUN 记录声明的目标 ID（`target.id` 与 `target_ids` 两种写法都认）。 */
+function runTargetIds(run: unknown): string[] {
+  const view = recordOf(run)
+  const ids: string[] = []
+  const target = recordOf(view.target)
+  if (typeof target.id === 'string' && target.id.length > 0) ids.push(target.id)
+  if (Array.isArray(view.target_ids)) {
+    const values: unknown[] = view.target_ids
+    for (const value of values) {
+      if (typeof value === 'string' && value.length > 0 && !ids.includes(value)) ids.push(value)
+    }
+  }
+  return ids
+}
+
+/** `dependedSealedRunIds()` 的入参：全是从已读记录投影出来的纯数据。 */
+interface DependedRunInput {
+  routeId: string
+  /** 路线声明的 RUN（`dependency_runs` ∪ `evidence`）。 */
+  declared: readonly string[]
+  /** 当前 seal 清单里的 RUN 封存。 */
+  sealed: readonly string[]
+  targetIds: readonly string[]
+  /** 已读到的 RUN 记录（只含已封存的，按 `run_id` 索引）。 */
+  runs: ReadonlyArray<{ run_id: string, record: unknown }>
+}
+
+/**
+ * 纯决策：本次派发真正要冻结的**已封存 RUN**。
+ *
+ * 只读已读到的记录，不做 I/O；`runs` 里没有的 RUN 一律当作「不冻结」（未封存/读不到）。
+ */
+export function dependedSealedRunIds(input: DependedRunInput): string[] {
+  const sealed = new Set<string>(input.sealed)
+  const declared = new Set<string>(input.declared)
+  const targets = new Set<string>(input.targetIds)
+  const picked: string[] = []
+  for (const run of input.runs) {
+    if (!sealed.has(run.run_id)) continue
+    const isDeclared = declared.has(run.run_id)
+    const belongsHere = recordOf(run.record).route_id === input.routeId
+      && runTargetIds(run.record).some((targetId) => targets.has(targetId))
+    if (!isDeclared && !belongsHere) continue
+    picked.push(run.run_id)
+  }
+  return picked
+}
+
+/** 依赖产物身份的读取结果。 */
+type DependentArtifactsRead =
+  | { ok: true, artifacts: Array<{ path: string, sha256: string }> }
+  | { ok: false, code: string, reason: string, nextStep: string }
+
+/**
+ * 读「本次派发依赖的既有已封存 RUN」，把它们 `run.json` 里声明的产物身份收成
+ * `[{path, sha256}]`（`captureBaseline()` 的 `artifacts` 入参）。
+ *
+ * 失败一律 fail-closed：读不到 seal 清单、或**路线声明的**依赖 RUN 已封存但 `run.json`
+ * 读不到/产物登记残缺 → 不能假装「没有依赖产物」，否则快照会静默少冻一项。
+ */
+async function dependentArtifacts(input: {
+  projectAdapter: ProjectAdapterLike
+  route: RouteRecord
+  targetIds: readonly string[]
+}): Promise<DependentArtifactsRead> {
+  const declared = declaredRunIds(input.route)
+  const sealsRead = recordOf(await input.projectAdapter.readSeals())
+  if (sealsRead.ok !== true) {
+    return {
+      ok: false,
+      code: 'RECOVERY_REQUIRED',
+      reason: `读不了既有 seal 清单，无法判断哪些已封存 RUN 是本派发的依赖：${sealsRead.reason ?? sealsRead.code ?? 'unknown'}`,
+      nextStep: '确认 re/seals 可读后再派发；读失败不能当作没有封存',
+    }
+  }
+  const sealed = sealedRunIds(sealsRead.seals)
+  const declaredSet = new Set<string>(declared)
+  const runs: Array<{ run_id: string, record: unknown }> = []
+  for (const runId of sealed) {
+    const read = recordOf(await input.projectAdapter.readRun(runId))
+    if (read.ok !== true) {
+      if (!declaredSet.has(runId)) continue
+      return {
+        ok: false,
+        code: 'RECOVERY_REQUIRED',
+        reason: `路线声明的依赖 RUN ${runId} 已封存，但它的 run.json 读不到（${read.reason ?? read.code ?? 'unknown'}）：冻结不了产物身份`,
+        nextStep: '按恢复流程核对 re/runs/<RUN>/run.json 后重新派发；不能把「读不到」当作「没有产物」',
+      }
+    }
+    runs.push({ run_id: runId, record: read.run })
+  }
+
+  const runIds = dependedSealedRunIds({
+    routeId: typeof input.route.id === 'string' ? input.route.id : '',
+    declared,
+    sealed,
+    targetIds: input.targetIds,
+    runs,
+  })
+  const artifacts: Array<{ path: string, sha256: string }> = []
+  const seen = new Set<string>()
+  for (const runId of runIds) {
+    const record = runs.find((entry) => entry.run_id === runId)?.record
+    const declaredArtifacts: unknown = recordOf(record).artifacts
+    const listed: unknown[] = Array.isArray(declaredArtifacts) ? declaredArtifacts : []
+    for (const entry of listed) {
+      const artifact = recordOf(entry)
+      const artifactPath = artifact.path
+      const sha256Value = artifact.sha256
+      if (typeof artifactPath !== 'string' || artifactPath.length === 0 || typeof sha256Value !== 'string') {
+        return {
+          ok: false,
+          code: 'RECOVERY_REQUIRED',
+          reason: `已封存 RUN ${runId} 的 run.json 里有一条产物没有 path/sha256：${JSON.stringify(entry).slice(0, 200)}`,
+          nextStep: '按 skill 补全该 RUN 的产物登记（path + 字节 SHA256）后重新派发；不完整的清单不能当作产物身份',
+        }
+      }
+      const key = `${artifactPath}\u0000${sha256Value}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      artifacts.push({ path: artifactPath, sha256: sha256Value })
+    }
+  }
+  artifacts.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+  return { ok: true, artifacts }
+}
+
 async function preflight({
   ctx,
   deps,
@@ -1732,7 +1910,21 @@ async function preflight({
     }
   }
 
-  // baseline：真实目标字节哈希 + 相关既有 seal。
+  // (7) 依赖产物身份（T17）：契约要求冻结「所依赖的既有已封存产物」，收口才能在写盘前比对。
+  // 只读；失败一律 blocked（此时还没有任何 `re/team/` 正式产物）。
+  const depended = await dependentArtifacts({ projectAdapter, route, targetIds: request.target_ids })
+  if (depended.ok !== true) {
+    return {
+      envelope: blockedEnvelope(envelope, {
+        code: depended.code,
+        operationId: request.operation_id,
+        reason: depended.reason,
+        nextStep: depended.nextStep,
+      }),
+    }
+  }
+
+  // baseline：真实目标字节哈希 + 相关既有 seal + 所依赖产物的身份。
   //
   // **装配接缝（T12）**：`deps.baseline` 是 T7 的 `src/baseline.mjs`（SEAMS §7 规定基准快照归它），
   // 它的 `captureBaseline({dispatchId, attemptId, ...})` 会把快照写进
@@ -1748,6 +1940,7 @@ async function preflight({
     dispatchId,
     attemptId,
     targetIds: request.target_ids,
+    artifacts: depended.artifacts,
     projectAdapter,
     now: typeof deps.clock?.isoNow === 'function' ? deps.clock.isoNow() : new Date().toISOString(),
     clock: deps.clock,
@@ -1760,6 +1953,7 @@ async function preflight({
     : await contractMod.captureBaseline({
       root,
       targetIds: request.target_ids,
+      artifacts: depended.artifacts,
       projectAdapter,
       atomic: deps.atomic,
       paths: deps.paths,
@@ -2007,9 +2201,24 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
 
     let baselineRef = isPlainObject(data.baseline_ref) ? data.baseline_ref : baselineRefForContract(plan?.baseline)
     if (baselineRef === null) {
+      // 恢复路径没有 preflight 计划：依赖产物身份照样要冻（T17），否则这条回退分支又会写出
+      // 一份没有 `artifacts` 的基准。
+      const depended = await dependentArtifacts({
+        projectAdapter,
+        route: routeForContract ?? {},
+        targetIds: request.target_ids,
+      })
+      if (depended.ok !== true) {
+        return failure(depended.code, {
+          reason: depended.reason,
+          nextStep: depended.nextStep,
+          phase: 'prepared',
+        })
+      }
       const capture = await contractMod.captureBaseline({
         root,
         targetIds: request.target_ids,
+        artifacts: depended.artifacts,
         projectAdapter,
         atomic,
         paths,
