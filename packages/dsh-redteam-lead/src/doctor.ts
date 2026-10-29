@@ -23,6 +23,76 @@ import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// ---------------------------------------------------------------------------
+// 本地契约类型与收窄小工具
+//
+// `test/doctor.test.mjs` 钉住：本文件只能 `import 'node:*'`（或 doctor 自身），
+// 所以**不**从 `src/types.ts` / `src/guards.ts` 取东西 —— 下面这几个声明是它们的
+// 本地副本，形状必须与 `types.ts` 的 `Diagnostic` / `Envelope` / `ResultStatus` 一致
+// （`$defs.diagnostic` / `$defs.result`）。
+// ---------------------------------------------------------------------------
+
+/** 契约诊断：恰好三字段（`$defs.diagnostic`，DECISIONS D21）。 */
+interface Diagnostic {
+  code: string
+  reason: string
+  next_step: string
+}
+
+/** 四种信封状态。 */
+type ResultStatus = 'ok' | 'blocked' | 'partial' | 'error'
+
+/** 八字段信封（`$defs.result`）。 */
+interface Envelope {
+  schema_version: number
+  status: ResultStatus
+  code: string | null
+  operation_id: string | null
+  replayed: boolean
+  retryable: boolean
+  diagnostics: Diagnostic[]
+  data: object | null
+}
+
+/** 非 null 对象（等价于 `typeof x === 'object' && x !== null`）。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/** 读记录的字段；不是记录就给空对象（与 `src/guards.ts` 的 `recordOf` 逐字等价）。 */
+function recordOf(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {}
+}
+
+/** 抛出错上的 `code`；不是字符串就当没有（与 `thrownCode` 逐字等价）。 */
+function thrownCode(thrown: unknown): string | null {
+  if (isRecord(thrown) && 'code' in thrown) {
+    const code = thrown.code
+    return typeof code === 'string' ? code : null
+  }
+  return null
+}
+
+/** 把任意抛出物压成一句文本（与 `thrownMessage` 逐字等价）。 */
+function thrownMessage(thrown: unknown): string {
+  if (isRecord(thrown) && 'message' in thrown) {
+    const message = thrown.message
+    if (message !== undefined && message !== null) return String(message)
+  }
+  return String(thrown)
+}
+
+/**
+ * `Object.keys(value ?? {})`。
+ *
+ * 原写法直接交给 `Object.keys`（非对象按 JS 语义处理，例如字符串会被拆成索引键），
+ * 这里只在类型上断言成 `object`，运行期表达式一字未改。
+ */
+function objectKeys(value: unknown): string[] {
+  // 断言成立的理由：`Object.keys` 在运行期接受任意值（内部做 ToObject），这里只是满足签名。
+  return Object.keys((value ?? {}) as object)
+}
+
 /** 本包包名（profile 的 `dsh.profile.bundles` 与 `dependencies` 里必须出现）。 */
 export const BUNDLE_NAME = '@local/dsh-redteam-lead'
 
@@ -71,14 +141,23 @@ export const USAGE = [
 // 参数
 // ---------------------------------------------------------------------------
 
+/** `parseDoctorArgs` 的结果。 */
+interface DoctorArgs {
+  profileRoot?: string
+  projectRoot?: string
+  bundleRoot?: string
+  help?: boolean
+  problems: string[]
+}
+
 /**
  * 解析命令行参数。
  * @param {string[]} argv `process.argv.slice(2)`
  * @returns {{ profileRoot?: string, projectRoot?: string, bundleRoot?: string, help?: boolean, problems: string[] }}
  */
-export function parseDoctorArgs(argv) {
-  const out = { problems: [] }
-  const takeValue = (index, flag) => {
+export function parseDoctorArgs(argv: string[]): DoctorArgs {
+  const out: DoctorArgs = { problems: [] }
+  const takeValue = (index: number, flag: string): string | undefined => {
     const value = argv[index + 1]
     if (typeof value !== 'string' || value.length === 0 || value.startsWith('--')) {
       out.problems.push(`${flag} 缺少值`)
@@ -120,16 +199,19 @@ export function parseDoctorArgs(argv) {
 // 小工具
 // ---------------------------------------------------------------------------
 
+/** 读 JSON 的结果：成功给解析值（形状由调用方收窄），失败给一句原因。 */
+type ReadJsonResult = { ok: true, value: unknown } | { ok: false, error: string }
+
 /** 读 JSON 文件；失败返回 `{ok:false, error}`，绝不抛。 */
-function readJson(path) {
+function readJson(path: string): ReadJsonResult {
   try {
     return { ok: true, value: JSON.parse(readFileSync(path, 'utf8')) }
   } catch (error) {
-    return { ok: false, error: `${path}: ${error.code ?? ''} ${error.message}`.trim() }
+    return { ok: false, error: `${path}: ${thrownCode(error) ?? ''} ${thrownMessage(error)}`.trim() }
   }
 }
 
-function isDirectory(path) {
+function isDirectory(path: string): boolean {
   try {
     return statSync(path).isDirectory()
   } catch {
@@ -137,7 +219,7 @@ function isDirectory(path) {
   }
 }
 
-function isFile(path) {
+function isFile(path: string): boolean {
   try {
     return statSync(path).isFile()
   } catch {
@@ -146,7 +228,7 @@ function isFile(path) {
 }
 
 /** 列出目录下的文件名；失败返回空数组。 */
-function listNames(path) {
+function listNames(path: string): string[] {
   try {
     return readdirSync(path)
   } catch {
@@ -154,11 +236,37 @@ function listNames(path) {
   }
 }
 
+/** 一条检查记录：`pass` / `skip` / `fail`，只有 hard fail 才阻止 configuration_ready。 */
+interface CheckEntry {
+  id: string
+  status: 'pass' | 'skip' | 'fail'
+  severity: 'hard' | 'soft'
+  detail: string
+}
+
+/** `fail()` 的入参。 */
+interface CheckFailure {
+  severity?: 'hard' | 'soft'
+  detail: string
+  code: string
+  nextStep: string
+}
+
+/** 检查清单的写入面（`checkBundle` / `checkProfile` / `checkProject` 用它记结果）。 */
+interface Recorder {
+  checks: CheckEntry[]
+  diagnostics: Diagnostic[]
+  pass(id: string, detail: string): void
+  skip(id: string, detail: string): void
+  fail(id: string, options: CheckFailure): void
+  readonly hardFailure: boolean
+}
+
 /** 检查清单：pass / skip / fail，fail 同时产出一条诊断；只有 hard fail 才阻止 configuration_ready。 */
-function createChecks() {
-  const checks = []
-  const diagnostics = []
-  const push = (entry) => checks.push(entry)
+function createChecks(): Recorder {
+  const checks: CheckEntry[] = []
+  const diagnostics: Diagnostic[] = []
+  const push = (entry: CheckEntry): void => { checks.push(entry) }
   return {
     checks,
     diagnostics,
@@ -184,12 +292,19 @@ function createChecks() {
   }
 }
 
+/** 解释器探针结果。 */
+interface InterpreterProbe {
+  ok: boolean
+  version: string | null
+  detail: string | null
+}
+
 /** 解释器探针：只验证「能启动且 `-V` 退出 0」，不解析版本文案。 */
-function probeInterpreter(interpreter) {
+function probeInterpreter(interpreter: string): InterpreterProbe {
   const probe = spawnSync(interpreter, ['-V'], { encoding: 'utf8', windowsHide: true, timeout: 20_000 })
   if (probe.error) {
-    const missing = probe.error.code === 'ENOENT'
-    return { ok: false, version: null, detail: missing ? `找不到可执行文件：${interpreter}` : String(probe.error.message) }
+    const missing = thrownCode(probe.error) === 'ENOENT'
+    return { ok: false, version: null, detail: missing ? `找不到可执行文件：${interpreter}` : thrownMessage(probe.error) }
   }
   const firstLine = String(probe.stdout || probe.stderr || '').split(/\r?\n/).find((line) => line.trim().length > 0)
   return {
@@ -200,11 +315,12 @@ function probeInterpreter(interpreter) {
 }
 
 /** 项目配置里若显式记录了实际解释器，优先采用（SEAMS §4：项目 pin > PATH）。 */
-function resolveInterpreter(projectConfig) {
-  const candidates = [
-    [projectConfig?.python, 're/project.json#python'],
-    [projectConfig?.python_executable, 're/project.json#python_executable'],
-    [projectConfig?.environment?.python, 're/project.json#environment.python'],
+function resolveInterpreter(projectConfig: unknown): { interpreter: string, source: string } {
+  const config = recordOf(projectConfig)
+  const candidates: Array<[unknown, string]> = [
+    [config.python, 're/project.json#python'],
+    [config.python_executable, 're/project.json#python_executable'],
+    [recordOf(config.environment).python, 're/project.json#environment.python'],
   ]
   for (const [value, source] of candidates) {
     if (typeof value === 'string' && value.trim().length > 0) return { interpreter: value.trim(), source }
@@ -216,8 +332,19 @@ function resolveInterpreter(projectConfig) {
 // 检查：本包
 // ---------------------------------------------------------------------------
 
-function checkBundle(recorder, bundleRoot) {
-  const facts = {
+/** 本包检查的事实（进 `data.bundle`）。 */
+interface BundleFacts {
+  root: string
+  name: string | null
+  version: string | null
+  manifest_ok: boolean
+  entry_present: boolean
+  patch_files: Array<{ path: string, exists: boolean }>
+  dependencies: string[]
+}
+
+function checkBundle(recorder: Recorder, bundleRoot: string): BundleFacts {
+  const facts: BundleFacts = {
     root: bundleRoot,
     name: null,
     version: null,
@@ -248,9 +375,10 @@ function checkBundle(recorder, bundleRoot) {
     return facts
   }
   facts.manifest_ok = true
-  facts.name = typeof manifest.value.name === 'string' ? manifest.value.name : null
-  facts.version = typeof manifest.value.version === 'string' ? manifest.value.version : null
-  facts.dependencies = Object.keys(manifest.value.dependencies ?? {})
+  const manifestValue = recordOf(manifest.value)
+  facts.name = typeof manifestValue.name === 'string' ? manifestValue.name : null
+  facts.version = typeof manifestValue.version === 'string' ? manifestValue.version : null
+  facts.dependencies = objectKeys(manifestValue.dependencies)
   recorder.pass('bundle.manifest', `${manifestPath}（name=${facts.name}）`)
 
   if (facts.name === BUNDLE_NAME) recorder.pass('bundle.name', BUNDLE_NAME)
@@ -262,16 +390,16 @@ function checkBundle(recorder, bundleRoot) {
     })
   }
 
-  if (manifest.value.type === 'module') recorder.pass('bundle.type', 'type: module')
+  if (manifestValue.type === 'module') recorder.pass('bundle.type', 'type: module')
   else {
     recorder.fail('bundle.type', {
       code: CODE_CONFIGURED,
-      detail: `package.json 的 type 是 ${String(manifest.value.type)}，入口是 ESM`,
+      detail: `package.json 的 type 是 ${String(manifestValue.type)}，入口是 ESM`,
       nextStep: '设置 "type": "module"',
     })
   }
 
-  const exportsMap = manifest.value.exports ?? {}
+  const exportsMap = recordOf(manifestValue.exports)
   const entry = exportsMap['.']
   if (entry === ENTRY_EXPORT) recorder.pass('bundle.exports', `${ENTRY_EXPORT} + ./locale/*.json`)
   else {
@@ -303,8 +431,8 @@ function checkBundle(recorder, bundleRoot) {
     })
   }
 
-  const declaredPatch = manifest.value.dsh?.bundle?.patch
-  const patchList = typeof declaredPatch === 'string' ? [declaredPatch] : Array.isArray(declaredPatch) ? declaredPatch : []
+  const declaredPatch = recordOf(recordOf(manifestValue.dsh).bundle).patch
+  const patchList: string[] = typeof declaredPatch === 'string' ? [declaredPatch] : Array.isArray(declaredPatch) ? declaredPatch : []
   if (patchList.length === 0) {
     recorder.fail('bundle.patch', {
       code: CODE_CONFIGURED,
@@ -339,8 +467,9 @@ function checkBundle(recorder, bundleRoot) {
   const localeDir = join(bundleRoot, 'locale')
   const enPath = join(localeDir, 'en.json')
   const en = readJson(enPath)
-  const title = en.ok ? en.value?.meta?.title : undefined
-  const description = en.ok ? en.value?.meta?.description : undefined
+  const enMeta: Record<string, unknown> = en.ok ? recordOf(recordOf(en.value).meta) : {}
+  const title = enMeta.title
+  const description = enMeta.description
   if (en.ok && typeof title === 'string' && title.trim() && typeof description === 'string' && description.trim()) {
     recorder.pass('bundle.locale', `${enPath}（meta.title / meta.description 齐备）`)
   } else {
@@ -359,8 +488,22 @@ function checkBundle(recorder, bundleRoot) {
 // 检查：profile
 // ---------------------------------------------------------------------------
 
-function checkProfile(recorder, profileRoot, bundleRoot) {
-  const facts = {
+/** profile 检查的事实（进 `data.profile`）。 */
+interface ProfileFacts {
+  root: string
+  exists: boolean
+  manifest_ok: boolean
+  bundles: string[]
+  team_profile_enabled: boolean
+  bundle_listed: boolean
+  bundle_declared: boolean
+  bundle_linked: boolean
+  declared_local: string[]
+  linked_local: string[]
+}
+
+function checkProfile(recorder: Recorder, profileRoot: string, bundleRoot: string): ProfileFacts {
+  const facts: ProfileFacts = {
     root: profileRoot,
     exists: false,
     manifest_ok: false,
@@ -397,7 +540,8 @@ function checkProfile(recorder, profileRoot, bundleRoot) {
   facts.manifest_ok = true
   recorder.pass('profile.manifest', manifestPath)
 
-  const bundles = manifest.value.dsh?.profile?.bundles
+  const profileManifest = recordOf(manifest.value)
+  const bundles = recordOf(recordOf(profileManifest.dsh).profile).bundles
   if (!Array.isArray(bundles)) {
     recorder.fail('profile.bundles', {
       code: CODE_CONFIGURED,
@@ -406,7 +550,7 @@ function checkProfile(recorder, profileRoot, bundleRoot) {
     })
     return facts
   }
-  facts.bundles = bundles.filter((item) => typeof item === 'string')
+  facts.bundles = bundles.filter((item: unknown): item is string => typeof item === 'string')
   recorder.pass('profile.bundles', `${facts.bundles.length} 个 bundle`)
 
   facts.team_profile_enabled = facts.bundles.includes(TEAM_PROFILE_BUNDLE)
@@ -429,7 +573,7 @@ function checkProfile(recorder, profileRoot, bundleRoot) {
     })
   }
 
-  const dependencies = { ...(manifest.value.dependencies ?? {}) }
+  const dependencies: Record<string, unknown> = { ...recordOf(profileManifest.dependencies) }
   facts.declared_local = Object.keys(dependencies).filter((name) => name.startsWith('@local/'))
   facts.bundle_declared = Object.hasOwn(dependencies, BUNDLE_NAME)
   if (facts.bundle_declared) recorder.pass('profile.bundle-declared', `${BUNDLE_NAME} → ${String(dependencies[BUNDLE_NAME])}`)
@@ -454,7 +598,10 @@ function checkProfile(recorder, profileRoot, bundleRoot) {
     })
   }
 
-  const missingLinks = facts.declared_local.filter((name) => !facts.linked_local.includes(name.split('/').at(-1)))
+  const missingLinks = facts.declared_local.filter((name) => {
+    const leaf = name.split('/').at(-1)
+    return leaf !== undefined && !facts.linked_local.includes(leaf)
+  })
   if (missingLinks.length === 0) recorder.pass('profile.local-links', 'dependencies 里的 @local 包都有 node_modules 链接')
   else {
     recorder.fail('profile.local-links', {
@@ -483,8 +630,20 @@ const PROJECT_CHECK_IDS = [
   'project.python',
 ]
 
-function checkProject(recorder, projectRoot) {
-  const facts = {
+/** 项目检查的事实（进 `data.project`）。 */
+interface ProjectFacts {
+  root: string
+  exists: boolean
+  index_present: boolean
+  config_present: boolean
+  skill_copy_present: boolean
+  team_rules_present: boolean
+  project_py_present: boolean
+  python: { interpreter: string | null, source: string | null, ok: boolean, version: string | null }
+}
+
+function checkProject(recorder: Recorder, projectRoot: string): ProjectFacts {
+  const facts: ProjectFacts = {
     root: projectRoot,
     exists: false,
     index_present: false,
@@ -595,8 +754,15 @@ function checkProject(recorder, projectRoot) {
 // 入口
 // ---------------------------------------------------------------------------
 
+/** `envelope` 的可选字段。 */
+interface EnvelopeOptions {
+  code?: string | null
+  diagnostics?: Diagnostic[]
+  data?: object | null
+}
+
 /** 构造一个与工具一致的信封；doctor 不成 operation，`operation_id` 恒为 null。 */
-function envelope(status, { code = null, diagnostics = [], data }) {
+function envelope(status: ResultStatus, { code = null, diagnostics = [], data = null }: EnvelopeOptions = {}): Envelope {
   return {
     schema_version: 1,
     status,
@@ -607,6 +773,15 @@ function envelope(status, { code = null, diagnostics = [], data }) {
     diagnostics,
     data,
   }
+}
+
+/** `runDoctor` 的入参（由 `bin/doctor.mjs` 或测试给）。 */
+interface DoctorOptions {
+  profileRoot?: string
+  projectRoot?: string
+  bundleRoot?: string
+  problems?: string[]
+  help?: boolean
 }
 
 /**
@@ -621,7 +796,7 @@ function envelope(status, { code = null, diagnostics = [], data }) {
  * }} options `bundleRoot` 省略时用本包根目录（`bin/` 的上一级）
  * @returns {{ envelope: object, exitCode: number, report: object | null }}
  */
-export function runDoctor(options = {}) {
+export function runDoctor(options: DoctorOptions = {}) {
   // 默认 bundle 根 = 本文件所在目录的上一级（`dist/`→包根，`src/`→包根）。
   const bundleRoot = options.bundleRoot ?? dirname(dirname(fileURLToPath(import.meta.url)))
 
@@ -644,7 +819,9 @@ export function runDoctor(options = {}) {
   }
 
   const problems = [...(options.problems ?? [])]
-  if (options.profileRoot === undefined) problems.push('缺少 --profile（必填：DSH profile 目录）')
+  // 先落成局部常量：`problems` 非空时早返回，之后 `profileRoot` 必是字符串。
+  const profileRoot = options.profileRoot
+  if (profileRoot === undefined) problems.push('缺少 --profile（必填：DSH profile 目录）')
 
   if (problems.length > 0) {
     return {
@@ -673,7 +850,9 @@ export function runDoctor(options = {}) {
 
   const recorder = createChecks()
   const bundle = checkBundle(recorder, bundleRoot)
-  const profile = checkProfile(recorder, options.profileRoot, bundleRoot)
+  // 断言成立的理由：上面 `profileRoot === undefined` 会往 `problems` 塞一条并在下一段早返回，
+  // 所以走到这里 `profileRoot` 必是字符串（运行期没有任何转换）。
+  const profile = checkProfile(recorder, profileRoot as string, bundleRoot)
   let project = null
   if (options.projectRoot === undefined) {
     for (const id of PROJECT_CHECK_IDS) recorder.skip(id, '未提供 --project，跳过项目侧检查')

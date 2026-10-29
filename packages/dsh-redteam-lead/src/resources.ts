@@ -33,36 +33,91 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { ContractError } from './errors.js'
+import { thrownCode } from './guards.js'
+import type { Diagnostic } from './types.js'
+
+/** 一条资源租约（`resources.json` 的权威形状）。 */
+interface Lease {
+  resource_key: string
+  physical_identity: string
+  mode: string
+  dispatch_id: string | null
+  attempt_id: string | null
+  generation: number
+  state: string
+  recovery_ref: string | null
+  acquired_at: string | null
+}
+
+/** 别名表的一项：物理身份 + 是否不可变读取。 */
+interface AliasEntry {
+  physical_identity: string
+  immutable_read: boolean
+}
+
+/** 资源注册表（本模块的权威形状）。 */
+interface ResourceRegistry {
+  schema_version: number
+  revision: number
+  aliases: Record<string, AliasEntry>
+  leases: Lease[]
+}
+
+/** `resources.json` 里一条可接受的租约条目（过滤后四个必填字段已确认是字符串）。 */
+interface LeaseEntry {
+  resource_key: string
+  physical_identity: string
+  mode: string
+  state: string
+  dispatch_id?: unknown
+  attempt_id?: unknown
+  generation?: unknown
+  recovery_ref?: unknown
+  acquired_at?: unknown
+}
 
 /** 项目内资源记录路径（统一 `/`）。 */
 export const RESOURCES_PATH = 're/team/resources.json'
 
 /** 资源模式闭集（`$defs.resource.mode`）。 */
-export const RESOURCE_MODES = Object.freeze(['shared_read', 'exclusive'])
+export const RESOURCE_MODES: readonly string[] = Object.freeze(['shared_read', 'exclusive'])
 
 /** 资源状态闭集（编排契约）。 */
-export const RESOURCE_STATES = Object.freeze(['reserved', 'held', 'quarantined', 'released'])
+export const RESOURCE_STATES: readonly string[] = Object.freeze(['reserved', 'held', 'quarantined', 'released'])
 
 const NEXT_STEP_BINDING =
   '在 re/team/resources.json 的 aliases 里登记该实例的物理身份（physical_identity），再做派发'
 const NEXT_STEP_BUSY =
   '等当前租用结束或核实旧副作用后按恢复流程释放；quarantined 资源必须先走 release + recovery_ref'
 
-function nonEmpty(value) {
+function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
-function invalid(message, nextStep) {
+function invalid(message: string, nextStep: string): ContractError {
   return new ContractError({ code: 'INVALID_ARGUMENT', message, nextStep })
 }
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /** 空注册表。 */
-export function emptyRegistry() {
+export function emptyRegistry(): ResourceRegistry {
   return { schema_version: 1, revision: 0, aliases: {}, leases: [] }
+}
+
+/**
+ * 过滤一条租约条目：四个必填字段必须是字符串且落在闭集里。
+ *
+ * 与原 `.filter(...)` 的判定逐字等价（`includes` 对非字符串本来就返回 false）。
+ */
+function isLeaseEntry(value: unknown): value is LeaseEntry {
+  return isPlainObject(value)
+    && nonEmpty(value.resource_key)
+    && nonEmpty(value.physical_identity)
+    && typeof value.mode === 'string' && RESOURCE_MODES.includes(value.mode)
+    && typeof value.state === 'string' && RESOURCE_STATES.includes(value.state)
 }
 
 /**
@@ -71,7 +126,7 @@ export function emptyRegistry() {
  * @param {unknown} needs `$defs.resource[]`
  * @returns {{ ok: boolean, needs: Array<{resource_key: string, mode: string}>, issues: object[] }}
  */
-export function normalizeResourceNeeds(needs) {
+export function normalizeResourceNeeds(needs: unknown) {
   if (needs === undefined || needs === null) return { ok: true, needs: [], issues: [] }
   if (!Array.isArray(needs)) {
     return {
@@ -80,9 +135,11 @@ export function normalizeResourceNeeds(needs) {
       issues: [{ code: 'INVALID_ARGUMENT', reason: 'resource_needs 必须是数组', next_step: '传 [{resource_key, mode}] 数组' }],
     }
   }
-  const issues = []
-  const byKey = new Map()
-  for (const [index, raw] of needs.entries()) {
+  const issues: Diagnostic[] = []
+  const byKey = new Map<string, { resource_key: string, mode: string }>()
+  // `Array.isArray` 收窄给的是 `any[]`；这里落到 `unknown[]` 再逐项判形状。
+  const needsList: unknown[] = needs
+  for (const [index, raw] of needsList.entries()) {
     if (!isPlainObject(raw)) {
       issues.push({
         code: 'INVALID_ARGUMENT',
@@ -101,7 +158,7 @@ export function normalizeResourceNeeds(needs) {
       continue
     }
     const mode = raw.mode
-    if (!RESOURCE_MODES.includes(mode)) {
+    if (typeof mode !== 'string' || !RESOURCE_MODES.includes(mode)) {
       issues.push({
         code: 'INVALID_ARGUMENT',
         reason: `resource_needs[${index}].mode 必须是 ${RESOURCE_MODES.join('|')}，实际 ${JSON.stringify(mode)}`,
@@ -120,10 +177,11 @@ export function normalizeResourceNeeds(needs) {
  * 注册表归一（容忍手写的最小形状，也接受字符串别名）。
  * @param {unknown} raw
  */
-export function normalizeRegistry(raw) {
+export function normalizeRegistry(raw: unknown): ResourceRegistry {
   const registry = emptyRegistry()
   if (!isPlainObject(raw)) return registry
-  if (Number.isInteger(raw.revision) && raw.revision >= 0) registry.revision = raw.revision
+  const revision = raw.revision
+  if (typeof revision === 'number' && Number.isInteger(revision) && revision >= 0) registry.revision = revision
   if (isPlainObject(raw.aliases)) {
     for (const [key, value] of Object.entries(raw.aliases)) {
       if (!nonEmpty(key)) continue
@@ -140,19 +198,16 @@ export function normalizeRegistry(raw) {
     }
   }
   if (Array.isArray(raw.leases)) {
-    registry.leases = raw.leases
-      .filter((lease) => isPlainObject(lease)
-        && nonEmpty(lease.resource_key)
-        && nonEmpty(lease.physical_identity)
-        && RESOURCE_MODES.includes(lease.mode)
-        && RESOURCE_STATES.includes(lease.state))
+    const rawLeases: unknown[] = raw.leases
+    registry.leases = rawLeases
+      .filter(isLeaseEntry)
       .map((lease) => ({
         resource_key: lease.resource_key,
         physical_identity: lease.physical_identity,
         mode: lease.mode,
         dispatch_id: nonEmpty(lease.dispatch_id) ? lease.dispatch_id : null,
         attempt_id: nonEmpty(lease.attempt_id) ? lease.attempt_id : null,
-        generation: Number.isInteger(lease.generation) && lease.generation > 0 ? lease.generation : 1,
+        generation: typeof lease.generation === 'number' && Number.isInteger(lease.generation) && lease.generation > 0 ? lease.generation : 1,
         state: lease.state,
         recovery_ref: nonEmpty(lease.recovery_ref) ? lease.recovery_ref : null,
         acquired_at: nonEmpty(lease.acquired_at) ? lease.acquired_at : null,
@@ -160,6 +215,11 @@ export function normalizeRegistry(raw) {
   }
   return registry
 }
+
+/** 单个 `resource_key` 的物理身份解析结果。 */
+type ResourceResolution =
+  | { ok: true, resource_key: string, physical_identity: string, immutable_read: boolean, source: 'alias' | 'lease' }
+  | { ok: false, code: 'RESOURCE_BINDING_MISSING', resource_key: string, reason: string, next_step: string }
 
 /**
  * 解析一个 resource_key 的物理身份。
@@ -170,7 +230,7 @@ export function normalizeRegistry(raw) {
  * @param {object} registry
  * @param {string} resourceKey
  */
-export function resolveResource(registry, resourceKey) {
+export function resolveResource(registry: ResourceRegistry, resourceKey: string): ResourceResolution {
   const alias = registry?.aliases?.[resourceKey]
   if (alias && nonEmpty(alias.physical_identity)) {
     return {
@@ -200,7 +260,7 @@ export function resolveResource(registry, resourceKey) {
   }
 }
 
-function maxGeneration(leases, physicalIdentity) {
+function maxGeneration(leases: Lease[], physicalIdentity: string): number {
   let max = 0
   for (const lease of leases) {
     if (lease.physical_identity !== physicalIdentity) continue
@@ -208,6 +268,26 @@ function maxGeneration(leases, physicalIdentity) {
   }
   return max
 }
+
+/** `planReservations` 的入参。 */
+interface PlanReservationsInput {
+  registry: ResourceRegistry
+  needs: Array<{ resource_key: string, mode: string }>
+  dispatchId: string
+  attemptId: string
+  now?: string
+}
+
+/** 资源冲突条目：除诊断两字段外还带持有者/实例信息（wire 上给调用方看）。 */
+interface ResourceConflict extends Record<string, unknown> {
+  reason: string
+  next_step: string
+}
+
+/** 纯规划结果：可租用时给新租约与预留，否则给冲突与诊断。 */
+type PlannedReservations =
+  | { ok: true, leases: Lease[], reservations: Array<Record<string, unknown>>, reused: boolean, gaps: Diagnostic[] }
+  | { ok: false, code: string, conflicts: ResourceConflict[], diagnostics: Diagnostic[] }
 
 /**
  * 纯规划：决定本次派发要新增/复用哪些租约，或为什么不能。
@@ -218,12 +298,12 @@ function maxGeneration(leases, physicalIdentity) {
  *             gaps: object[] }
  *           | { ok: false, code: string, diagnostics: object[], conflicts?: object[] }}
  */
-export function planReservations({ registry, needs, dispatchId, attemptId, now }) {
+export function planReservations({ registry, needs, dispatchId, attemptId, now }: PlanReservationsInput): PlannedReservations {
   const acquiredAt = nonEmpty(now) ? now : new Date().toISOString()
   const leases = (registry?.leases ?? []).map((lease) => ({ ...lease }))
-  const reservations = []
-  const gaps = []
-  const conflicts = []
+  const reservations: Array<Record<string, unknown>> = []
+  const gaps: Diagnostic[] = []
+  const conflicts: ResourceConflict[] = []
   let allReused = true
 
   for (const need of Array.isArray(needs) ? needs : []) {
@@ -328,21 +408,21 @@ export function planReservations({ registry, needs, dispatchId, attemptId, now }
  * @param {string} root 已规范化的绝对根
  * @returns {Promise<object>}
  */
-export async function readRegistry(root) {
+export async function readRegistry(root: string): Promise<ResourceRegistry> {
   const file = join(root, ...RESOURCES_PATH.split('/'))
-  let text
+  let text: string
   try {
     text = await readFile(file, 'utf8')
   } catch (error) {
-    if (error?.code === 'ENOENT') return emptyRegistry()
+    if (thrownCode(error) === 'ENOENT') return emptyRegistry()
     throw new ContractError({
       code: 'RECOVERY_REQUIRED',
-      message: `无法读取 ${RESOURCES_PATH}（${error?.code ?? 'unknown'}）`,
+      message: `无法读取 ${RESOURCES_PATH}（${thrownCode(error) ?? 'unknown'}）`,
       nextStep: '确认项目根可读；资源记录异常时先按恢复流程核实，不要当作没有资源继续租用',
     })
   }
   if (text.trim().length === 0) return emptyRegistry()
-  let parsed
+  let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch {
@@ -364,7 +444,7 @@ export async function readRegistry(root) {
   return normalizeRegistry(parsed)
 }
 
-async function writeRegistry(root, registry, atomic) {
+async function writeRegistry(root: string, registry: ResourceRegistry, atomic: typeof import('./atomic.js')) {
   const file = join(root, ...RESOURCES_PATH.split('/'))
   const payload = {
     schema_version: 1,
@@ -376,13 +456,24 @@ async function writeRegistry(root, registry, atomic) {
   return payload
 }
 
+/** `reserveResources` 的入参。 */
+interface ReserveResourcesInput {
+  root: string
+  needs?: unknown
+  dispatchId: string
+  attemptId: string
+  clock?: { isoNow?: () => string }
+  atomic: typeof import('./atomic.js')
+  now?: string
+}
+
 /**
  * 在**项目锁内**检查并租用资源。冲突/缺映射时**不落盘**。
  *
  * @param {{ root: string, needs: unknown, dispatchId: string, attemptId: string,
  *           clock?: { isoNow?: () => string }, atomic: object, now?: string }} input
  */
-export async function reserveResources(input) {
+export async function reserveResources(input: ReserveResourcesInput) {
   const { root, needs, dispatchId, attemptId, clock, atomic } = input
   const normalized = normalizeResourceNeeds(needs)
   if (!normalized.ok) {
@@ -435,10 +526,22 @@ export async function reserveResources(input) {
   }
 }
 
-function leasesOwnedBy(registry, dispatchId, attemptId) {
+function leasesOwnedBy(registry: ResourceRegistry, dispatchId: string, attemptId: string): Lease[] {
   return registry.leases.filter((lease) => lease.dispatch_id === dispatchId
     && lease.attempt_id === attemptId
     && lease.state !== 'released')
+}
+
+/** `releaseResources` 的入参（`recoveryRef`/`note` 由调用方按需给）。 */
+interface ReleaseResourcesInput {
+  root: string
+  dispatchId: string
+  attemptId: string
+  atomic: typeof import('./atomic.js')
+  clock?: { isoNow?: () => string }
+  /** 恢复依据（项目内相对路径）；给的话写进 released 的租约。 */
+  recoveryRef?: unknown
+  note?: unknown
 }
 
 /**
@@ -447,7 +550,7 @@ function leasesOwnedBy(registry, dispatchId, attemptId) {
  * @param {{ root: string, dispatchId: string, attemptId: string, atomic: object,
  *           clock?: object, note?: string }} input
  */
-export async function releaseResources(input) {
+export async function releaseResources(input: ReleaseResourcesInput) {
   const { root, dispatchId, attemptId, atomic } = input
   const registry = await readRegistry(root)
   const owned = leasesOwnedBy(registry, dispatchId, attemptId)
@@ -472,11 +575,22 @@ export async function releaseResources(input) {
   }
 }
 
+/** `quarantineResources` 的入参。 */
+interface QuarantineResourcesInput {
+  root: string
+  dispatchId: string
+  attemptId: string
+  /** 恢复依据（必填）；只接受非空字符串。 */
+  recoveryRef?: unknown
+  atomic: typeof import('./atomic.js')
+  clock?: { isoNow?: () => string }
+}
+
 /**
  * 把某个 dispatch/attempt 的资源置为 `quarantined`（失败/中断/失联，A22/A33）。
  * 必须给恢复依据（`recovery_ref`），否则只能是普通 `release`。
  */
-export async function quarantineResources(input) {
+export async function quarantineResources(input: QuarantineResourcesInput) {
   const { root, dispatchId, attemptId, recoveryRef, atomic } = input
   if (!nonEmpty(recoveryRef)) {
     throw invalid('quarantine 必须提供 recovery_ref（恢复核查记录的项目内路径）', '先保存恢复记录，再隔离资源')

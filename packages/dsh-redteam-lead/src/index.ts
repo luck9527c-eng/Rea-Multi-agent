@@ -66,6 +66,8 @@ import { handleConclude } from './conclude.js'
 // `*Parameters` 是展开 `$ref` 后的自包含入参 schema；`resultOutput` 是宿主支持子集里的
 // `$defs.result` 投影（`assertSupportedJsonSchema` 不认 `$ref`/`allOf`/类型数组）。
 import { schemaDefs, rosterParameters, dispatchParameters, concludeParameters, resultOutput } from './tool-schema.js'
+import { recordOf } from './guards.js'
+import type { Deps, Envelope, HandlerConfig, HandlerCtx, HandlerResult } from './types.js'
 
 /** 插件名（插件清单/日志用）。 */
 export const name = 'redteam-lead-tools'
@@ -145,7 +147,7 @@ const OPERATION_ID = /^[a-z0-9][a-z0-9_-]{0,95}$/
  * 任一形状都能取到，**不会把 operation id 悄悄丢成 null**。等 T1 统一成一处后可以收成一个键。
  * @param {string | null} operationId
  */
-function envelopeIds(operationId) {
+function envelopeIds(operationId: string | null): { operationId: string | null, operation_id: string | null } {
   return { operationId, operation_id: operationId }
 }
 
@@ -155,15 +157,25 @@ function envelopeIds(operationId) {
  * @param {unknown} args
  * @returns {string | null}
  */
-export function operationIdOf(args) {
+export function operationIdOf(args: unknown): string | null {
   if (args === null || typeof args !== 'object') return null
-  const value = args.operation_id
+  const value = recordOf(args).operation_id
   return typeof value === 'string' && OPERATION_ID.test(value) ? value : null
 }
 
+/** 宿主可选注入的服务：`agentTeams` / `tools`，缺就是 `undefined`。 */
+interface ProbeServices {
+  agentTeams: unknown
+  tools: unknown
+}
+
 /** 探针：宿主可选注入的服务，缺就是 undefined（不要让缺服务把插件拖垮）。 */
-function probeServices(ctx) {
-  const get = typeof ctx?.get === 'function' ? (service) => ctx.get(service) : () => undefined
+function probeServices(ctx: unknown): ProbeServices {
+  const context = recordOf(ctx)
+  // 等价于原来的 `(service) => ctx.get(service)`：有 `get` 就以 `ctx` 为 this 调用，没有就恒 undefined。
+  const get: (service: string) => unknown = typeof context.get === 'function'
+    ? context.get.bind(context)
+    : () => undefined
   return { agentTeams: get('agentTeams'), tools: get('tools') }
 }
 
@@ -182,6 +194,16 @@ function fileSystem() {
   }
 }
 
+/** `createDeps` 的选项：当次调用的服务探针、exec、部署配置与已解析的项目根。 */
+interface CreateDepsOptions {
+  services: ProbeServices
+  exec: unknown
+  config: Record<string, unknown>
+  ctx?: unknown
+  /** 已 `normalizeProjectRoot` 的真实根；`undefined` = 本次没有可用根。 */
+  projectRoot?: string
+}
+
 /**
  * 装配一次调用用的依赖表。**键名与 SEAMS.md 第 1 节逐字一致**（`DEP_KEYS`）。
  *
@@ -198,12 +220,12 @@ function fileSystem() {
  *           projectRoot?: string }} options
  * @returns {object} `ctx.deps`
  */
-export function createDeps({ services, exec, config, ctx = undefined, projectRoot = undefined }) {
+export function createDeps({ services, exec, config, ctx = undefined, projectRoot = undefined }: CreateDepsOptions): Deps {
   const clock = {
     now: () => Date.now(),
     isoNow: () => new Date(clock.now()).toISOString(),
   }
-  const deps = {
+  const deps: Deps = {
     envelope, errors, validate, paths, atomic, lock, identity, operation, audit,
     catalog, capability, capacity,
     teamAdapter: null,
@@ -226,24 +248,38 @@ export function createDeps({ services, exec, config, ctx = undefined, projectRoo
 }
 
 /** `ctx.config`：handler 能看到的部署配置（defaults 来自 patch 里的本包行）。 */
-function configView(config) {
-  const raw = config !== null && typeof config === 'object' ? config : {}
-  const defaults = raw.defaults !== null && typeof raw.defaults === 'object' ? raw.defaults : {}
+function configView(config: unknown): HandlerConfig {
+  const raw = recordOf(config)
+  const defaults = recordOf(raw.defaults)
   return { defaults, presetId: PRESET_ID, bundleRoot: BUNDLE_ROOT }
 }
 
+/** 校验 issue 的可读面（`validate.validateInput()` 的 `issues` 元素）。 */
+interface ValidationIssue {
+  path: string
+  message: string
+}
+
 /** 把校验 issue 压成一句人读的原因（不堆几十行）。 */
-function describeIssues(issues) {
+function describeIssues(issues: readonly ValidationIssue[]): string {
   const shown = issues.slice(0, 8).map((issue) => `${issue.path === '' ? '(root)' : issue.path}: ${issue.message}`)
   const more = issues.length > shown.length ? `（另有 ${issues.length - shown.length} 项）` : ''
   return `入参不符合契约：${shown.join('；')}${more}`
+}
+
+/** `handlerContext` 的入参。 */
+interface HandlerContextOptions {
+  deps: Deps
+  exec: unknown
+  services: ProbeServices
+  config: unknown
 }
 
 /**
  * 组装交给 handler 的上下文（SEAMS 第 1 节的 `HandlerCtx`）。
  * @param {{ deps: object, exec: unknown, services: object, config: object }} options
  */
-export function handlerContext({ deps, exec, services, config }) {
+export function handlerContext({ deps, exec, services, config }: HandlerContextOptions): HandlerCtx {
   return {
     deps,
     exec,
@@ -251,6 +287,19 @@ export function handlerContext({ deps, exec, services, config }) {
     config: configView(config),
     now: deps.clock.now,
   }
+}
+
+/** handler 的契约形状（SEAMS §1）：`(ctx, 已校验入参)` → `{envelope}`，绝不 reject。 */
+type ToolHandler = (ctx: HandlerCtx, input: Record<string, unknown>) => Promise<HandlerResult>
+
+/** `invokeTool` 的入参（测试会传假 handler 验收接缝）。 */
+interface InvokeToolOptions {
+  tool: string
+  args: unknown
+  exec?: unknown
+  ctx?: unknown
+  config?: Record<string, unknown>
+  handlers?: Record<string, Function>
 }
 
 /**
@@ -272,7 +321,7 @@ export function handlerContext({ deps, exec, services, config }) {
  * }} options
  * @returns {Promise<object>} `$defs.result` 信封
  */
-export async function invokeTool(options) {
+export async function invokeTool(options: InvokeToolOptions): Promise<Envelope> {
   const { tool, args, exec = undefined, ctx = undefined, config = {}, handlers = DEFAULT_HANDLERS } = options
   const spec = TOOL_BY_NAME.get(tool)
   if (spec === undefined) {

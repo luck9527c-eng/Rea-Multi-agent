@@ -13,9 +13,11 @@
  */
 
 import { isProjectRelative } from './paths.js'
+import { recordOf } from './guards.js'
+import type { Diagnostic } from './types.js'
 
 /** 六类锚点，顺序与 `$defs.anchorKind` 一致。 */
-export const ANCHOR_KINDS = Object.freeze([
+export const ANCHOR_KINDS: readonly string[] = Object.freeze([
   'binary_location',
   'source_location',
   'web_capture',
@@ -35,7 +37,16 @@ const LOCATOR_KEY = /^[a-z][a-z0-9_]*$/
  * - `conditional`：`when` 存在时追加要求。
  * - `hashes`：值必须是 64 位小写十六进制（目标/内容身份，不允许占位符）。
  */
-export const REQUIRED_FIELDS_BY_KIND = Object.freeze({
+
+/** 一类锚点的最低定位字段规则（上表的一行）。 */
+interface KindRule {
+  all?: readonly string[]
+  anyOf?: readonly (readonly string[])[]
+  conditional?: ReadonlyArray<{ when: string, all?: readonly string[], anyOf?: readonly (readonly string[])[] }>
+  hashes?: readonly string[]
+}
+
+export const REQUIRED_FIELDS_BY_KIND: Readonly<Record<string, KindRule>> = Object.freeze({
   binary_location: {
     all: ['target_id', 'sha256', 'module'],
     anyOf: [['va'], ['rva'], ['file_offset']],
@@ -72,12 +83,15 @@ export const REQUIRED_FIELDS_BY_KIND = Object.freeze({
   },
 })
 
-function issue(code, reason, nextStep) {
+function issue(code: string, reason: string, nextStep: string): Diagnostic {
   return { code, reason, next_step: nextStep }
 }
 
 const NEXT_STEP_LOCATOR =
   '在产物里记录该锚点的最低定位字段，并在 anchor_ref.locator 里给出同一组键值（例如 k=v;k2=v2）；缺项不能靠函数名/URL/evidence ID 替代'
+
+/** `parseLocator` 的结果：可解析就给键值表，否则给一句人读原因。 */
+type ParsedLocator = { ok: true, fields: Record<string, string> } | { ok: false, reason: string }
 
 /**
  * 解析 `locator` 文本为键值表。
@@ -85,16 +99,15 @@ const NEXT_STEP_LOCATOR =
  * @param {unknown} locator
  * @returns {{ ok: true, fields: Record<string, string> } | { ok: false, reason: string }}
  */
-export function parseLocator(locator) {
+export function parseLocator(locator: unknown): ParsedLocator {
   if (typeof locator !== 'string' || locator.trim().length === 0) {
     return { ok: false, reason: 'locator 是非空文本，必须是键值表（k=v;k2=v2 或 JSON 对象）' }
   }
   const text = locator.trim()
-  /** @type {Record<string, string>} */
-  const fields = {}
+  const fields: Record<string, string> = {}
 
   if (text.startsWith('{')) {
-    let parsed
+    let parsed: unknown
     try {
       parsed = JSON.parse(text)
     } catch (error) {
@@ -103,7 +116,7 @@ export function parseLocator(locator) {
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return { ok: false, reason: 'locator 的 JSON 必须是对象' }
     }
-    for (const [key, value] of Object.entries(parsed)) {
+    for (const [key, value] of Object.entries(recordOf(parsed))) {
       if (value === null || value === undefined) continue
       fields[key] = String(value)
     }
@@ -131,9 +144,9 @@ export function parseLocator(locator) {
   return { ok: true, fields }
 }
 
-function requiredIssues(kind, fields) {
+function requiredIssues(kind: string, fields: Record<string, string>): Diagnostic[] {
   const rule = REQUIRED_FIELDS_BY_KIND[kind]
-  const issues = []
+  const issues: Diagnostic[] = []
 
   for (const key of rule.all ?? []) {
     if (!Object.hasOwn(fields, key)) {
@@ -203,9 +216,18 @@ function requiredIssues(kind, fields) {
   return issues
 }
 
-function asStringArray(value) {
-  return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : []
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
+
+/** `validateAnchorRef` 的调用方上下文（`runIds` 缺省表示不校验 RUN 归属）。 */
+interface AnchorRefContext {
+  runIds?: string[]
+  artifactsForRun?: (runId: string) => string[]
+}
+
+/** 单条锚点的校验结果。 */
+type AnchorRefVerdict = { ok: true } | { ok: false, code: 'SUBMISSION_INVALID', issues: Diagnostic[] }
 
 /**
  * 校验单条 `anchor_ref`。
@@ -214,8 +236,8 @@ function asStringArray(value) {
  * @param {{ runIds?: string[], artifactsForRun?: (runId: string) => string[] }} [context]
  * @returns {{ ok: true } | { ok: false, code: 'SUBMISSION_INVALID', issues: Array<{code:string, reason:string, next_step:string}> }}
  */
-export function validateAnchorRef(ref, context = {}) {
-  const issues = []
+export function validateAnchorRef(ref: unknown, context: AnchorRefContext = {}): AnchorRefVerdict {
+  const issues: Diagnostic[] = []
 
   if (ref === null || typeof ref !== 'object' || Array.isArray(ref)) {
     return {
@@ -225,8 +247,9 @@ export function validateAnchorRef(ref, context = {}) {
     }
   }
 
-  const kind = ref.kind
-  if (!ANCHOR_KINDS.includes(kind)) {
+  const anchor = recordOf(ref)
+  const kind = anchor.kind
+  if (typeof kind !== 'string' || !ANCHOR_KINDS.includes(kind)) {
     return {
       ok: false,
       code: 'SUBMISSION_INVALID',
@@ -242,43 +265,43 @@ export function validateAnchorRef(ref, context = {}) {
 
   // run_id
   const runIds = context.runIds === undefined ? null : asStringArray(context.runIds)
-  if (typeof ref.run_id !== 'string' || ref.run_id.length === 0) {
+  if (typeof anchor.run_id !== 'string' || anchor.run_id.length === 0) {
     issues.push(issue('ANCHOR_RUN_MISSING', `${kind} 缺少 run_id`, '锚点必须指向本次交付声明的 RUN'))
-  } else if (runIds !== null && !runIds.includes(ref.run_id)) {
+  } else if (runIds !== null && !runIds.includes(anchor.run_id)) {
     issues.push(
       issue(
         'ANCHOR_RUN_UNKNOWN',
-        `${kind} 指向的 ${ref.run_id} 不在本次交付声明的 RUN 清单里（${runIds.join(', ') || '空'}）`,
+        `${kind} 指向的 ${anchor.run_id} 不在本次交付声明的 RUN 清单里（${runIds.join(', ') || '空'}）`,
         '锚点只能引用本次提交的 RUN；其他 RUN 的证据要另走新提交',
       ),
     )
   }
 
   // path 必须是项目内相对路径，且登记在该 RUN 的 artifacts
-  if (typeof ref.path !== 'string' || ref.path.length === 0) {
+  if (typeof anchor.path !== 'string' || anchor.path.length === 0) {
     issues.push(issue('ANCHOR_PATH_MISSING', `${kind} 缺少 path`, 'path 必须是该项目内、且登记在 RUN artifacts 的相对路径'))
-  } else if (!isProjectRelative(ref.path)) {
+  } else if (!isProjectRelative(anchor.path)) {
     issues.push(
       issue(
         'ANCHOR_PATH_INVALID',
-        `${kind} 的 path 不是合法的项目内相对路径：${JSON.stringify(ref.path)}`,
+        `${kind} 的 path 不是合法的项目内相对路径：${JSON.stringify(anchor.path)}`,
         '改用 / 分隔的项目内相对路径，不要传绝对路径、盘符、反斜杠或 ..',
       ),
     )
-  } else if (typeof context.artifactsForRun === 'function' && typeof ref.run_id === 'string') {
-    const registered = asStringArray(context.artifactsForRun(ref.run_id))
-    if (!registered.includes(ref.path)) {
+  } else if (typeof context.artifactsForRun === 'function' && typeof anchor.run_id === 'string') {
+    const registered = asStringArray(context.artifactsForRun(anchor.run_id))
+    if (!registered.includes(anchor.path)) {
       issues.push(
         issue(
           'ANCHOR_ARTIFACT_UNREGISTERED',
-          `${kind} 的 path 未在 ${ref.run_id} 的 artifacts 登记：${ref.path}`,
+          `${kind} 的 path 未在 ${anchor.run_id} 的 artifacts 登记：${anchor.path}`,
           '先在该 RUN 的 artifacts 里登记产物 path/sha256（正式记录），再引用它做锚点',
         ),
       )
     }
   }
 
-  const parsed = parseLocator(ref.locator)
+  const parsed = parseLocator(anchor.locator)
   if (parsed.ok !== true) {
     issues.push(issue('ANCHOR_LOCATOR_INVALID', `${kind} 的 locator 不可解析：${parsed.reason}`, NEXT_STEP_LOCATOR))
   } else {
@@ -289,14 +312,25 @@ export function validateAnchorRef(ref, context = {}) {
   return { ok: true }
 }
 
+/** `validateAnchorSet` 的入参（`refs` 保持 `unknown[]`：逐条再收窄）。 */
+interface AnchorSetInput {
+  refs?: unknown[]
+  requiredKinds?: string[]
+  runIds?: string[]
+  artifactsForRun?: (runId: string) => string[]
+}
+
+/** 锚点集合的校验结果。 */
+type AnchorSetVerdict = { ok: true } | { ok: false, code: 'SUBMISSION_INVALID', issues: Diagnostic[] }
+
 /**
  * 校验一组锚点：逐条 + 闭集（requiredKinds 必须全部出现）。
  *
  * @param {{ refs?: unknown[], requiredKinds?: string[], runIds?: string[],
  *           artifactsForRun?: (runId: string) => string[] }} input
  */
-export function validateAnchorSet(input = {}) {
-  const issues = []
+export function validateAnchorSet(input: AnchorSetInput = {}): AnchorSetVerdict {
+  const issues: Diagnostic[] = []
   const refs = Array.isArray(input.refs) ? input.refs : null
   if (refs === null) {
     return {
@@ -312,11 +346,13 @@ export function validateAnchorSet(input = {}) {
   })
   issues.push(...merged.issues)
 
-  const present = new Set()
+  const present = new Set<string>()
   for (const ref of refs) {
     const result = validateAnchorRef(ref, { runIds: input.runIds, artifactsForRun: input.artifactsForRun })
     if (result.ok === true) {
-      present.add(ref.kind)
+      // 这一条已被 validateAnchorRef 判为合法锚点，kind 必是已知字符串（见其 UNKNOWN_ANCHOR_KIND 分支）。
+      const kindOfRef = recordOf(ref).kind
+      if (typeof kindOfRef === 'string') present.add(kindOfRef)
       continue
     }
     issues.push(...result.issues)
@@ -338,6 +374,18 @@ export function validateAnchorSet(input = {}) {
   return { ok: true }
 }
 
+/** `mergeRequiredKinds` 的入参：两组可能缺省/形状不对的要求清单。 */
+interface RequiredKindsInput {
+  anchorsRequired?: unknown
+  evidenceRequired?: unknown
+}
+
+/** 合并后的要求：去重排序的 kind 与被跳过的未知 kind 诊断。 */
+interface MergedKinds {
+  kinds: string[]
+  issues: Diagnostic[]
+}
+
 /**
  * 合并锚点要求：岗位默认 ∪ 契约 `evidence_required`，去重并稳定排序。
  *
@@ -346,9 +394,9 @@ export function validateAnchorSet(input = {}) {
  * @param {{ anchorsRequired?: unknown, evidenceRequired?: unknown }} input
  * @returns {{ kinds: string[], issues: Array<{code:string, reason:string, next_step:string}> }}
  */
-export function mergeRequiredKinds(input = {}) {
-  const issues = []
-  const kinds = new Set()
+export function mergeRequiredKinds(input: RequiredKindsInput = {}): MergedKinds {
+  const issues: Diagnostic[] = []
+  const kinds = new Set<string>()
   for (const source of [input.anchorsRequired, input.evidenceRequired]) {
     for (const kind of asStringArray(source)) {
       if (ANCHOR_KINDS.includes(kind)) {

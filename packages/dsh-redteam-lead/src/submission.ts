@@ -14,6 +14,8 @@
  */
 
 import { isProjectRelative } from './paths.js'
+import { recordOf, thrownCode, thrownMessage } from './guards.js'
+import type { Diagnostic, FsLike } from './types.js'
 
 /** 提交记录版本。 */
 export const SUBMISSION_SCHEMA_VERSION = 1
@@ -25,7 +27,7 @@ export const SUBMISSION_FILE = 'submission.json'
 export const WORK_DIR = 're/team/work'
 
 /** 七类 outcome（`$defs.outcome`）。 */
-export const OUTCOMES = Object.freeze([
+export const OUTCOMES: readonly string[] = Object.freeze([
   'finding',
   'no_finding',
   'refuted',
@@ -36,10 +38,10 @@ export const OUTCOMES = Object.freeze([
 ])
 
 /** 交付分类里需要「已完成运行」的几类（岗位成功锚点要求适用）。 */
-export const RUN_BEARING_OUTCOMES = Object.freeze(['finding', 'no_finding', 'refuted', 'failed'])
+export const RUN_BEARING_OUTCOMES: readonly string[] = Object.freeze(['finding', 'no_finding', 'refuted', 'failed'])
 
 /** `submission.json` 的必填字段（契约逐字）。 */
-export const SUBMISSION_FIELDS = Object.freeze([
+export const SUBMISSION_FIELDS: readonly string[] = Object.freeze([
   'schema_version',
   'dispatch_id',
   'attempt_id',
@@ -61,16 +63,27 @@ const ATTEMPT_ID = /^A-[0-9]{6}$/
 const RUN_ID = /^RUN-[A-Za-z0-9_-]+$/
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 
-function issue(code, reason, nextStep) {
+function issue(code: string, reason: string, nextStep: string): Diagnostic {
   return { code, reason, next_step: nextStep }
 }
 
-function text(value) {
+function text(value: unknown): boolean {
   return typeof value === 'string' && value.trim().length > 0
 }
 
-function isPlainObject(value) {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * 把抛出物压成一句「code 优先、其次 message」的细节文本。
+ *
+ * 与原写法 `error?.code ?? error?.message ?? 'unknown'` 等价：非对象抛出物没有这两个字段 → `'unknown'`。
+ */
+function thrownDetail(thrown: unknown): string {
+  const record = recordOf(thrown)
+  const value = record.code ?? record.message
+  return value === undefined || value === null ? 'unknown' : String(value)
 }
 
 /**
@@ -79,7 +92,7 @@ function isPlainObject(value) {
  * @param {string} attemptId
  * @returns {string}
  */
-export function attemptDir(dispatchId, attemptId) {
+export function attemptDir(dispatchId: string, attemptId: string): string {
   return `${WORK_DIR}/${dispatchId}/${attemptId}`
 }
 
@@ -90,10 +103,15 @@ export function attemptDir(dispatchId, attemptId) {
  * @param {string} attemptId
  * @returns {boolean}
  */
-export function isInsideAttempt(relativePath, dispatchId, attemptId) {
+export function isInsideAttempt(relativePath: string, dispatchId: string, attemptId: string): boolean {
   if (!isProjectRelative(relativePath)) return false
   return relativePath.startsWith(`${attemptDir(dispatchId, attemptId)}/`)
 }
+
+/** `validateSubmission` 的结果：通过时给出原对象，否则给出逐条诊断。 */
+type SubmissionVerdict =
+  | { ok: true, submission: Record<string, unknown> }
+  | { ok: false, code: 'SUBMISSION_INVALID', issues: Diagnostic[] }
 
 /**
  * 纯校验：形状、字段、枚举与内部一致性（不读盘，不做跨文件核对）。
@@ -102,7 +120,7 @@ export function isInsideAttempt(relativePath, dispatchId, attemptId) {
  * @returns {{ ok: true, submission: object } | { ok: false, code: 'SUBMISSION_INVALID',
  *   issues: Array<{code:string, reason:string, next_step:string}> }}
  */
-export function validateSubmission(value) {
+export function validateSubmission(value: unknown): SubmissionVerdict {
   if (!isPlainObject(value)) {
     return {
       ok: false,
@@ -111,8 +129,8 @@ export function validateSubmission(value) {
     }
   }
 
-  const issues = []
-  const missing = (field) => {
+  const issues: Diagnostic[] = []
+  const missing = (field: string): void => {
     issues.push(
       issue(
         'SUBMISSION_FIELD_MISSING',
@@ -148,7 +166,7 @@ export function validateSubmission(value) {
   if (Object.hasOwn(value, 'contract_sha256') && (typeof value.contract_sha256 !== 'string' || !SHA256.test(value.contract_sha256))) {
     issues.push(issue('SUBMISSION_INVALID', 'submission.contract_sha256 必须是 64 位小写十六进制', '重算派发契约的 SHA256'))
   }
-  if (Object.hasOwn(value, 'outcome') && !OUTCOMES.includes(value.outcome)) {
+  if (Object.hasOwn(value, 'outcome') && (typeof value.outcome !== 'string' || !OUTCOMES.includes(value.outcome))) {
     issues.push(
       issue(
         'SUBMISSION_INVALID',
@@ -165,8 +183,10 @@ export function validateSubmission(value) {
     if (!Array.isArray(value.run_ids)) {
       issues.push(issue('SUBMISSION_INVALID', 'submission.run_ids 必须是数组（未开始可为空数组）', '未实验即阻塞时给 []，并保存就绪/中断核查'))
     } else {
-      const seen = new Set()
-      for (const runId of value.run_ids) {
+      // `Array.isArray` 收窄给的是 `any[]`；这里落到 `unknown[]`，逐项判类型。
+      const runIds: unknown[] = value.run_ids
+      const seen = new Set<string>()
+      for (const runId of runIds) {
         if (typeof runId !== 'string' || !RUN_ID.test(runId)) {
           issues.push(issue('SUBMISSION_INVALID', `submission.run_ids 含非法 RUN 标识：${JSON.stringify(runId)}`, '使用 RUN-<字母数字_-> 形状'))
           continue
@@ -183,7 +203,9 @@ export function validateSubmission(value) {
     if (!Array.isArray(value.artifacts)) {
       issues.push(issue('SUBMISSION_INVALID', 'submission.artifacts 必须是数组', '每项给 {path, sha256}；没有产物时给 []'))
     } else {
-      value.artifacts.forEach((artifact, index) => {
+      // 同上：`Array.isArray` 的 `any[]` 先落到 `unknown[]`，逐项用谓词收窄。
+      const artifacts: unknown[] = value.artifacts
+      artifacts.forEach((artifact: unknown, index: number) => {
         if (!isPlainObject(artifact)) {
           issues.push(issue('SUBMISSION_INVALID', `submission.artifacts[${index}] 必须是对象`, '给 {path, sha256}'))
           return
@@ -239,9 +261,32 @@ export function validateSubmission(value) {
   return { ok: true, submission: value }
 }
 
-function failure(code, issues) {
+function failure(code: 'PATH_INVALID' | 'SUBMISSION_INVALID', issues: Diagnostic[]): { ok: false, code: 'PATH_INVALID' | 'SUBMISSION_INVALID', issues: Diagnostic[] } {
   return { ok: false, code, issues }
 }
+
+/** `readVerifiedSubmission` 的入参：调用方注入 `paths`/`fs`/`atomic`（本模块不直接 I/O）。 */
+interface ReadVerifiedSubmissionInput {
+  /** 已规范化的项目根。 */
+  root: string
+  /** 项目内相对路径（未校验，本函数先验形状与归属）。 */
+  submissionRef: unknown
+  /** 调用方传入的 `submission_sha256`。 */
+  expectedSha256: unknown
+  dispatchId: unknown
+  attemptId: unknown
+  /** `src/paths.mjs`（或等价实现）。 */
+  paths: typeof import('./paths.js')
+  /** `fs/promises` 形状（需 `readFile`）。 */
+  fs: FsLike
+  /** `src/atomic.mjs`。 */
+  atomic: typeof import('./atomic.js')
+}
+
+/** `readVerifiedSubmission` 的结果。 */
+type VerifiedSubmission =
+  | { ok: true, submission: Record<string, unknown>, bytes: Buffer, sha256: string, relative_path: string }
+  | { ok: false, code: 'PATH_INVALID' | 'SUBMISSION_INVALID', issues: Diagnostic[] }
 
 /**
  * 读取并核对提交：路径归属 → 字节哈希 → 形状 → **再读一次**核对字节未变。
@@ -258,17 +303,17 @@ function failure(code, issues) {
  * @returns {Promise<{ ok: true, submission: object, bytes: Buffer, sha256: string, relative_path: string }
  *   | { ok: false, code: 'PATH_INVALID' | 'SUBMISSION_INVALID', issues: Array<object> }>}
  */
-export async function readVerifiedSubmission(input) {
+export async function readVerifiedSubmission(input: ReadVerifiedSubmissionInput): Promise<VerifiedSubmission> {
   const { root, submissionRef, expectedSha256, dispatchId, attemptId } = input
 
-  let relative
+  let relative: string
   try {
     relative = input.paths.assertProjectRelative(submissionRef)
   } catch (error) {
     return failure('PATH_INVALID', [
       issue(
         'PATH_INVALID',
-        `submission_ref 不是合法的项目内相对路径：${JSON.stringify(submissionRef)}（${error?.message ?? error}）`,
+        `submission_ref 不是合法的项目内相对路径：${JSON.stringify(submissionRef)}（${thrownMessage(error)}）`,
         'submission_ref 必须是当前 attempt 工作目录内的项目相对路径',
       ),
     ])
@@ -298,24 +343,24 @@ export async function readVerifiedSubmission(input) {
     ])
   }
 
-  let absolute
+  let absolute: string
   try {
     absolute = input.paths.resolveInProject(root, relative)
   } catch (error) {
     return failure('PATH_INVALID', [
-      issue('PATH_INVALID', `submission_ref 解析失败：${error?.message ?? error}`, '确认路径仍在项目根内'),
+      issue('PATH_INVALID', `submission_ref 解析失败：${thrownMessage(error)}`, '确认路径仍在项目根内'),
     ])
   }
 
-  let bytes
+  let bytes: Buffer
   try {
     bytes = await input.fs.readFile(absolute)
   } catch (error) {
-    const missing = error && typeof error === 'object' && error.code === 'ENOENT'
+    const missing = thrownCode(error) === 'ENOENT'
     return failure('SUBMISSION_INVALID', [
       issue(
         'SUBMISSION_INVALID',
-        missing ? `提交文件不存在：${relative}` : `提交文件读不了：${relative}（${error?.code ?? error?.message ?? 'unknown'}）`,
+        missing ? `提交文件不存在：${relative}` : `提交文件读不了：${relative}（${thrownDetail(error)}）`,
         '确认工兵已把 submission.json 写进本次 attempt 的工作目录并停止改写',
       ),
     ])
@@ -332,7 +377,7 @@ export async function readVerifiedSubmission(input) {
     ])
   }
 
-  let parsed
+  let parsed: unknown
   try {
     parsed = JSON.parse(bytes.toString('utf8'))
   } catch (error) {
@@ -344,23 +389,24 @@ export async function readVerifiedSubmission(input) {
   const shape = validateSubmission(parsed)
   if (shape.ok !== true) return failure('SUBMISSION_INVALID', shape.issues)
 
-  if (parsed.dispatch_id !== dispatchId || parsed.attempt_id !== attemptId) {
+  const submission = shape.submission
+  if (submission.dispatch_id !== dispatchId || submission.attempt_id !== attemptId) {
     return failure('SUBMISSION_INVALID', [
       issue(
         'SUBMISSION_INVALID',
-        `提交身份与本 attempt 不符：submission=${parsed.dispatch_id}/${parsed.attempt_id}，调用=${dispatchId}/${attemptId}`,
+        `提交身份与本 attempt 不符：submission=${submission.dispatch_id}/${submission.attempt_id}，调用=${dispatchId}/${attemptId}`,
         '用当前 attempt 的提交；别的 attempt 的提交只入历史',
       ),
     ])
   }
 
   // 读取后再核对一次：校验与使用之间被换内容必须暴露。
-  let again
+  let again: Buffer
   try {
     again = await input.fs.readFile(absolute)
   } catch (error) {
     return failure('SUBMISSION_INVALID', [
-      issue('SUBMISSION_INVALID', `提交在读取后不可再读：${relative}（${error?.code ?? 'unknown'}）`, '确认文件稳定后再收口'),
+      issue('SUBMISSION_INVALID', `提交在读取后不可再读：${relative}（${thrownCode(error) ?? 'unknown'}）`, '确认文件稳定后再收口'),
     ])
   }
   const secondSha = input.atomic.sha256Bytes(again)
@@ -374,5 +420,5 @@ export async function readVerifiedSubmission(input) {
     ])
   }
 
-  return { ok: true, submission: parsed, bytes: Buffer.from(bytes), sha256, relative_path: relative }
+  return { ok: true, submission, bytes: Buffer.from(bytes), sha256, relative_path: relative }
 }
