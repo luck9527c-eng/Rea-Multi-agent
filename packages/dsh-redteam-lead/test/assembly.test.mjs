@@ -315,6 +315,12 @@ test('rt_dispatch → rt_conclude：同一份派发记录能被收口按原样�
   const capacity = await deps.teamAdapter.capacity()
   assert.equal(capacity.evidence.source, 'declared:re/team/capacity.json', '容量来源必须是项目声明，不能是 unavailable')
   assert.equal(typeof roster.envelope.data.capacity.remaining_member_slots, 'number', '声明可用时余额必须是数字（D19：known 不上线）')
+  const gapCodes = (roster.envelope.data.gaps ?? []).map((gap) => gap.code)
+  assert.ok(!gapCodes.includes('CAPACITY_UNKNOWN'), `声明了容量就不该报 CAPACITY_UNKNOWN：${gapCodes.join(',')}`)
+  assert.ok(
+    !gapCodes.includes('CAPACITY_DECLARATION_UNREAD'),
+    `项目声明了容量却没被适配器读到（正是 projectRoot 没绑上的症状）：${gapCodes.join(',')}`,
+  )
 
   // —— 3.2 rt_dispatch ——
   const dispatched = await handleDispatch(ctx, {
