@@ -22,6 +22,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ContractError, isErrorCode } from './errors.js';
 import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js';
+import * as pathsModule from './paths.js';
 import * as resourceDefaults from './resources.js';
 import * as contractDefaults from './contract.js';
 /** `$defs.id` */
@@ -49,9 +50,8 @@ const NOTE_ZERO_SIDE_EFFECT = '前置拒绝不建成员、不建任务、不改�
 /**
  * 取 `capacity.planBudget` 的调用视图。
  *
- * 该模块的形参还没标注（默认值把 `candidates` 推成 `never[]`、余额推成 `null`），与它
- * JSDoc 记录的入参形状对不上；先收成 `unknown` 再给出本模块的调用签名。运行期拿到的
- * 还是同一个函数 —— 断言只收敛调用处的类型，不改变任何调用结果（该函数自己兜底非法值）。
+ * `capacity.PlanBudgetInput` 把每个字段都声明成可选 `unknown`，本模块的七个键逐字可赋值给它，
+ * 所以这里**不需要断言**：直接取函数引用即可（运行期拿到的还是同一个函数）。
  */
 function planBudgetOf(module) {
     return module.planBudget;
@@ -307,7 +307,7 @@ function diagnosticsOf(value) {
 // ---------------------------------------------------------------------------
 async function readJsonIfPresent(root, relative) {
     try {
-        const text = await readFile(join(root, ...relative.split('/')), 'utf8');
+        const text = await readFile(pathsModule.resolveInProject(root, relative), 'utf8');
         if (text.trim().length === 0)
             return null;
         return JSON.parse(text);
@@ -363,10 +363,7 @@ function toolNamesOf(ctx) {
 /** attempt 本地记录（dispatch/attempt → task/member 的恢复关联）。 */
 export async function readAttemptRecord(root, dispatchId, attemptId, paths) {
     const ref = contractDefaults.attemptRefFor(dispatchId, attemptId);
-    const resolve = paths?.resolveInProject;
-    const absolute = typeof resolve === 'function'
-        ? resolve.call(paths, root, ref)
-        : join(root, ...ref.split('/'));
+    const absolute = (paths ?? pathsModule).resolveInProject(root, ref);
     try {
         const text = await readFile(absolute, 'utf8');
         const parsed = JSON.parse(text);
@@ -377,7 +374,7 @@ export async function readAttemptRecord(root, dispatchId, attemptId, paths) {
     }
 }
 async function listAttemptRecords(root) {
-    const dir = join(root, ...contractDefaults.ATTEMPTS_DIR.split('/'));
+    const dir = pathsModule.resolveInProject(root, contractDefaults.ATTEMPTS_DIR);
     let names;
     try {
         names = await readdir(dir);
@@ -402,9 +399,9 @@ async function listAttemptRecords(root) {
 }
 async function writeAttemptRecord({ root, atomic, paths, record }) {
     const ref = contractDefaults.attemptRefFor(record.dispatch_id, record.attempt_id);
-    const absolute = paths.assertSafeWriteTarget
+    const absolute = typeof paths?.assertSafeWriteTarget === 'function'
         ? await paths.assertSafeWriteTarget(root, ref)
-        : join(root, ...ref.split('/'));
+        : pathsModule.resolveInProject(root, ref);
     await atomic.writeJsonAtomic(absolute, record);
     return ref;
 }
@@ -803,7 +800,7 @@ function identitiesOf(data) {
 // ---------------------------------------------------------------------------
 async function readContractFile(root, ref) {
     try {
-        const text = await readFile(join(root, ...ref.split('/')), 'utf8');
+        const text = await readFile(pathsModule.resolveInProject(root, ref), 'utf8');
         const parsed = JSON.parse(text);
         return isPlainObject(parsed) ? parsed : null;
     }

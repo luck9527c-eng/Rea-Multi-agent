@@ -24,6 +24,7 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isRecord, thrownCode } from './guards.js';
+import { resolveInProject } from './paths.js';
 /** 适配器契约版本（binding.json 的 `adapter.contract_version`）。 */
 export const CONTRACT_VERSION = 1;
 /** 项目内 skill 副本的相对路径（skill 自己的规则：只用副本，不用全局路径）。 */
@@ -62,7 +63,8 @@ async function isFile(target) {
 async function walk(root, prefix = '', accept = () => true) {
     let entries;
     try {
-        entries = await readdir(path.join(root, ...prefix.split('/').filter(Boolean)), { withFileTypes: true });
+        // 空前缀就是根本身；其余一律走 `paths.resolveInProject`（项目内相对路径的唯一解析器）。
+        entries = await readdir(prefix === '' ? root : resolveInProject(root, prefix), { withFileTypes: true });
     }
     catch {
         return [];
@@ -86,7 +88,7 @@ async function walk(root, prefix = '', accept = () => true) {
 async function hashFiles(root, relatives) {
     const rows = [];
     for (const relative of [...relatives].sort()) {
-        const absolute = path.join(root, ...relative.split('/'));
+        const absolute = resolveInProject(root, relative);
         try {
             rows.push({ path: relative, sha256: sha256(await readFile(absolute)) });
         }
@@ -123,7 +125,7 @@ export async function computeDigests(input = {}) {
     const gaps = [];
     const skillRoot = input.skillRoot ?? (projectRoot === undefined
         ? undefined
-        : path.join(projectRoot, ...SKILL_COPY_RELATIVE.split('/')));
+        : resolveInProject(projectRoot, SKILL_COPY_RELATIVE));
     let ruleFiles = [];
     let scriptFiles = [];
     if (skillRoot === undefined || !await isDirectory(skillRoot)) {

@@ -21,7 +21,6 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
 import { ContractError } from './errors.js';
 import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js';
 import * as defaultPaths from './paths.js';
@@ -486,9 +485,9 @@ export async function assertAttemptPath({ root, dispatchId, attemptId, candidate
 /** 建（或复用）本次尝试的工作目录，返回项目内相对路径。 */
 export async function ensureWorkDir({ root, dispatchId, attemptId, paths = defaultPaths, }) {
     const dir = workDirFor(dispatchId, attemptId);
-    await paths.assertSafeWriteTarget(root, dir);
+    const absolute = await paths.assertSafeWriteTarget(root, dir);
     await paths.assertNoCaseCollision(root, dir);
-    await mkdir(join(root, ...dir.split('/')), { recursive: true });
+    await mkdir(absolute, { recursive: true });
     return dir;
 }
 // ---------------------------------------------------------------------------
@@ -611,7 +610,7 @@ export async function readStartAck({ root, dispatchId, attemptId }) {
     const relative = `${workDirFor(dispatchId, attemptId)}/start.json`;
     let parsed;
     try {
-        const text = await readFile(join(root, ...relative.split('/')), 'utf8');
+        const text = await readFile(defaultPaths.resolveInProject(root, relative), 'utf8');
         parsed = JSON.parse(text);
     }
     catch {
@@ -664,7 +663,7 @@ export async function persistContract({ root, ref, text, atomic, paths = default
 // ---------------------------------------------------------------------------
 async function readProjectJson(root, relative) {
     try {
-        const text = await readFile(join(root, ...relative.split('/')), 'utf8');
+        const text = await readFile(defaultPaths.resolveInProject(root, relative), 'utf8');
         return JSON.parse(text);
     }
     catch (error) {

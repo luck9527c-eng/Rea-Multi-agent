@@ -69,6 +69,7 @@ function normalizePost(raw) {
         optional: copyArray(post.optional),
         anchors_required: copyArray(post.anchors_required),
         prohibited: copyArray(post.prohibited),
+        // 断言：调用方已跑过 validateCatalog()，它证明了 id/四个集合的类型；本函数只搬值不造型。
     };
 }
 function normalizeCapability(raw) {
@@ -531,6 +532,7 @@ export function composeTemplate(templateId, targetKinds = [], catalog = defaultC
         target_kinds: kinds,
         posts,
         // validateCatalog 已保证 reserved/on_demand 里的 ID 都存在于 posts，故这里不会是 undefined。
+        // 断言：`Map.get` 只有「可能 undefined」这一个差异，校验过的 ID 一定命中。
         reserved_posts: normalized.reserved_posts.map((postId) => clonePost(postsById.get(postId))),
         on_demand_posts: normalized.on_demand_posts.map((postId) => clonePost(postsById.get(postId))),
         available_post_count: posts.length,
@@ -541,6 +543,7 @@ export function composeTemplate(templateId, targetKinds = [], catalog = defaultC
  * 且只有它会把目录冻上），因此它就是 `NormalizedCatalog`。
  */
 function asNormalizedCatalog(catalog) {
+    // 断言：已冻结的目录只可能是 normalizeCatalog() 的产物（本模块是唯一规范化入口）。
     return catalog;
 }
 /** 按 ID 取岗位（含 disabled / on_demand / reserved），目录缺该 ID 时返回 null。 */

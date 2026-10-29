@@ -13,9 +13,9 @@
  * 并发由项目锁协调（调用方持有 `re/team/lock`），本模块只做读-改-写。
  */
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { ContractError } from './errors.js';
 import { isRecord, thrownCode } from './guards.js';
+import { resolveInProject } from './paths.js';
 import { writeJsonAtomic } from './atomic.js';
 /** 项目内台账目录。 */
 export const OPERATIONS_DIR = 're/team/operations';
@@ -85,7 +85,7 @@ function isPlainObject(value) {
  */
 export function operationRecordPath(root, operationId) {
     assertOperationId(operationId);
-    return join(root, ...OPERATIONS_DIR.split('/'), `${operationId}.json`);
+    return resolveInProject(root, `${OPERATIONS_DIR}/${operationId}.json`);
 }
 /**
  * 创建绑定到某个项目根的 operation 台账。
