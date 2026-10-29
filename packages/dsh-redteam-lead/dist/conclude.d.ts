@@ -210,6 +210,12 @@ type RouteUpdateResult = {
  *
  * 只写 review 有依据的判定：不臆造 closure 里的实验事实（缺就拒绝，见 `closureForStatus`）。
  *
+ * 两个返回位分得很开，调用方不要混用：
+ * - `historyAppended`：**只**随真实状态迁移为真（`from !== nextStatus`）；
+ * - `changed`：任一受管字段（`MANAGED_ROUTE_FIELDS`）与入参路线不同即为真 ——
+ *   状态没变但 `evidence`/`state_reason`/`resume_when`/`closure` 变了，也必须落盘。
+ *   也不得恒为真：那样每次收口都会给路线文件打一次戳（有专门用例守着）。
+ *
  * @returns {{ok:true, route:object, changed:boolean, historyAppended:boolean}
  *   | {ok:false, code:'CHECK_FAILED', issues:object[]}}
  */
