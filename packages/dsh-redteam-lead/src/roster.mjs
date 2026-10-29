@@ -40,6 +40,13 @@ const NOT_CONFIGURED_GAP_CODES = new Set([
 const NEXT_STEP_REPROPOSE =
   '重新 rt_roster action=inspect 生成新的 proposal_hash，确认后再 bind；不要复用过期提议'
 
+/**
+ * 缺团队服务时的固定入口（契约「自检、会话接管与 Lead 循环」：`bin/doctor.mjs` 不依赖插件挂载）。
+ */
+const NEXT_STEP_SERVICE =
+  '启用 @deepseek-ai/dsh-experimental-agent-team-profile（profile 的 dsh.profile.bundles）后重试；'
+  + '缺服务时先跑不依赖插件挂载的只读自检：node <bundle-root>/bin/doctor.mjs --profile <profile-root> --project <project-root>'
+
 function depsOf(ctx) {
   const value = ctx && typeof ctx === 'object' ? ctx.deps : null
   const deps = value && typeof value === 'object' ? value : {}
@@ -450,7 +457,7 @@ function orderPosts(entries, priorityOf) {
     })
 }
 
-async function readCapacity(deps, env) {
+async function readCapacity(deps, root, env) {
   const adapter = deps.teamAdapter
   if (!adapter || typeof adapter.capacity !== 'function') {
     return {
@@ -459,7 +466,7 @@ async function readCapacity(deps, env) {
       diagnostics: [env.diagnostic(
         'TEAM_SERVICE_UNAVAILABLE',
         '没有团队适配器，取不到成员席位与 activation 上限',
-        '启用团队 profile bundle 后重试；不要用常数代替余额',
+        NEXT_STEP_SERVICE,
       )],
       memberSlots: { known: false, remaining: null, total: null, used: null },
       activations: { known: false, remaining: null, total: null },
@@ -467,15 +474,38 @@ async function readCapacity(deps, env) {
     }
   }
   const value = await adapter.capacity()
-  if (value && typeof value === 'object') return value
-  return {
-    ok: false,
-    code: 'RECOVERY_REQUIRED',
-    diagnostics: [env.diagnostic('RECOVERY_REQUIRED', '团队适配器没有返回容量对象', '核对 team-adapter 版本后重试')],
-    memberSlots: { known: false, remaining: null, total: null, used: null },
-    activations: { known: false, remaining: null, total: null },
-    gaps: [],
+  if (!value || typeof value !== 'object') {
+    return {
+      ok: false,
+      code: 'RECOVERY_REQUIRED',
+      diagnostics: [env.diagnostic('RECOVERY_REQUIRED', '团队适配器没有返回容量对象', '核对 team-adapter 版本后重试')],
+      memberSlots: { known: false, remaining: null, total: null, used: null },
+      activations: { known: false, remaining: null, total: null },
+      gaps: [],
+    }
   }
+
+  // 诊断用：项目里明明声明了容量，但适配器没读到（典型原因是装配时没把 project_root 交给它）。
+  // 这里只**报告**，不改预算口径 —— 容量仍按适配器给的值走（D1/D25）。
+  if (value.memberSlots?.total === null && typeof adapter.readDeclaredCapacity === 'function') {
+    try {
+      const declared = await adapter.readDeclaredCapacity(root)
+      if (declared?.known === true) {
+        const gaps = Array.isArray(value.gaps) ? value.gaps : []
+        return {
+          ...value,
+          gaps: [...gaps, {
+            code: 'CAPACITY_DECLARATION_UNREAD',
+            detail: `项目声明了容量（${declared.path ?? 're/team/capacity.json'}：maxMembers=${declared.maxMembers}、maxActiveSubagents=${declared.maxActiveSubagents}），但团队适配器没有读到它`,
+            nextStep: '由装配层把本次 project_root 传给 createTeamAdapter（或把容量声明放进 profile 的 config.capacity）；在此之前按 CAPACITY_UNKNOWN 处理，不猜余额',
+          }],
+        }
+      }
+    } catch {
+      // 诊断失败不影响容量口径
+    }
+  }
+  return value
 }
 
 /** `capacity().gaps`（`{code, detail, nextStep}`）→ 诊断。 */
@@ -566,7 +596,7 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
     }))
   }
 
-  const cap = await readCapacity(deps, env)
+  const cap = await readCapacity(deps, root, env)
   if (cap.ok === false) {
     return {
       ok: false,
@@ -660,7 +690,7 @@ async function assembleEnvironmentOnly(ctx, deps, { root, request, compatibility
     ))
   }
 
-  const cap = await readCapacity(deps, env)
+  const cap = await readCapacity(deps, root, env)
   if (cap.ok === false) return { ok: false, code: cap.code, diagnostics: cap.diagnostics ?? [] }
 
   const remainingActivations = cap.activations.known === true ? cap.activations.total : null
@@ -820,11 +850,18 @@ async function runRoster(ctx, deps, input, env) {
   const identity = await deps.identity.resolveCaller(ctx)
   if (!identity || identity.ok !== true) {
     const code = identity?.code === 'TEAM_SERVICE_UNAVAILABLE' ? 'TEAM_SERVICE_UNAVAILABLE' : 'ROLE_REQUIRED'
-    const diagnostic = identity?.diagnostic ?? env.diagnostic(
-      code,
-      '无法解析调用者身份',
-      '在团队会话内以 Lead 或 teammate 身份调用',
-    )
+    // 缺服务必须给出**可执行**的修复路径（doctor 不依赖插件挂载），而不是含糊「服务不可用」。
+    const diagnostic = code === 'TEAM_SERVICE_UNAVAILABLE'
+      ? env.diagnostic(
+        code,
+        identity?.diagnostic?.reason ?? '宿主未注入团队服务，无法判定调用者身份',
+        NEXT_STEP_SERVICE,
+      )
+      : (identity?.diagnostic ?? env.diagnostic(
+        code,
+        '无法解析调用者身份',
+        '在团队会话内以 Lead 或 teammate 身份调用',
+      ))
     const envelope = code === 'ROLE_REQUIRED'
       ? env.error({ code, operationId, diagnostics: [diagnostic] })
       : env.blocked({ code, operationId, diagnostics: [diagnostic] })

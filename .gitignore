@@ -3,3 +3,6 @@ node_modules/
 .DSH/
 tmp/
 dist/
+
+# 子代理临时脚本
+.tmp-*

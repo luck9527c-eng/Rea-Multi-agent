@@ -25,6 +25,7 @@ import { readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 
 import { handleRoster } from '../src/roster.mjs'
+import { createTeamAdapter } from '../src/team-adapter.mjs'
 import { validateInput } from '../src/validate.mjs'
 import { makeCtx, makeTempProject } from './helpers/host.mjs'
 
@@ -949,6 +950,27 @@ test('缺 Python / 非默认布局 → SKILL_INCOMPATIBLE，并点名具体缺�
   const layoutGap = layoutResult.envelope.data.gaps.find((gap) => gap.code === 'PROJECT_LAYOUT_UNSUPPORTED')
   assert.ok(layoutGap)
   assert.match(layoutGap.reason, /legacy-flat/u)
+})
+
+test('项目声明了容量但适配器没读到 → 明确诊断，仍按 CAPACITY_UNKNOWN 处理', async (t) => {
+  const project = makeTempProject({ t })
+  const ctx = leadCtx(t, project)
+  // 模拟装配层没把 project_root 交给适配器：容量声明在项目里，但适配器创建时没有根。
+  ctx.deps.teamAdapter = createTeamAdapter({
+    services: ctx.services,
+    exec: ctx.exec,
+    config: {},
+  })
+
+  const { envelope } = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  assert.equal(envelope.status, 'ok')
+  assert.equal(envelope.data.capacity.remaining_member_slots, null)
+  assert.equal(envelope.data.capacity.remaining_activations, null)
+  assert.equal(envelope.data.recommended_members, 0)
+  const unread = envelope.data.gaps.find((gap) => gap.code === 'CAPACITY_DECLARATION_UNREAD')
+  assert.ok(unread, '必须点名「声明了但读不到」')
+  assert.match(unread.reason, /maxMembers=8/u)
+  assert.ok(envelope.data.gaps.some((gap) => gap.code === 'CAPACITY_UNKNOWN'))
 })
 
 // ---------------------------------------------------------------------------
