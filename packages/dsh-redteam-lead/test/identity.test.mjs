@@ -140,3 +140,51 @@ test('resolveCaller 永不 reject：空 ctx 与 undefined 都返回结构化结�
     assert.equal(caller.code, 'TEAM_SERVICE_UNAVAILABLE')
   }
 })
+
+test('deps.teamAdapter 是工厂函数时（SEAMS §1 形状）按调用参数建一次实例', async () => {
+  const seen = []
+  const factory = (bindings) => {
+    seen.push(bindings)
+    return {
+      async membership(agent) {
+        return { ok: true, member: { id: 'm-1', name: 'lead', role: 'lead', root: 'root-1' } }
+      },
+    }
+  }
+  const ctx = {
+    exec: { agent: { id: 'agent-1' } },
+    services: { agentTeams: {} },
+    config: { presetId: 'redteam-lead' },
+    deps: { teamAdapter: factory },
+  }
+
+  const caller = await resolveCaller(ctx)
+  assert.deepEqual(caller, { ok: true, role: 'lead', name: 'lead', root: 'root-1' })
+  assert.equal(seen.length, 1)
+  assert.deepEqual(seen[0], {
+    services: ctx.services,
+    exec: ctx.exec,
+    config: ctx.config,
+    deps: ctx.deps,
+  })
+})
+
+test('适配器工厂抛异常或返回坏实例时降级为 TEAM_SERVICE_UNAVAILABLE', async () => {
+  const throwing = {
+    exec: { agent: { id: 'agent-1' } },
+    deps: {
+      teamAdapter: () => {
+        throw new Error('no team service')
+      },
+    },
+  }
+  const failed = await resolveCaller(throwing)
+  assert.equal(failed.ok, false)
+  assert.equal(failed.code, 'TEAM_SERVICE_UNAVAILABLE')
+  assert.match(failed.diagnostic.reason, /no team service/)
+
+  const useless = { exec: { agent: { id: 'agent-1' } }, deps: { teamAdapter: () => ({}) } }
+  const broken = await resolveCaller(useless)
+  assert.equal(broken.ok, false)
+  assert.equal(broken.code, 'TEAM_SERVICE_UNAVAILABLE')
+})

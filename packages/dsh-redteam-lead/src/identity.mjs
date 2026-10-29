@@ -3,6 +3,7 @@
  *
  * **唯一**身份来源是宿主执行上下文：`ctx.exec.agent` + 团队服务的成员查询
  * （SEAMS §2：`ctx.deps.teamAdapter.membership(agent)`；T1 ticket 里写作 `ctx.agentTeams`）。
+ * `deps.teamAdapter` 既可能是适配器实例，也可能是 SEAMS §1 规定的工厂函数，两种都接受。
  * 入参、提示词、agent 名字字符串、以及任何自报的 `role` 字段**一律忽略** ——
  * 否则普通裸子代理可以直接自称 Lead。
  *
@@ -41,23 +42,38 @@ function roleRequired(reason) {
 
 /**
  * 找到成员查询来源：
- * 1. `ctx.deps.teamAdapter`（SEAMS 钉死的接缝，T4 薄封装，永不 reject）；
+ * 1. `ctx.deps.teamAdapter`（SEAMS 钉死的接缝，T4 薄封装，永不 reject）：
+ *    SEAMS §1 的 deps 表把 `teamAdapter` 定为**工厂函数**，而 §2 又写
+ *    `ctx.deps.teamAdapter.membership(...)` —— 两种形状这里都接受：
+ *    实例（有 `membership` 方法）直接用；函数则按 `createTeamAdapter({services, exec, config, deps})`
+ *    建一次当次调用的实例；
  * 2. `ctx.agentTeams` / `ctx.services.agentTeams`（宿主原始服务，T1 ticket 的形态；
  *    `tryMembership` 优先，缺失时退回会抛异常的 `membership`）。
+ *
+ * @returns {Promise<{ query: (agent: unknown) => Promise<object> } | { error: string } | null>}
  */
-function membershipSource(ctx) {
+async function membershipSource(ctx) {
   const adapter = ctx?.deps?.teamAdapter
   if (adapter && typeof adapter.membership === 'function') {
-    return {
-      kind: 'adapter',
-      query: (agent) => adapter.membership(agent),
+    return { query: (agent) => adapter.membership(agent) }
+  }
+  if (typeof adapter === 'function') {
+    // SEAMS §1：工厂函数形状，每次工具调用新建一次实例，把当次上下文绑进去。
+    let instance
+    try {
+      instance = await adapter({ services: ctx.services, exec: ctx.exec, config: ctx.config, deps: ctx.deps })
+    } catch (error) {
+      return { error: `团队适配器工厂创建失败：${error?.message ?? String(error)}` }
     }
+    if (instance && typeof instance.membership === 'function') {
+      return { query: (agent) => instance.membership(agent) }
+    }
+    return { error: '团队适配器工厂没有返回带 membership 的实例' }
   }
 
   const host = ctx?.agentTeams ?? ctx?.services?.agentTeams
   if (host && typeof host.tryMembership === 'function') {
     return {
-      kind: 'host',
       query: async (agent) => {
         const member = await host.tryMembership(agent)
         return member ? { ok: true, member } : { ok: false, code: 'ROLE_REQUIRED' }
@@ -66,7 +82,6 @@ function membershipSource(ctx) {
   }
   if (host && typeof host.membership === 'function') {
     return {
-      kind: 'host',
       query: async (agent) => {
         try {
           const member = await host.membership(agent)
@@ -115,9 +130,12 @@ export async function resolveCaller(ctx) {
   const agent = ctx?.exec?.agent
   if (!agent) return unavailable('缺少可信执行身份 ctx.exec.agent，无法判定调用者角色')
 
-  const source = membershipSource(ctx)
+  const source = await membershipSource(ctx)
   if (source === null) {
     return unavailable('宿主未注入团队服务（deps.teamAdapter 与 ctx.agentTeams 都不可用）')
+  }
+  if (source.error) {
+    return unavailable(source.error)
   }
 
   let result
