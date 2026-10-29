@@ -363,8 +363,8 @@ test('bind：proposal_hash 匹配时写 binding + roster，成员仍为 0，INDE
   assert.equal(binding.team_id, envelope.data.team_id)
   assert.equal(binding.epoch, 1)
   // 摘要来自项目探测（替身给出固定值），证明 rule/script/catalog 三类摘要真的被记下来了。
-  assert.equal(binding.ruleDigest, 'r'.repeat(64))
-  assert.equal(binding.scriptDigest, 's'.repeat(64))
+  assert.equal(binding.ruleDigest, 'a'.repeat(64))
+  assert.equal(binding.scriptDigest, 'b'.repeat(64))
   assert.equal(binding.catalogDigest, 'c'.repeat(64))
   assert.equal(binding.bindingDigest, hash)
   assert.equal(binding.adapter.contract_version, 1)

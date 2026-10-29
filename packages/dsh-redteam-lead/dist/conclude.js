@@ -1383,7 +1383,34 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
     const link = attempt.record;
     const post = pick('post');
     const rawBaseline = pick('baseline_ref');
-    const compatibility = pick('compatibility');
+    const compatibility = recordOf(pick('compatibility'));
+    // 缺陷 1（fail-closed）：规则版本必须由派发侧冻结过。缺摘要或摘要不合形状都**不放行** ——
+    // 那正是原来的 bug：没有摘要就整段跳过比对，副本在执行期被改写也发现不了。
+    const rawRuleDigest = pick('rule_digest')
+        ?? (typeof compatibility.ruleDigest === 'string' ? compatibility.ruleDigest : null);
+    const ruleDigest = typeof rawRuleDigest === 'string' && SHA256.test(rawRuleDigest) ? rawRuleDigest : null;
+    if (ruleDigest === null) {
+        return {
+            ok: false,
+            code: 'RECOVERY_REQUIRED',
+            issues: [
+                diag('RECOVERY_REQUIRED', `派发记录没有冻结规则摘要（rule_digest）：${ref}`, '先核查该派发记录（可能被外部改写或来自旧版本）；缺摘要就无法判断项目规则副本是否在执行期被改，不能收口'),
+            ],
+        };
+    }
+    // 缺陷 2（fail-closed）：锚点门槛不能被静默清零。记录明确指向一个岗位（有 `post_id` 或 `post`）
+    // 却两处都拿不到锚点要求时，本条交付是否达到门槛无从判断 —— 只能按恢复流程核查该记录，
+    // **不能**用「空数组」当作兼容旧记录。两处都是数组时以顶层为准（与 T6 契约的摆放顺序一致）。
+    const topAnchors = pick('anchors_required');
+    const postAnchors = recordOf(post).anchors_required;
+    const anchorsRequired = Array.isArray(topAnchors)
+        ? topAnchors
+        : (Array.isArray(postAnchors) ? postAnchors : null);
+    const postId = pick('post_id');
+    const pointsAtPost = (typeof postId === 'string' && postId.trim().length > 0) || isPlainObject(post);
+    // `evidence_required` 允许是空数组，但**必须显式存在**：缺键说明记录被剥掉了字段，
+    // 不能当成「没有证据要求」（那同样是把门槛静默清零）。
+    const rawEvidence = pick('evidence_required');
     const flat = {
         ref,
         dispatch_id: pick('dispatch_id') ?? dispatchId,
@@ -1392,13 +1419,13 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
         route_id: pick('route_id') ?? null,
         member: pick('member') ?? pick('member_name') ?? link?.member ?? null,
         contract_sha256: pick('contract_sha256') ?? link?.contract_sha256 ?? null,
-        rule_digest: pick('rule_digest') ?? (typeof recordOf(compatibility).ruleDigest === 'string' ? recordOf(compatibility).ruleDigest : null),
+        rule_digest: ruleDigest,
         // 路径（项目内相对）与内联快照都收：`loadBaseline` 用 `ref` 读文件、用 `embedded` 直接校验。
         baseline_ref: typeof rawBaseline === 'string' ? rawBaseline : null,
         baseline: pick('baseline') ?? (isPlainObject(rawBaseline) ? rawBaseline : null),
         target_ids: pick('target_ids') ?? [],
-        anchors_required: pick('anchors_required') ?? (Array.isArray(recordOf(post).anchors_required) ? recordOf(post).anchors_required : []),
-        evidence_required: pick('evidence_required') ?? [],
+        anchors_required: anchorsRequired ?? [],
+        evidence_required: rawEvidence ?? [],
         work_dir: pick('work_dir') ?? null,
         contract_ref: pick('contract_ref') ?? null,
     };
@@ -1407,6 +1434,24 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
             ok: false,
             code: 'RECOVERY_REQUIRED',
             issues: [diag('RECOVERY_REQUIRED', `派发记录缺少合法 route_id：${ref}`, '派发记录必须绑定路线；缺失时按恢复流程核对，不要从提交猜路线')],
+        };
+    }
+    if (anchorsRequired === null && (pointsAtPost || topAnchors !== undefined || postAnchors !== undefined)) {
+        return {
+            ok: false,
+            code: 'RECOVERY_REQUIRED',
+            issues: [
+                diag('RECOVERY_REQUIRED', `派发记录没有冻结锚点要求：${ref}（既没有顶层 anchors_required，也没有 post.anchors_required）`, '先核查该派发记录（可能被外部改写或来自旧版本）；不能把「读不到要求」当成「没有要求」，否则零锚点交付会被放行'),
+            ],
+        };
+    }
+    if (!Array.isArray(rawEvidence)) {
+        return {
+            ok: false,
+            code: 'RECOVERY_REQUIRED',
+            issues: [
+                diag('RECOVERY_REQUIRED', `派发记录缺少 evidence_required（它允许为空数组，但必须显式存在）：${ref}`, '按恢复流程核对派发记录；缺键不能假定「没有证据要求」'),
+            ],
         };
     }
     return { ok: true, record: flat };
@@ -1486,10 +1531,23 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
             }),
         };
     }
-    // 断言的理由：`ok:true` 的适配器确实带 `task`（`projectTask()` 的产物），下面沿用原有的
-    // `task.status` / `task.revision` **直接解引用**（历史行为：`task` 是 null 时抛错由外层兜底），
-    // 所以这里贴回记录形状而不是用 `recordOf` 把 null 读成 `{}` —— 那会改变这条错误路径的结论。
-    const task = resultOf(taskResult.task);
+    // 缺陷 3：适配器给出 `{ok:true, task:null}`（宿主把记录交回成非对象）时不能直接解引用 ——
+    // 那是「记录被外部改写」的**异常状态**，要返回可读的 blocked，而不是让 TypeError 冒到外层
+    // 变成 error 信封（也不是静默当成「没有这条记录」）。
+    const taskRecord = taskResult.task;
+    if (!isPlainObject(taskRecord)) {
+        return {
+            ok: false,
+            envelope: en.blocked({
+                code: 'RECOVERY_REQUIRED',
+                operationId,
+                reason: `任务 ${input.task_id} 的记录为空（宿主 getTask 返回 ok 但没有任务对象），可能被外部改写`,
+                nextStep: '按恢复流程核对任务板与成员名册；确认任务真实状态后再决定重派或收口，不要凭提交自证',
+                data: { phase: 'preflight', task_id: input.task_id },
+            }),
+        };
+    }
+    const task = taskRecord;
     if (task.status === 'deleted') {
         return {
             ok: false,
@@ -1554,8 +1612,21 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
             }),
         };
     }
-    // 断言的理由同上：`ok:true` 的 `readRoute()` 带解析后的路线记录；下面沿用原来的直接解引用。
-    const route = resultOf(routeResult.route);
+    // 缺陷 3（同一处）：路线文件被写成 `null` 时同样按异常状态处理，返回可读的 blocked。
+    const routeRecord = routeResult.route;
+    if (!isPlainObject(routeRecord)) {
+        return {
+            ok: false,
+            envelope: en.blocked({
+                code: 'RECOVERY_REQUIRED',
+                operationId,
+                reason: `路线 ${dispatch.route_id} 的记录为空（readRoute 返回 ok 但没有路线对象），可能被外部改写`,
+                nextStep: '按恢复流程核对 re/routes 下的路线记录；确认路线真实状态后再收口，不要从提交猜路线',
+                data: { phase: 'preflight', route_id: dispatch.route_id },
+            }),
+        };
+    }
+    const route = routeRecord;
     if (route.id !== dispatch.route_id) {
         return {
             ok: false,
@@ -1568,34 +1639,33 @@ async function checkPremises({ envelope: en, team, project, dispatch, input, ope
             }),
         };
     }
-    // 规则版本：派发时冻结过规则摘要才比对（副本变化需要重做兼容性检查，见 D8）。
-    if (typeof dispatch.rule_digest === 'string' && SHA256.test(dispatch.rule_digest)) {
-        const probe = recordOf(await project.probe({ projectRoot: root }));
-        const current = recordOf(probe.compatibility).ruleDigest ?? null;
-        if (probe.ok !== true || current === null) {
-            return {
-                ok: false,
-                envelope: en.blocked({
-                    code: 'SKILL_INCOMPATIBLE',
-                    operationId,
-                    reason: `无法复核项目规则版本（probe: ${probe.reason ?? probe.code ?? 'unknown'}）`,
-                    nextStep: '先按 rt_roster 的接入检查确认项目副本完整，再收口',
-                    data: { phase: 'preflight', route_id: dispatch.route_id },
-                }),
-            };
-        }
-        if (current !== dispatch.rule_digest) {
-            return {
-                ok: false,
-                envelope: en.blocked({
-                    code: 'SKILL_INCOMPATIBLE',
-                    operationId,
-                    reason: `项目规则副本在派发后变化（冻结 ${dispatch.rule_digest}，当前 ${current}）`,
-                    nextStep: '按 skill 重做兼容性检查并保留旧绑定；未完成尝试继续绑定原规则或显式重派，不能静默换规则',
-                    data: { phase: 'preflight', route_id: dispatch.route_id },
-                }),
-            };
-        }
+    // 规则版本：派发时**必须**已经冻结摘要（`readDispatchContext` 缺摘要就按 RECOVERY_REQUIRED 拒绝），
+    // 所以这里无条件比对当前副本的摘要。副本在执行期被改 → SKILL_INCOMPATIBLE，不能静默换规则（D8）。
+    const probe = recordOf(await project.probe({ projectRoot: root }));
+    const current = recordOf(probe.compatibility).ruleDigest ?? null;
+    if (probe.ok !== true || current === null) {
+        return {
+            ok: false,
+            envelope: en.blocked({
+                code: 'SKILL_INCOMPATIBLE',
+                operationId,
+                reason: `无法复核项目规则版本（probe: ${probe.reason ?? probe.code ?? 'unknown'}）`,
+                nextStep: '先按 rt_roster 的接入检查确认项目副本完整，再收口',
+                data: { phase: 'preflight', route_id: dispatch.route_id },
+            }),
+        };
+    }
+    if (current !== dispatch.rule_digest) {
+        return {
+            ok: false,
+            envelope: en.blocked({
+                code: 'SKILL_INCOMPATIBLE',
+                operationId,
+                reason: `项目规则副本在派发后变化（冻结 ${dispatch.rule_digest}，当前 ${current}）`,
+                nextStep: '按 skill 重做兼容性检查并保留旧绑定；未完成尝试继续绑定原规则或显式重派，不能静默换规则',
+                data: { phase: 'preflight', route_id: dispatch.route_id },
+            }),
+        };
     }
     const impact = recordOf(await project.impact());
     if (impact.ok !== true) {

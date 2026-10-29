@@ -14,6 +14,8 @@ import { createFakeTeam } from './helpers/fake-team.mjs'
 import { handleConclude } from '../dist/conclude.js'
 
 const SHA = (char) => char.repeat(64)
+/** 派发侧冻结的规则摘要（与 `fake-project` 的默认探测结果一致，代表「副本没被改过」）。 */
+const FROZEN_RULE = 'a'.repeat(64)
 
 const DISPATCH = 'D-abc123'
 const ATTEMPT = 'A-000001'
@@ -127,7 +129,9 @@ async function setup(t, options = {}) {
   project.write(`re/runs/${RUN}/run.json`, run)
   const runJsonBefore = await project.read(`re/runs/${RUN}/run.json`)
 
-  const route = options.routeOverride ?? routeFixture({ status: options.routeStatus ?? 'active', closure: options.routeClosure ?? null })
+  const route = options.routeOverride === undefined
+    ? routeFixture({ status: options.routeStatus ?? 'active', closure: options.routeClosure ?? null })
+    : options.routeOverride
   const fakeProject = createFakeProject({
     projectRoot: project.root,
     routes: { [ROUTE]: route, ...(options.extraRoutes ?? {}) },
@@ -150,6 +154,8 @@ async function setup(t, options = {}) {
   })
   assert.equal(baselineCaptured.ok, true, JSON.stringify(baselineCaptured))
 
+  // 派发记录按「T6 契约本体」的形状造：`anchors_required` 在 `post` 里，
+  // `evidence_required` 在顶层。传 `null` 表示**省略该键**（旧记录 / 被剥掉字段的形状）。
   project.write(`re/team/dispatches/${DISPATCH}.json`, {
     schema_version: 1,
     dispatch_id: DISPATCH,
@@ -158,11 +164,13 @@ async function setup(t, options = {}) {
     route_id: ROUTE,
     member: 'rt-scout',
     contract_sha256: options.contractSha ?? SHA('c'),
-    ...(options.ruleDigest === undefined ? {} : { rule_digest: options.ruleDigest }),
+    // 新派发一定带 rule_digest（派发侧冻结）；`null` 表示**省略该键**，模拟旧记录/被剥掉字段。
+    ...(options.ruleDigest === null ? {} : { rule_digest: options.ruleDigest ?? FROZEN_RULE }),
     baseline_ref: baselineCaptured.ref,
     target_ids: ['T-001'],
-    anchors_required: options.anchorsRequired ?? ['source_location'],
-    evidence_required: options.evidenceRequired ?? ['artifact_locator'],
+    ...(options.anchorsRequired === null ? {} : { anchors_required: options.anchorsRequired ?? ['source_location'] }),
+    ...(options.evidenceRequired === null ? {} : { evidence_required: options.evidenceRequired ?? ['artifact_locator'] }),
+    ...(options.dispatchPost === undefined ? {} : { post: options.dispatchPost }),
     work_dir: WORK,
   })
 
@@ -275,7 +283,7 @@ test('工兵调用 → ROLE_REQUIRED，且零副作用', async (t) => {
   }
 })
 
-test('正常 finding 交付：readRoute→impact→readRun→readSeals→seal→impact→index→check，任务完成并落回执', async (t) => {
+test('正常 finding 交付：readRoute→probe→impact→readRun→readSeals→seal→impact→index→check，任务完成并落回执', async (t) => {
   const fx = await setup(t)
   const { envelope } = await handleConclude(fx.ctx, fx.input)
 
@@ -287,8 +295,10 @@ test('正常 finding 交付：readRoute→impact→readRun→readSeals→seal→
     [],
     'ok 的 data 必须通过 $defs.concludeData',
   )
+  // `probe` 是 T14 之后**每次**收口都必跑的一步：派发记录冻结了规则摘要，就要拿当前副本复核一次。
   assert.deepEqual(fx.fakeProject.order(), [
     'readRoute',
+    'probe',
     'impact',
     'readRun',
     'readSeals',
@@ -754,6 +764,102 @@ test('路线记录 id 与派发绑定的路线不一致 → RECOVERY_REQUIRED', 
   const { envelope } = await handleConclude(fx.ctx, fx.input)
   assert.equal(envelope.code, 'RECOVERY_REQUIRED')
   assert.match(envelope.diagnostics[0].reason, /R-999/u)
+  assert.equal(fx.fakeProject.callsFor('seal').length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// T14：三处 fail-open 缺陷
+// ---------------------------------------------------------------------------
+
+test('派发记录没有冻结规则摘要 → RECOVERY_REQUIRED（规则漂移守卫不得静默跳过）', async (t) => {
+  const fx = await setup(t, { ruleDigest: null })
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.status, 'blocked', JSON.stringify(envelope))
+  assert.equal(envelope.code, 'RECOVERY_REQUIRED')
+  assert.match(envelope.diagnostics[0].reason, /规则摘要/u)
+  assert.equal(fx.fakeProject.callsFor('probe').length, 0, '缺摘要时不能用一次探测假装核对过')
+  assert.equal(fx.team.callsFor('updateTask').length, 0, '拒绝收口不得完成任务')
+  assert.equal(fx.team.snapshot().tasks.find((task) => task.id === TASK).status, 'in_progress')
+})
+
+test('派发记录带规则摘要且与当前副本一致 → 照常收口，并真的复核一次', async (t) => {
+  const fx = await setup(t)
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.status, 'ok', JSON.stringify(envelope))
+  assert.equal(fx.fakeProject.callsFor('probe').length, 1, '有摘要时必须真的探测一次当前副本')
+  assert.equal(fx.team.snapshot().tasks.find((task) => task.id === TASK).status, 'completed')
+})
+
+test('派发记录指向岗位却没有任何锚点要求 → RECOVERY_REQUIRED（finding 不能零锚点放行）', async (t) => {
+  const fx = await setup(t, {
+    anchorsRequired: null,
+    dispatchPost: { id: 'rt-scout', anchors_required: undefined },
+    evidenceRequired: [],
+    anchors: [],
+  })
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.status, 'blocked', JSON.stringify(envelope))
+  assert.equal(envelope.code, 'RECOVERY_REQUIRED')
+  assert.match(envelope.diagnostics[0].reason, /锚点/u)
+  assert.equal(fx.team.callsFor('updateTask').length, 0, '零锚点不得完成任务')
+})
+
+test('契约形状的 post.anchors_required 承重：缺该类锚点照常拒绝，带齐照常放行', async (t) => {
+  // 顶层没有 anchors_required，只能回退到 post 里的那一份。
+  const missing = await setup(t, {
+    anchorsRequired: null,
+    dispatchPost: { id: 'rt-scout', anchors_required: ['web_capture'] },
+  })
+  const refused = await handleConclude(missing.ctx, missing.input)
+  assert.equal(refused.envelope.code, 'SUBMISSION_INVALID', JSON.stringify(refused.envelope))
+  assert.match(refused.envelope.diagnostics[0].reason, /web_capture/u)
+
+  const satisfied = await setup(t, {
+    anchorsRequired: null,
+    dispatchPost: { id: 'rt-scout', anchors_required: ['source_location'] },
+  })
+  const accepted = await handleConclude(satisfied.ctx, satisfied.input)
+  assert.equal(accepted.envelope.status, 'ok', JSON.stringify(accepted.envelope))
+})
+
+test('派发记录缺 evidence_required → RECOVERY_REQUIRED（允许为空，但必须显式存在）', async (t) => {
+  const fx = await setup(t, { evidenceRequired: null })
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.status, 'blocked', JSON.stringify(envelope))
+  assert.equal(envelope.code, 'RECOVERY_REQUIRED')
+  assert.match(envelope.diagnostics[0].reason, /evidence_required/u)
+  assert.equal(fx.team.callsFor('updateTask').length, 0)
+})
+
+test('宿主 getTask 返回 ok 但 task=null → 可读的 blocked，不是未捕获异常', async (t) => {
+  const fx = await setup(t)
+  fx.ctx.deps.teamAdapter = {
+    ...fx.ctx.deps.teamAdapter,
+    async getTask() {
+      return { ok: true, task: null }
+    },
+  }
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.status, 'blocked', JSON.stringify(envelope))
+  assert.equal(envelope.code, 'RECOVERY_REQUIRED')
+  assert.match(envelope.diagnostics[0].reason, /任务.*记录为空|记录为空.*任务/u)
+  assert.equal(envelope.data.phase, 'preflight')
+  assert.equal(fx.team.callsFor('updateTask').length, 0)
+})
+
+test('路线记录被写成 null → 可读的 blocked，不是未捕获异常', async (t) => {
+  const fx = await setup(t, { routeOverride: null })
+  const { envelope } = await handleConclude(fx.ctx, fx.input)
+
+  assert.equal(envelope.status, 'blocked', JSON.stringify(envelope))
+  assert.equal(envelope.code, 'RECOVERY_REQUIRED')
+  assert.match(envelope.diagnostics[0].reason, /路线.*记录为空|记录为空.*路线/u)
+  assert.equal(envelope.data.phase, 'preflight')
   assert.equal(fx.fakeProject.callsFor('seal').length, 0)
 })
 

@@ -218,6 +218,13 @@ export interface EnsureWorkDirInput {
   paths?: typeof defaultPaths
 }
 
+/** 派发时冻结的内容摘要（取自 `compatibility.computeDigests()`；没有可冻结的内容时对应项为 null）。 */
+export interface ContractDigests {
+  ruleDigest: string | null
+  scriptDigest: string | null
+  catalogDigest: string | null
+}
+
 /** `buildContract` 的入参（必填项由 `requireField` 在运行期拒绝）。 */
 export interface BuildContractInput {
   dispatchId?: unknown
@@ -243,6 +250,8 @@ export interface BuildContractInput {
   contractRef?: string
   retryOf?: unknown
   caller?: unknown
+  /** 派发门 1 的兼容性摘要：契约据此冻结规则版本，收口侧据此发现执行期规则漂移（D8）。 */
+  digests?: ContractDigests | null
 }
 
 /** `readStartAck` 的入参。 */
@@ -842,6 +851,7 @@ export function buildContract(input: BuildContractInput = {}): BuiltContract {
     deliveryTimeoutMs = 60000,
     retryOf = null,
     caller = null,
+    digests = null,
   } = input
 
   // 必填项：与原循环同一顺序、同一拒绝文本（先报第一个缺的字段），顺带拿到收窄后的值。
@@ -914,6 +924,11 @@ export function buildContract(input: BuildContractInput = {}): BuiltContract {
     work_dir: workDir,
     run_id_reservation: runIdReservation,
     contract_ref: contractRef,
+    // 派发时冻结的规则版本：收口侧拿它与当前项目副本比对，发现执行期被改动就 SKILL_INCOMPATIBLE。
+    // 三个键**总是**写入（拿不到就是 null）——「缺键」因此只可能是旧记录，收口侧按 RECOVERY_REQUIRED 拒绝。
+    rule_digest: typeof digests?.ruleDigest === 'string' ? digests.ruleDigest : null,
+    script_digest: typeof digests?.scriptDigest === 'string' ? digests.scriptDigest : null,
+    catalog_digest: typeof digests?.catalogDigest === 'string' ? digests.catalogDigest : null,
     work_rules: buildWorkRules({ workDir }),
     authority: {
       dispatchable: false,

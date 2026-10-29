@@ -12,6 +12,7 @@ import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import * as atomic from '../dist/atomic.js'
+import * as compatibility from '../dist/compatibility.js'
 import * as contract from '../dist/contract.js'
 import * as paths from '../dist/paths.js'
 import { ContractError } from '../dist/errors.js'
@@ -436,6 +437,38 @@ test('routeTargetIds 兼容 target_ids / targets 两种登记形状', () => {
   assert.deepEqual(contract.routeTargetIds({ targets: [{ id: 'T-004' }] }), ['T-004'])
   assert.deepEqual(contract.routeTargetIds({}), [])
   assert.deepEqual(contract.routeTargetIds(null), [])
+})
+
+test('buildContract 冻结派发时的内容摘要：rule_digest 是 64-hex（收口侧规则漂移守卫的输入）', async (t) => {
+  const project = makeTempProject({ t })
+  const digests = await compatibility.computeDigests({ projectRoot: project.root })
+  assert.match(digests.ruleDigest, /^[0-9a-f]{64}$/u, '项目副本应给出可冻结的规则摘要')
+
+  const built = contract.buildContract({
+    dispatchId: 'D-op-dispatch-1-0123abcd',
+    attemptId: 'A-000001',
+    attemptIndex: 1,
+    operationId: 'op-dispatch-1',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    projectRoot: project.root,
+    post: POST,
+    route: { schema_version: 1, id: 'R-001', status: 'active', target_ids: ['T-001'] },
+    targets: [{ id: 'T-001', path: 're/samples/sample.bin', sha256: 'c'.repeat(64) }],
+    baselineRef: {
+      ref: 're/team/baselines/D-op-dispatch-1-0123abcd.json',
+      targets: [{ id: 'T-001', path: 're/samples/sample.bin', sha256: 'c'.repeat(64) }],
+      preexisting_seals: [],
+    },
+    workDir: 're/team/work/D-op-dispatch-1-0123abcd/A-000001',
+    runIdReservation: 'RUN-D-op-dispatch-1-0123abcd-A-000001',
+    contractRef: 're/team/dispatches/D-op-dispatch-1-0123abcd.json',
+    digests,
+  })
+
+  assert.match(built.contract.rule_digest, /^[0-9a-f]{64}$/u, '契约必须冻结 64-hex 规则摘要')
+  assert.equal(built.contract.rule_digest, digests.ruleDigest, '冻结的必须是 computeDigests 的规则摘要')
+  assert.equal(built.contract.script_digest, digests.scriptDigest)
+  assert.equal(built.contract.catalog_digest, digests.catalogDigest)
 })
 
 test('契约里必带三条行为规矩与「你没有派发权」的授权声明', () => {

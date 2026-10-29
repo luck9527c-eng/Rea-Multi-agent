@@ -501,7 +501,7 @@ export async function ensureWorkDir({ root, dispatchId, attemptId, paths = defau
  * 回执/交付信封/台账里引用它，因此「回执里的哈希与文件字节一致」永远成立。
  */
 export function buildContract(input = {}) {
-    const { dispatchId, attemptId, attemptIndex = 1, operationId, createdAt, projectRoot, binding = null, targets = [], objective, requirements = {}, capabilityMatch = null, resources = [], dependsOnTasks = [], timeboxMs = 1800000, deliveryTimeoutMs = 60000, retryOf = null, caller = null, } = input;
+    const { dispatchId, attemptId, attemptIndex = 1, operationId, createdAt, projectRoot, binding = null, targets = [], objective, requirements = {}, capabilityMatch = null, resources = [], dependsOnTasks = [], timeboxMs = 1800000, deliveryTimeoutMs = 60000, retryOf = null, caller = null, digests = null, } = input;
     // 必填项：与原循环同一顺序、同一拒绝文本（先报第一个缺的字段），顺带拿到收窄后的值。
     const post = requireField('post', input.post);
     const route = requireField('route', input.route);
@@ -569,6 +569,11 @@ export function buildContract(input = {}) {
         work_dir: workDir,
         run_id_reservation: runIdReservation,
         contract_ref: contractRef,
+        // 派发时冻结的规则版本：收口侧拿它与当前项目副本比对，发现执行期被改动就 SKILL_INCOMPATIBLE。
+        // 三个键**总是**写入（拿不到就是 null）——「缺键」因此只可能是旧记录，收口侧按 RECOVERY_REQUIRED 拒绝。
+        rule_digest: typeof digests?.ruleDigest === 'string' ? digests.ruleDigest : null,
+        script_digest: typeof digests?.scriptDigest === 'string' ? digests.scriptDigest : null,
+        catalog_digest: typeof digests?.catalogDigest === 'string' ? digests.catalogDigest : null,
         work_rules: buildWorkRules({ workDir }),
         authority: {
             dispatchable: false,

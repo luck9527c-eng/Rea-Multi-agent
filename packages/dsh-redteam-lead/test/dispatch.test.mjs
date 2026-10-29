@@ -764,6 +764,61 @@ test('retry_of：问题改变 / 旧任务已收口 → STALE_ATTEMPT', async (t)
 })
 
 // ---------------------------------------------------------------------------
+// 契约里冻结的规则版本（T14 缺陷 1：收口侧规则漂移守卫的输入）
+// ---------------------------------------------------------------------------
+
+test('派发把规则/脚本/目录摘要冻结进契约，且一次派发只探测一次兼容性', async (t) => {
+  const { project, ctx, input } = setup(t)
+
+  const { envelope } = await handleDispatch(ctx, input())
+  assertEnvelopeShape(envelope, { expectStatus: 'ok' })
+
+  const frozen = (await contractFile(project, envelope.data.contract_ref)).json
+  for (const key of ['rule_digest', 'script_digest', 'catalog_digest']) {
+    assert.match(frozen[key], /^[0-9a-f]{64}$/u, `契约必须冻结内容摘要 ${key}`)
+  }
+  // 值来自门 1 的兼容性探测（替身给出固定摘要），不是另算一份哈希。
+  assert.equal(frozen.rule_digest, 'a'.repeat(64))
+  assert.equal(frozen.script_digest, 'b'.repeat(64))
+  assert.equal(frozen.catalog_digest, 'c'.repeat(64))
+  assert.equal(ctx.fakes.project.callsFor('probe').length, 1, '一次派发只探测一次兼容性（不重复跑 Python）')
+})
+
+test('项目兼容性探测失败 → 不派发（冻结不了规则版本时保持零副作用）', async (t) => {
+  const { project, ctx, team, input } = setup(t)
+  ctx.fakes.project.queue('probe', {
+    exitCode: 1,
+    stdout: '',
+    stderr: 'ERROR: skill copy missing',
+    code: 'PROJECT_NOT_CONFIGURED',
+  })
+
+  const { envelope } = await handleDispatch(ctx, input())
+  assertEnvelopeShape(envelope, { expectStatus: 'blocked' })
+  assert.equal(envelope.code, 'PROJECT_NOT_CONFIGURED')
+  assert.match(envelope.diagnostics[0].reason, /规则版本/u)
+  assert.equal(team.callsFor('spawnTeammate').length, 0)
+  assert.equal(team.callsFor('createTask').length, 0)
+  assert.deepEqual(await filesUnder(project.root, 're/team/dispatches'), [], '不得落下契约')
+})
+
+test('探测成功但拿不到规则摘要 → 不派发（SKILL_INCOMPATIBLE，而不是冻结一个空摘要）', async (t) => {
+  const { project, ctx, team, input } = setup(t)
+  ctx.fakes.project.queue('probe', {
+    exitCode: 0,
+    stdout: `${JSON.stringify({ ruleDigest: null, scriptDigest: null, catalogDigest: null })}\n`,
+    stderr: '',
+  })
+
+  const { envelope } = await handleDispatch(ctx, input())
+  assertEnvelopeShape(envelope, { expectStatus: 'blocked' })
+  assert.equal(envelope.code, 'SKILL_INCOMPATIBLE')
+  assert.match(envelope.diagnostics[0].reason, /规则摘要/u)
+  assert.equal(team.callsFor('createTask').length, 0)
+  assert.deepEqual(await filesUnder(project.root, 're/team/dispatches'), [])
+})
+
+// ---------------------------------------------------------------------------
 // 入参形状
 // ---------------------------------------------------------------------------
 

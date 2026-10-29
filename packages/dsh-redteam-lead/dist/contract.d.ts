@@ -172,6 +172,12 @@ export interface EnsureWorkDirInput {
     attemptId: unknown;
     paths?: typeof defaultPaths;
 }
+/** 派发时冻结的内容摘要（取自 `compatibility.computeDigests()`；没有可冻结的内容时对应项为 null）。 */
+export interface ContractDigests {
+    ruleDigest: string | null;
+    scriptDigest: string | null;
+    catalogDigest: string | null;
+}
 /** `buildContract` 的入参（必填项由 `requireField` 在运行期拒绝）。 */
 export interface BuildContractInput {
     dispatchId?: unknown;
@@ -197,6 +203,8 @@ export interface BuildContractInput {
     contractRef?: string;
     retryOf?: unknown;
     caller?: unknown;
+    /** 派发门 1 的兼容性摘要：契约据此冻结规则版本，收口侧据此发现执行期规则漂移（D8）。 */
+    digests?: ContractDigests | null;
 }
 /** `readStartAck` 的入参。 */
 export interface StartAckInput {
