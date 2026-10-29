@@ -120,7 +120,7 @@ schema 是 `additionalProperties:false`，`capacity` 恰好 4 个属性：`remai
 
 ## D20 — 门禁命令用显式 glob
 
-`cd packages/dsh-redteam-lead; node --test "test/**/*.test.mjs"`。裸 `node --test` 会把 `test/helpers/*.mjs` 当测试文件执行（虚增计数、将来可能产生副作用）；`node --test test` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
+**T10 起统一为仓库根形态**，并与根 `package.json` 的 `scripts.test`、`docs/impl/CONVENTIONS.md`、`packages/dsh-redteam-lead/README.md` 三处逐字相同：`npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"`。裸 `node --test` 会把 `test/helpers/*.mjs` 当测试文件执行（虚增计数、将来可能产生副作用）；`node --test <目录>` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
 
 ## D21 — `ContractError.details` 不可上线
 
@@ -161,22 +161,22 @@ const gaps = [...budget.gaps, ...cap.gaps]   // cap.gaps 只作非阻塞诊断
 
 ## D26 — output.schema / parameters 不能直接注册规格的 $defs
 
-ctx.tools.register() 会用 host 的 ssertSupportedJsonSchema 校验，**支持的子集只有** 	ype / oneOf / properties / required / additionalProperties / items / enum / const + 注解。以下一律抛 UNSUPPORTED_SCHEMA，**整行插件不激活**（不是降级，是整行消失）：
-\、llOf、nyOf、if/then/else、pattern、minLength、minimum、ormat、**类型数组**（如 ["string","null"]）。
-已对照**两个**版本核对：安装目标 dsh-v0.2.1-rc.3 与 checkout  .2.2-alpha.2 的 `packages/core/tools/src/json-schema.ts`，子集与 `ONE_OF_SIBLING_KEYWORDS` 一致。
+ctx.tools.register() 会用 host 的 `assertSupportedJsonSchema` 校验，**支持的子集只有** `type` / oneOf / properties / required / additionalProperties / items / enum / const + 注解。以下一律抛 UNSUPPORTED_SCHEMA，**整行插件不激活**（不是降级，是整行消失）：
+`$ref`、`allOf`、`anyOf`、if/then/else、pattern、minLength、minimum、`format`、**类型数组**（如 ["string","null"]）。
+已对照**两个**版本核对：安装目标 dsh-v0.2.1-rc.3 与 checkout `0.2.2-alpha.2` 的 `packages/core/tools/src/json-schema.ts`，子集与 `ONE_OF_SIBLING_KEYWORDS` 一致。
 
 **因此**：
-- 注册用的 output.schema 是 `src/tool-schema.mjs` 的 `resultOutput` —— `\.result` 的**子集投影**（八字段/required/封闭/status enum；`code` 的 enum 直接取 `\.errorCode`；string|null 与 object|null 用 `oneOf`）。
-- `parameters` 用 `inlineRefs` 就地展开 `\`（悬空 `\` 会直接进模型上下文）。
+- 注册用的 output.schema 是 `src/tool-schema.mjs` 的 `resultOutput` —— `$defs.result` 的**子集投影**（八字段/required/封闭/status enum；`code` 的 enum 直接取 `$defs.errorCode`；string|null 与 object|null 用 `oneOf`）。
+- `parameters` 用 `inlineRefs` 就地展开 `$ref`（悬空 `$ref` 会直接进模型上下文）。
 - `ok ⇒ code=null`、非 ok 的 data 联合这类表达不了的条件，由 `envelope.mjs` + 入口的**完整** JSON Schema 校验（含 if/then/else）在运行期保证。
-- 测试里镜像了宿主的校验器；谁把 `\`/`allOf` 加回注册 schema 就红。
-- **校验**仍用逐字 `\`（漂移测试不变）—— 注册投影与校验用字分离。
+- 测试里镜像了宿主的校验器；谁把 `$ref`/`allOf` 加回注册 schema 就红。
+- **校验**仍用逐字 `$defs`（漂移测试不变）—— 注册投影与校验用字分离。
 
 ## D27 — envelope 的参数名以实现为准
 
 `envelope.ok/blocked/...` 解构的是 **`operationId`**（驼峰），不是 `operation_id`。信封**输出**字段才是 `operation_id`。下游照实现写；`index.js` 目前两个键都传，属兼容冗余。
 
-## D28 — 改用 TypeScript：源码 .ts + 	sc 产物 dist/，运行时依赖仍为零
+## D28 — 改用 TypeScript：源码 .ts + `tsc` 产物 `dist/`，运行时依赖仍为零
 
 **背景**：原决定用纯 .mjs 的两条理由已失效 ——（a）本机 Node v24.22.1 **原生支持运行 .ts**（类型擦除默认开启，`node x.ts` 与 `node --test x.test.ts` 均实测通过）；（b）`npm.cmd` 实测可用（11.19.1），registry 可达，`typescript` 可装。此前"npm 不可用"是 **PowerShell 执行策略**拦了 `npm.ps1`（五个作用域全 Undefined → OS 默认 Restricted），与 DSH 无关，`npm.cmd` 一直能用。
 
@@ -202,15 +202,13 @@ ctx.tools.register() 会用 host 的 ssertSupportedJsonSchema 校验，**支持
 
 编排契约 §135 提到「seal 前先按事实解除会令全项目校验失败的旧状态」，而 T7 的实现顺序是 写记录 → seal → 更新事实 → impact → index → check。
 
-**裁决：保持 T7 的顺序。** 把 seal 挪到「更新事实」之后会让**封存的是尚未更新的旧事实**，比它想解决的问题更严重。若旧路线状态本身会让 seal 的全项目校验失败，t_conclude 如实返回 CHECK_FAILED，由 Lead 先按 skill 修正记录再以同一 operation ID 重入 —— **不降门槛、不静默改序**。
+**裁决：保持 T7 的顺序。** 把 seal 挪到「更新事实」之后会让**封存的是尚未更新的旧事实**，比它想解决的问题更严重。若旧路线状态本身会让 seal 的全项目校验失败，`rt_conclude` 如实返回 CHECK_FAILED，由 Lead 先按 skill 修正记录再以同一 operation ID 重入 —— **不降门槛、不静默改序**。
 
 ## D30 — TS 工具链已由 Lead 预置；注意 Windows 不能 spawn .cmd
 
-**已就位**（不要重新发明）：仓库根 package.json（	ypescript@^5.9 + @types/node@^24 为 devDependencies，scripts.build/test/typecheck）、packages/dsh-redteam-lead/tsconfig.json、scripts/build.mjs。实测 	sc 5.9.3 可用，
-pm run build 通路正常（无 .ts 时如实报 TS18003 并非零退出）。
+**已就位**（不要重新发明）：仓库根 package.json（`typescript@^5.9` + @types/node@^24 为 devDependencies，scripts.build/test/typecheck）、packages/dsh-redteam-lead/tsconfig.json、scripts/build.mjs。实测 `tsc` 5.9.3 可用，`npm run build` 通路正常（无 .ts 时如实报 TS18003 并非零退出）。
 
-**	sconfig 的取舍**：strict: true，但 **
-oUncheckedIndexedAccess: false**。理由：本次是**机械迁移**，目标是把模块边界的类型钉住，而不是在迁移途中跟每一处 obj[key] 搏斗；打开它会让迁移量成倍膨胀且容易诱发「加 ! 兜底」的伪类型安全。要开另立 ticket。
+**`tsconfig` 的取舍**：strict: true，但 **noUncheckedIndexedAccess: false**。理由：本次是**机械迁移**，目标是把模块边界的类型钉住，而不是在迁移途中跟每一处 obj[key] 搏斗；打开它会让迁移量成倍膨胀且容易诱发「加 ! 兜底」的伪类型安全。要开另立 ticket。
 
 **踩到的坑（复用价值高）**：Windows 上 Node ≥ 18.20 因 CVE-2024-27980 的修正，在 shell: false 下**拒绝 spawn .cmd/.bat**，会抛 spawn EINVAL。所以 scripts/build.mjs 用 `process.execPath` + `node_modules/typescript/bin/tsc` 的 **JS 入口**，而不是 `.bin/tsc.cmd`。任何要调外部程序的代码都适用这条：优先找 .exe 或 JS 入口，不要靠 .cmd shim，也**不要**为了跑通而打开 shell: true（那会引入注入面）。
 
@@ -219,3 +217,48 @@ oUncheckedIndexedAccess: false**。理由：本次是**机械迁移**，目标�
 产品代码已全部是 TypeScript（`src/*.ts` → `dist/`，`tsc` 0 错、`strict: true`）。**测试保持 `.mjs` 并 import `dist/*.js`** —— 它们跑的是要发货的字节，行为断言完整。
 
 未做「测试也转 TS」（T13）的理由：它只增加测试内部类型，不改变被测行为；而当前剩余工作（真实 skill 集成、第三层验收套件、验收总表、代码审查）对交付价值更高。**这是有意的降级，不是遗漏**：T13 的 ticket 保留，可随时执行，门禁届时切到 `test/**/*.test.ts`。
+
+## D32 — skill 侧三处会「炸一整个命令」的坑，以及 seal 的真实成本
+
+> 来源：T8 在真实 `project.py` 上做第二层集成时踩到并记录；本文件只记录事实与由此而来的实现约束，不改 `docs/specs/`。
+> 对应的回归用例：`test/l2/helpers.mjs`（`writeRun` 的 `state` 语义）、`test/l2/outcomes.test.mjs`（中断必须有恢复评估）、`test/l2/seal-check.test.mjs`（导航顺序与执行事实）、`test/l2/recovery.test.mjs`（重放与前向恢复）。
+
+### 1. `run.json` 里写 `"state": null` 会让 `index` 崩
+
+`run.json` 带 `"state": null` 时，真实 CLI 的 `management_summary()` 在 `state.get(...)` 上抛
+`'NoneType' object has no attribute 'get'`。**没有 state 就要整个删掉这个键**，不能写 `null`：
+
+- 写记录的一方（`test/l2/helpers.mjs` 的 `writeRun`、任何归档路径）必须 `delete run.state`；
+- 插件收口/归档时**不得**把"没有状态评估"序列化成 `state: null`；
+- 读到少了 `state` 键的旧记录是合法的，不能当损坏（`RECOVERY_REQUIRED` 只适用于真的坏 JSON）。
+
+### 2. `interrupted` 缺 `recovery` 同样会让 `index` 崩
+
+`status: 'interrupted'` 的运行必须带恢复评估（`state.recovery`）。缺它的表现不是"少一条提示"，而是
+`index` 直接失败——因为导航区摘要要数"实验恢复待办"。因此：
+
+- `interrupted` 的 RUN 要么补 `state.recovery`，要么不要进正式记录；
+- 插件对 `interrupted` 的提交必须要求恢复评估（`test/l2/outcomes.test.mjs` 的
+  "failed（中断）：interrupted 必须有恢复评估，否则 check 给出具体拒绝" 就是这条）。
+
+### 3. INDEX 的导航区是**内容派生**的，改完事实必须重跑 `index`
+
+`<!-- RPM:NAV:START -->…<!-- RPM:NAV:END -->` 之间的内容由 `inventory(root)` 现算：目标清单、
+`re/project.json` 的验收/审计/争议摘要、`re/{env,conditions,routes,runs,seals,docs,scripts}` 的文件枚举、
+待复核表与恢复待办。**它不是缓存，是当前事实的投影。** 所以：
+
+- 改 `re/project.json`（验收项、审计、争议、完成声明）、改条件/路线、加 RUN、加 seal、加环境快照之后，
+  **必须重跑 `index`**；
+- 否则 `check` 的第一条就是 `INDEX navigation stale; run index`——这是记录真的不一致，不是"忘了刷新页面"；
+- 插件侧的推导：`seal`/`index`/`check` 是**有序**的（`test/l2/seal-check.test.mjs` 的
+  "顺序不可换：seal 不刷新 INDEX…"），编排顺序照 D29（写记录 → seal → 更新事实 → impact → index → check）。
+
+### 4. 操作后果：`seal` 跑的是**全项目**校验
+
+`seal` 在写基线前调用 `validate(root, hashes=True, allow_unsealed=True, check_index=False)`，即：
+所有目标的字节哈希、所有路线/条件/锚点的结构与引用、既有 seal 的字节一致性都会在这一步被核对，
+**只有 INDEX 导航检查被跳过**。
+
+因此 seal 失败通常**不是**"这个 RUN 有问题"，而是项目里别处已经不一致（旧目标哈希变了、旧 seal 被删、
+某条路线缺锚点……）。处置顺序：按 skill 修记录 → 用**同一个 operation ID** 重入（D29 的前向恢复），
+**不要**重封存、不要为了让 seal 过去而放宽 `check` 门槛、不要删旧证据。

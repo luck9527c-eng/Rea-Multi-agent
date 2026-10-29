@@ -114,6 +114,51 @@ test('rosterInput：inspect 携带 operation_id 被拒（else 分支的 not 约�
   assert.ok(result.issues.some((issue) => issue.keyword === 'not'), JSON.stringify(result.issues))
 })
 
+test('rosterInput：未知 action（含 skill 侧的清单刷新动作）被拒，不静默当成 inspect', async () => {
+  const s = await schema()
+  for (const action of ['refresh_tools', 'refresh', 'list']) {
+    const result = validateInput(s, 'rosterInput', { ...rosterValid(), action })
+    assert.equal(result.ok, false, `${action} 不应被接受`)
+    assert.ok(
+      result.issues.some((issue) => issue.path === '/action' && issue.keyword === 'enum'),
+      JSON.stringify(result.issues),
+    )
+  }
+})
+
+test('rosterInput：bind/takeover 的 target_kinds 不能为空（then 分支 minItems）', async () => {
+  const result = validateInput(await schema(), 'rosterInput', {
+    project_root: 'D:\\workSpace\\case01',
+    action: 'bind',
+    operation_id: 'op-bind-1',
+    proposal_hash: 'b'.repeat(64),
+    target_kinds: [],
+  })
+  assert.equal(result.ok, false)
+  assert.ok(result.issues.some((issue) => issue.path === '/target_kinds' && issue.keyword === 'minItems'))
+})
+
+test('rosterInput：takeover 缺 recovery_ref 被拒（const 条件），带齐则通过', async () => {
+  const s = await schema()
+  const takeover = {
+    project_root: 'D:\\workSpace\\case01',
+    action: 'takeover',
+    operation_id: 'op-takeover-1',
+    proposal_hash: 'b'.repeat(64),
+    target_kinds: ['game'],
+  }
+
+  const missing = validateInput(s, 'rosterInput', takeover)
+  assert.equal(missing.ok, false)
+  assert.ok(missing.issues.some((issue) => issue.path === '/recovery_ref' && issue.keyword === 'required'))
+
+  const complete = validateInput(s, 'rosterInput', {
+    ...takeover,
+    recovery_ref: 'docs/agents/reverse-project-management.md',
+  })
+  assert.deepEqual(complete.issues, [])
+})
+
 test('dispatchInput：合法样例通过', async () => {
   const result = validateInput(await schema(), 'dispatchInput', dispatchValid())
   assert.deepEqual(result.issues, [])
