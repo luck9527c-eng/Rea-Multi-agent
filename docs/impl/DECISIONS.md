@@ -175,3 +175,25 @@ ctx.tools.register() 会用 host 的 ssertSupportedJsonSchema 校验，**支持
 ## D27 — envelope 的参数名以实现为准
 
 `envelope.ok/blocked/...` 解构的是 **`operationId`**（驼峰），不是 `operation_id`。信封**输出**字段才是 `operation_id`。下游照实现写；`index.js` 目前两个键都传，属兼容冗余。
+
+## D28 — 改用 TypeScript：源码 .ts + 	sc 产物 dist/，运行时依赖仍为零
+
+**背景**：原决定用纯 .mjs 的两条理由已失效 ——（a）本机 Node v24.22.1 **原生支持运行 .ts**（类型擦除默认开启，`node x.ts` 与 `node --test x.test.ts` 均实测通过）；（b）`npm.cmd` 实测可用（11.19.1），registry 可达，`typescript` 可装。此前"npm 不可用"是 **PowerShell 执行策略**拦了 `npm.ps1`（五个作用域全 Undefined → OS 默认 Restricted），与 DSH 无关，`npm.cmd` 一直能用。
+
+**决定**：
+
+| 项 | 形态 |
+|---|---|
+| 源码 | `packages/dsh-redteam-lead/src/*.ts`；`strict: true`、`verbatimModuleSyntax`、`erasableSyntaxOnly`、`module/moduleResolution: nodenext`、`target: es2023`、`declaration: true` |
+| 产物 | `tsc` 编译到 `packages/dsh-redteam-lead/dist/*.js` + `*.d.ts` |
+| `dist/` | **提交进 git**。`link:` 安装不触发 `prepare`，不提交等于装上一具空壳；参考实现也是直接提交成品 JS |
+| 入口 | `package.json` 的 `exports["."]` → `./dist/index.js`；`dsh.bundle.patch` **不变** |
+| `bin/doctor.mjs` | **保留这个路径与文件名**（规格钉死 `node <bundle-root>/bin/doctor.mjs`），内容改为薄壳：`import('../dist/doctor.js')` |
+| 依赖 | `typescript` 放**仓库根** `devDependencies`；**shipped bundle 的 `dependencies` 仍为空**，运行时仍零 `@deepseek-ai/*` import |
+| 测试 | `test/**/*.test.ts`，import `dist/`（测试跑的就是要发货的字节）；`declaration` 提供类型 |
+| 门禁 | `npm run build && node --test "test/**/*.test.ts"`（`node --test test` 在 Node 24 上仍不可用，见 D20） |
+| 漂移防护 | 一条用例断言 `dist/` 与源码同步（构建后再跑；不同步即红） |
+
+**迁移顺序**：等 T5/T6/T7 的 `.mjs` 实现落地合并后再做（现在是 278 绿用例的安全网在托底），迁移是机械的、不得改行为；T8/T9/T10 直接按 TS 做。
+
+**不得**：不得为了让 TS 编译通过而放宽 `strict` 或加 `any` 兜底；不得在 `src/` 里引入任何运行时依赖。
