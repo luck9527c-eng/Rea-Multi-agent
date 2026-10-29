@@ -7,7 +7,7 @@ import path from 'node:path';
 import { DEP_KEYS, makeClock, makeCtx, makeFakeTools, makeTempProject } from './helpers/host.mjs';
 import { CONTRACT_VERSION } from '../src/compatibility.mjs';
 
-test('makeCtx 装配出 SEAMS 第 1 节的全部 deps 键（未实现的为 null）', (t) => {
+test('makeCtx 装配出 SEAMS 第 1 节的全部 deps 键（已实现的给真实模块，未实现的为 null）', (t) => {
   const ctx = makeCtx({ t });
   assert.deepEqual(Object.keys(ctx.deps).sort(), [...DEP_KEYS].sort());
   assert.equal(typeof ctx.deps.teamAdapter.listMembers, 'function');
@@ -16,8 +16,19 @@ test('makeCtx 装配出 SEAMS 第 1 节的全部 deps 键（未实现的为 null
   assert.equal(typeof ctx.deps.clock.now, 'function');
   assert.match(ctx.deps.clock.isoNow(), /^\d{4}-\d{2}-\d{2}T/u);
   assert.equal(typeof ctx.deps.fs.readFile, 'function');
-  assert.equal(ctx.deps.identity, null);
-  assert.equal(ctx.deps.operation, null);
+  // T1/T3 的模块直接可用（命名空间），T5/T6/T7 需要实例时用 depsOverrides 覆盖
+  assert.equal(typeof ctx.deps.identity.resolveCaller, 'function');
+  assert.equal(typeof ctx.deps.operation.createOperationLedger, 'function');
+  assert.equal(typeof ctx.deps.lock.acquire, 'function');
+  assert.equal(typeof ctx.deps.audit.appendAudit, 'function');
+  assert.equal(typeof ctx.deps.catalog.composeTemplate, 'function');
+  assert.equal(typeof ctx.deps.capability.matchCapabilities, 'function');
+  assert.equal(typeof ctx.deps.capacity.planBudget, 'function');
+  assert.equal(typeof ctx.deps.envelope.ok, 'function');
+  // 本轮（T4）还没实现的键
+  assert.equal(ctx.deps.binding, null);
+  assert.equal(ctx.deps.contract, null);
+  assert.equal(ctx.deps.submission, null);
   assert.equal(ctx.config.presetId, 'redteam-lead');
   assert.equal(typeof ctx.now(), 'number');
   assert.equal(ctx.root, ctx.fakes.projectRoot);
@@ -94,6 +105,19 @@ test('depsOverrides 可以注入 T1/T3 的模块', (t) => {
   const marker = { resolveCaller: async () => ({ ok: true, role: 'lead' }) };
   const ctx = makeCtx({ t, depsOverrides: { identity: marker } });
   assert.equal(ctx.deps.identity, marker);
+});
+
+test('T1 的 identity.resolveCaller 能直接吃 makeCtx 的 ctx（适配器投影与身份模块相容）', async (t) => {
+  const lead = makeCtx({ t });
+  const asLead = await lead.deps.identity.resolveCaller(lead);
+  assert.equal(asLead.ok, true);
+  assert.equal(asLead.role, 'lead');
+  assert.equal(asLead.name, 'lead');
+
+  const bare = makeCtx({ t, role: 'none' });
+  const asBare = await bare.deps.identity.resolveCaller(bare);
+  assert.equal(asBare.ok, false);
+  assert.equal(asBare.code, 'ROLE_REQUIRED');
 });
 
 test('makeClock 可前进且 isoNow 带时区', () => {

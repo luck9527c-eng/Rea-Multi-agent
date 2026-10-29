@@ -17,7 +17,11 @@
  * - `ctx.deps.teamAdapter` = **真实** `src/team-adapter.mjs` 套在假宿主上（所以映射逻辑被测到）；
  * - `ctx.deps.projectAdapter` = `test/helpers/fake-project.mjs` 替身；
  * - `ctx.deps.compatibility` = **真实** `src/compatibility.mjs` 模块；
- * - `ctx.deps.<T1/T3 的键>` = `null`，用 `depsOverrides` 注入（T5/T6/T7 自己决定注入什么）；
+ * - `ctx.deps` 里 T1/T3 的模块（`envelope`/`errors`/`validate`/`paths`/`atomic`/`lock`/`identity`/
+ *   `operation`/`audit`/`catalog`/`capability`/`capacity`）默认装配**真实模块命名空间**；
+ *   需要实例而不是命名空间时（例如 `operation` 的 ledger、已加载的 `catalog`）用
+ *   `depsOverrides` 覆盖；
+ * - 本轮尚未实现的键（`binding`/`contract`/`resources`/`submission`/`anchors`/`baseline`）为 `null`；
  * - `ctx.deps.clock` / `ctx.deps.fs` = 假时钟与 `fs/promises` 薄封装。
  *
  * 容量：真实宿主没有容量查询（D1），所以容量只能来自**显式声明**
@@ -39,6 +43,18 @@ import path from 'node:path';
 
 import { createTeamAdapter } from '../../src/team-adapter.mjs';
 import * as compatibility from '../../src/compatibility.mjs';
+import * as envelope from '../../src/envelope.mjs';
+import * as errors from '../../src/errors.mjs';
+import * as validate from '../../src/validate.mjs';
+import * as paths from '../../src/paths.mjs';
+import * as atomic from '../../src/atomic.mjs';
+import * as lock from '../../src/lock.mjs';
+import * as identity from '../../src/identity.mjs';
+import * as operation from '../../src/operation.mjs';
+import * as audit from '../../src/audit.mjs';
+import * as catalog from '../../src/catalog.mjs';
+import * as capability from '../../src/capability.mjs';
+import * as capacity from '../../src/capacity.mjs';
 import { createFakeTeam } from './fake-team.mjs';
 import { createFakeProject } from './fake-project.mjs';
 
@@ -256,18 +272,18 @@ export function makeCtx(options = {}) {
     : (options.project ?? createFakeProject({ projectRoot, ...(options.projectOpts ?? {}) }));
 
   const deps = {
-    envelope: null,
-    errors: null,
-    validate: null,
-    paths: null,
-    atomic: null,
-    lock: null,
-    identity: null,
-    operation: null,
-    audit: null,
-    catalog: null,
-    capability: null,
-    capacity: null,
+    envelope,
+    errors,
+    validate,
+    paths,
+    atomic,
+    lock,
+    identity,
+    operation,
+    audit,
+    catalog,
+    capability,
+    capacity,
     teamAdapter,
     projectAdapter: project,
     compatibility,
