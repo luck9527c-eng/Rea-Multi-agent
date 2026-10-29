@@ -29,10 +29,12 @@
 - `createTask` / `updateTask({action:'reassign'|'complete', owner})` / `getTask` / `listTasks`：**严格用宿主的方法名与 action 枚举**（E2 笔记为准），不要臆造 `reassignTask`/`completeTask`。任务投影成 SEAMS 的 `task` 形状。
 - `sendMessage`：把宿主抛的长度/拒绝映射为 `DELIVERY_FAILED`，`reason` 保留原文。
 - `interruptAgent`：返回 `previousStatus ∈ {running, inactive}`。
-- **`capacity()` 是本 ticket 最关键的判断点**：按 E2 笔记的结论实现。
-  - 若宿主确有**受支持的读法** → 读它，`known: true`，并在 `evidence.source` 写清来源。
-  - 若宿主只能给"目录/计数"而不是剩余额度，或需要读私有字段 → `known: false`，`evidence.source: 'unavailable'`，`remaining/total: null`。
-  - **绝对禁止**：假设 8、把 `maxMembers` 配置当剩余额度、读宿主 `private` 字段或 manager 内部结构、把 `listMembers().length` 当成"剩余"。
+- **`capacity()` 是本 ticket 最关键的判断点**，先读 [DECISIONS.md](../DECISIONS.md) D1，再按它实现：
+  - 宿主**没有**受支持的余额查询（已核实：`maxMembers`/`maxActiveSubagents`/`ActivationPool.slots` 全私有，唯一公开限额 getter 是 `resolveMaxDepth()`）。
+  - `used` 恒从 `listMembers().filter(r=>r.role==='teammate').length` 得出，**必须计入失败成员**。
+  - `total`/`remaining` **只允许**来自显式声明：`re/team/capacity.json`（`evidence.source:'declared:re/team/capacity.json'`）或插件 `config.capacity`（`'declared:profile-config'`）。都没有 → `known:false` + null。
+  - **绝对禁止**：假设 8、把 `maxMembers` 配置当剩余额度、读宿主 `private` 字段或 manager 内部结构、把 `listMembers().length` 当 `remaining`、`listChildren()` 算术当余额、**靠 spawn 试探余额**（失败会永久烧掉成员名与席位，见 D12）。
+  - 另提供 `readDeclaredCapacity(projectRoot)`：读并校验 `re/team/capacity.json`（`schema_version`、`declared_at`、`declared_by`、`maxMembers`、`maxActiveSubagents`），非法/缺字段 → `{known:false, gap}` 而不是崩。
 
 ### `src/project-adapter.mjs`
 

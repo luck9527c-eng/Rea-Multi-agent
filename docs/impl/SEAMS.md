@@ -54,9 +54,9 @@ spawnTeammate({name, prompt})            -> {ok, member} | {ok:false, code: 'CAP
 sendMessage({target, message})           -> {ok} | {ok:false, code:'DELIVERY_FAILED', reason}
 interruptAgent({target})                 -> {ok, previousStatus: 'running'|'inactive'}
 capacity()                               -> {
-  memberSlots:  {known: boolean, remaining: number|null, total: number|null},
+  memberSlots:  {known: boolean, remaining: number|null, total: number|null, used: number},
   activations:  {known: boolean, remaining: number|null, total: number|null},
-  evidence: {source: string}             // 说明余额从哪读到的；宿主不提供时 known:false 且 evidence.source='unavailable'
+  evidence: {source: string}             // 'declared:re/team/capacity.json' | 'declared:profile-config' | 'unavailable'
 }
 createTask({subject, description, blockedBy}) -> {ok, task} | {ok:false, code}
 updateTask({taskId, expectedRevision, action, owner?}) -> {ok, task} | {ok:false, code:'REVISION_CONFLICT'|'TEAM_TASK_*'}
@@ -66,7 +66,12 @@ listTasks()                              -> {ok, tasks: []}
 
 `task` 统一投影为 `{id, revision, status: 'pending'|'in_progress'|'completed', owner: string|null, subject, description, blockedBy: []}`。
 
-**`capacity()` 的 known=false 是合法结果**：上层必须转成 `CAPACITY_UNKNOWN` 并拒绝创建，不得用 8 兜底、不得读宿主私有字段。若 E2 的探查证明宿主确有受支持的读法，T4 就实现它并在 `evidence.source` 注明。
+**`capacity()` 是本次实现最容易瞎编的地方，规则见 [DECISIONS.md](DECISIONS.md) D1。** 宿主**没有任何**受支持的只读余额查询（`maxMembers` / `maxActiveSubagents` / `ActivationPool.slots` 全私有，唯一公开限额 getter 是 `resolveMaxDepth()`）。因此：
+
+- `used` 恒为 `listMembers().filter(r => r.role === 'teammate').length`，**永远可数，且必须计入失败成员**（失败 spawn 会永久占用名字与席位）。
+- `total` / `remaining` **只允许**来自显式声明：`re/team/capacity.json`（`evidence.source: 'declared:re/team/capacity.json'`）或插件 `config.capacity`（`'declared:profile-config'`）；都没有 → `known:false` 且置 `null`。
+- **禁止**：猜 8/16、读 `service.config` 或任何私有字段、用 `listChildren()` 算术当余额、**靠 spawn 试探余额**。
+- `known:false` 是合法结果，上层转 `CAPACITY_UNKNOWN` 并给出「怎么声明容量」的具体下一步。
 
 ## 4. `projectAdapter`（T4 提供，跑项目 skill 的真实 CLI）
 
