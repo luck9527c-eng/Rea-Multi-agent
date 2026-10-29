@@ -43,6 +43,15 @@ import * as catalog from './src/catalog.mjs'
 import * as capability from './src/capability.mjs'
 import * as capacity from './src/capacity.mjs'
 
+// —— 项目/会话记录（T5–T7）：绑定、派发契约、资源、提交、锚点、基准 ——
+// 这六个都是**纯模块命名空间**（SEAMS §1 的第一种形状），由 handler 直接调用其导出函数。
+import * as binding from './src/binding.mjs'
+import * as contract from './src/contract.mjs'
+import * as resources from './src/resources.mjs'
+import * as submission from './src/submission.mjs'
+import * as anchors from './src/anchors.mjs'
+import * as baseline from './src/baseline.mjs'
+
 // —— 适配器（T4）：团队服务、项目 skill CLI、兼容性摘要 ——
 import { createTeamAdapter } from './src/team-adapter.mjs'
 import { createProjectAdapter } from './src/project-adapter.mjs'
@@ -174,18 +183,22 @@ function fileSystem() {
 }
 
 /**
- * 装配一次调用用的依赖表。**键名与 SEAMS.md 第 1 节逐字一致**。
+ * 装配一次调用用的依赖表。**键名与 SEAMS.md 第 1 节逐字一致**（`DEP_KEYS`）。
  *
- * `binding` / `contract` / `resources` / `submission` / `anchors` / `baseline` 属于 T5/T6/T7，
- * 本 ticket 只给 `null`：那六个模块尚未存在，提前静态 import 会让本文件整体加载失败。
+ * 两种形状（SEAMS §1）：
+ * - `envelope` … `baseline` 与 `compatibility` 是**模块命名空间**，handler 直接用其导出函数；
+ * - `teamAdapter` / `projectAdapter` 是**每次调用新建**的适配器实例，把当次的
+ *   exec/services/config 与 `projectRoot` 绑进去（不跨调用复用）。
  *
- * 适配器工厂的入参形状由 T4 最终确定；这里把当次调用能拿到的上下文**原样**给出
- * （`services` / `exec` / `config` / `ctx` / `deps`），工厂取自己需要的字段即可。
+ * `projectRoot` 必须由调用方（`invokeTool`）先解析入参、`normalizeProjectRoot` 之后再传进来：
+ * 适配器只有在拿到真实根时才能读 `re/routes/**`、`re/team/capacity.json`。传 `undefined`
+ * 表示本次没有可用根（入参非法），适配器仍会装配但不绑定 —— 由 handler 返回可读错误。
  *
- * @param {{ services: object, exec: unknown, config: object, ctx?: unknown }} options
+ * @param {{ services: object, exec: unknown, config: object, ctx?: unknown,
+ *           projectRoot?: string }} options
  * @returns {object} `ctx.deps`
  */
-export function createDeps({ services, exec, config, ctx = undefined }) {
+export function createDeps({ services, exec, config, ctx = undefined, projectRoot = undefined }) {
   const clock = {
     now: () => Date.now(),
     isoNow: () => new Date(clock.now()).toISOString(),
@@ -196,17 +209,17 @@ export function createDeps({ services, exec, config, ctx = undefined }) {
     teamAdapter: null,
     projectAdapter: null,
     compatibility,
-    binding: null,
-    contract: null,
-    resources: null,
-    submission: null,
-    anchors: null,
-    baseline: null,
+    binding,
+    contract,
+    resources,
+    submission,
+    anchors,
+    baseline,
     clock,
     fs: fileSystem(),
   }
-  // 适配器是薄封装宿主服务的有状态对象：每次调用按当次的 exec/config 装配一次。
-  const adapterOptions = { services, exec, config, ctx, deps }
+  // 适配器是薄封装宿主服务的有状态对象：每次调用按当次的 exec/config/projectRoot 装配一次。
+  const adapterOptions = { services, exec, config, ctx, deps, projectRoot }
   deps.teamAdapter = createTeamAdapter(adapterOptions)
   deps.projectAdapter = createProjectAdapter(adapterOptions)
   return deps
@@ -241,7 +254,11 @@ export function handlerContext({ deps, exec, services, config }) {
 }
 
 /**
- * 把一次工具调用走完：解析入参 → 校验 → 分发到 handler → 返回信封。**绝不抛**。
+ * 把一次工具调用走完：解析入参 → 校验 → 规范化 `project_root` → 建两个适配器 → 交给 handler → 返回信封。
+ * **绝不抛**（未知工具名是唯一的编程错误）。
+ *
+ * 顺序是硬要求（T12）：`projectRoot` 是适配器的构造参数，必须在装配**之前**从入参里解出来并
+ * `normalizeProjectRoot`；否则 `readRoute/impact/readSeals` 在生产里一律 `PROJECT_NOT_CONFIGURED`。
  *
  * 这是本包真正拥有的那段逻辑（校验/路由/错误兜底），单独导出以便测试用假 handler 验收接缝。
  *
@@ -264,17 +281,9 @@ export async function invokeTool(options) {
   }
 
   const services = probeServices(ctx)
-  // 先装配 deps：handler 需要它，INVALID_ARGUMENT 分支也需要用它造信封。
-  let deps
-  try {
-    deps = createDeps({ services, exec, config, ctx })
-  } catch (thrown) {
-    // 适配器工厂炸了：仍然要给注册表一个合法信封。
-    return errorEnvelopeWithoutDeps(LOCAL_FALLBACK_CODES.adapter, thrown)
-  }
 
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    return deps.envelope.error({
+    return envelope.error({
       code: 'INVALID_ARGUMENT',
       ...envelopeIds(null),
       reason: `${spec.name} 的入参必须是对象，实际是 ${args === null ? 'null' : Array.isArray(args) ? 'array' : typeof args}`,
@@ -287,15 +296,32 @@ export async function invokeTool(options) {
   const input = { ...args }
   if (spec.handler === 'roster' && input.action === undefined) input.action = 'inspect'
 
-  const checked = deps.validate.validateInput(schemaDefs, spec.defName, input)
+  // 1) 校验：产生任何副作用（含建适配器）之前完成。
+  const checked = validate.validateInput(schemaDefs, spec.defName, input)
   if (!checked.ok) {
-    return deps.envelope.error({
+    return envelope.error({
       code: 'INVALID_ARGUMENT',
       ...envelopeIds(null),
       reason: describeIssues(checked.issues),
       nextStep: `按 docs/specs/rt-tools.schema.json 的 $defs.${spec.defName} 修正入参（字段形状、必填项与枚举以该 schema 为准）；本次调用未产生任何副作用`,
       data: null,
     })
+  }
+
+  // 2) 规范化本次的 project_root —— **必须在建适配器之前**。
+  //    适配器是「薄封装本次项目」的有状态对象：projectRoot 是它的构造参数，事后补不了
+  //    （T5/T6 各自报过 `readRoute/impact/readSeals` 一律 PROJECT_NOT_CONFIGURED）。
+  //    规范化失败时不绑定根：适配器照旧装配，但 handler 仍会被调用并给出可读错误
+  //    （handler 自己也会 normalizeProjectRoot，抛出的 ContractError 由下面统一转信封）。
+  const rootAttempt = await resolveProjectRoot(input)
+
+  // 3) 装配：键名与 SEAMS §1 一致，六个 T5–T7 模块是真实命名空间。
+  let deps
+  try {
+    deps = createDeps({ services, exec, config, ctx, projectRoot: rootAttempt })
+  } catch (thrown) {
+    // 适配器工厂炸了：仍然要给注册表一个合法信封。
+    return errorEnvelopeWithoutDeps(LOCAL_FALLBACK_CODES.adapter, thrown)
   }
 
   const operationId = operationIdOf(input)
@@ -328,6 +354,24 @@ export async function invokeTool(options) {
   } catch (thrown) {
     // ContractError 沿用其码；未知异常 → RECOVERY_REQUIRED + status=error（DECISIONS D22），且不把栈写进信封。
     return deps.envelope.fromError(thrown, { ...envelopeIds(operationId) })
+  }
+}
+
+/**
+ * 解析并规范化入参里的 `project_root`。**绝不抛**：失败返回 `undefined`（本次不绑定根）。
+ *
+ * 失败原因**不在这里吞掉**：三个 handler 自己第一步就 `normalizeProjectRoot`，会把
+ * `PATH_INVALID` 的原话与下一步放进信封（`test/assembly.test.mjs` 有用例钉住这一点）。
+ * 这里只决定「适配器建不建得上根」。
+ *
+ * @param {{ project_root?: unknown }} input
+ * @returns {Promise<string | undefined>}
+ */
+async function resolveProjectRoot(input) {
+  try {
+    return await paths.normalizeProjectRoot(input?.project_root)
+  } catch {
+    return undefined
   }
 }
 

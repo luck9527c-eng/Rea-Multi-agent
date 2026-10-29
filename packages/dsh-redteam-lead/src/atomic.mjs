@@ -25,6 +25,73 @@ function conflict(message, nextStep, details) {
 }
 
 /**
+ * 只对这三个码做重试：Windows 上并发写同一目录 / 杀软与索引器持有句柄会让
+ * `fs.rename` 与 `open(..., 'wx')` 偶发 `EPERM`、`EACCES`、`EBUSY`。
+ *
+ * 这是**真实**的健壮性缺陷（T5/T6/T7 都观察到门禁约 1/6 次飘红），不是测试噪音；
+ * 但重试面必须窄：`EEXIST`（幂等/冲突信号）、`ENOENT`（目标真的不存在）与哈希不一致
+ * 都是**有意义的失败**，重试只会把确定性错误变成随机行为。
+ */
+export const TRANSIENT_REPLACE_CODES = Object.freeze(['EPERM', 'EACCES', 'EBUSY'])
+
+/** 有界重试：最多尝试 3 次（含第一次）。 */
+export const DEFAULT_REPLACE_ATTEMPTS = 3
+
+/** 短退避基数：第 n 次失败后等 `n * 5ms`（最坏 15ms，不拖慢门禁）。 */
+const DEFAULT_REPLACE_DELAY_MS = 5
+
+/** 默认 I/O 实现；测试可注入 `options.io`（形状与 `fs/promises` 子集一致）。 */
+const DEFAULT_IO = Object.freeze({ mkdir, readFile, rename, rm, writeFile })
+
+function ioOf(options = {}) {
+  const io = options.io
+  return io === undefined || io === null ? DEFAULT_IO : { ...DEFAULT_IO, ...io }
+}
+
+function sleepFor(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function isTransientReplaceError(error, codes) {
+  const code = error?.code
+  return typeof code === 'string' && codes.includes(code)
+}
+
+/**
+ * 有界重试一次「替换 / 独占创建」动作。
+ *
+ * 契约：只对 `codes`（默认 {@link TRANSIENT_REPLACE_CODES}）重试；最多 `attempts` 次；
+ * 耗尽后抛**原始错误对象**（不包装、不改码、不吞）；非瞬时错误第一次就直接抛。
+ *
+ * @template T
+ * @param {() => Promise<T>} run
+ * @param {{ attempts?: number, delayMs?: number, sleep?: (ms: number) => Promise<void>,
+ *           codes?: string[] }} [options]
+ * @returns {Promise<T>}
+ */
+async function replaceWithRetry(run, options = {}) {
+  const attempts = Number.isSafeInteger(options.attempts) && options.attempts > 0
+    ? options.attempts
+    : DEFAULT_REPLACE_ATTEMPTS
+  const delayMs = Number.isSafeInteger(options.delayMs) && options.delayMs >= 0
+    ? options.delayMs
+    : DEFAULT_REPLACE_DELAY_MS
+  const codes = Array.isArray(options.codes) ? options.codes : TRANSIENT_REPLACE_CODES
+  const sleep = typeof options.sleep === 'function' ? options.sleep : sleepFor
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run()
+    } catch (error) {
+      if (!isTransientReplaceError(error, codes) || attempt >= attempts) throw error
+      await sleep(delayMs * attempt)
+    }
+  }
+}
+
+/**
  * 计算字节摘要。
  * @param {Buffer | Uint8Array} bytes
  * @returns {string} 小写十六进制 SHA256
@@ -49,8 +116,8 @@ function tempSibling(filePath) {
   return join(dirname(filePath), `.${process.pid}-${randomBytes(6).toString('hex')}.tmp`)
 }
 
-async function ensureParent(filePath) {
-  await mkdir(dirname(filePath), { recursive: true })
+async function ensureParent(filePath, io = DEFAULT_IO) {
+  await io.mkdir(dirname(filePath), { recursive: true })
 }
 
 /**
@@ -58,23 +125,30 @@ async function ensureParent(filePath) {
  *
  * 输出固定为 2 空格缩进 + 结尾换行，便于 diff 与人工核对。
  *
+ * `rename` 命中瞬时 `EPERM`/`EACCES`/`EBUSY` 时按短退避**有界**重试（默认 3 次）；
+ * 其它错误不重试，耗尽后抛原始错误。
+ *
  * @param {string} filePath 目标绝对路径
  * @param {unknown} value 可 JSON 序列化的值
- * @param {{ ensureParent?: boolean }} [options]
+ * @param {{ ensureParent?: boolean, attempts?: number, delayMs?: number,
+ *           sleep?: (ms: number) => Promise<void>, codes?: string[], io?: object }} [options]
  * @returns {Promise<{ path: string, sha256: string, bytes: number }>}
  */
 export async function writeJsonAtomic(filePath, value, options = {}) {
   const { ensureParent: createParent = true } = options
+  const io = ioOf(options)
   const text = `${JSON.stringify(value, null, 2)}\n`
   const bytes = Buffer.from(text, 'utf8')
-  if (createParent) await ensureParent(filePath)
+  if (createParent) await ensureParent(filePath, io)
 
   const temp = tempSibling(filePath)
   try {
-    await writeFile(temp, bytes)
-    await rename(temp, filePath)
+    await replaceWithRetry(async () => {
+      await io.writeFile(temp, bytes)
+      await io.rename(temp, filePath)
+    }, options)
   } catch (error) {
-    await rm(temp, { force: true }).catch(() => {})
+    await io.rm(temp, { force: true }).catch(() => {})
     throw error
   }
   return { path: filePath, sha256: sha256Bytes(bytes), bytes: bytes.length }
@@ -86,21 +160,27 @@ export async function writeJsonAtomic(filePath, value, options = {}) {
  * 已存在且内容完全一致 → 幂等成功（`created=false`）；内容不同 → `OPERATION_CONFLICT`，
  * 且**不覆盖**原文件。
  *
+ * `open(wx)` 命中瞬时 `EPERM`/`EACCES`/`EBUSY` 时有界重试；`EEXIST` **绝不**重试
+ * （它是幂等/冲突信号，不是抖动）。
+ *
  * @param {string} filePath 目标绝对路径
  * @param {string | Uint8Array} contents
+ * @param {{ attempts?: number, delayMs?: number, sleep?: (ms: number) => Promise<void>,
+ *           codes?: string[], io?: object }} [options]
  * @returns {Promise<{ created: boolean, existed: boolean, sameContent: boolean }>}
  */
-export async function createExclusive(filePath, contents) {
-  await ensureParent(filePath)
+export async function createExclusive(filePath, contents, options = {}) {
+  const io = ioOf(options)
+  await ensureParent(filePath, io)
   const bytes = typeof contents === 'string' ? Buffer.from(contents, 'utf8') : contents
   try {
-    await writeFile(filePath, bytes, { flag: 'wx' })
+    await replaceWithRetry(() => io.writeFile(filePath, bytes, { flag: 'wx' }), options)
     return { created: true, existed: false, sameContent: true }
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error
   }
 
-  const existing = await readFile(filePath)
+  const existing = await io.readFile(filePath)
   if (existing.equals(bytes)) {
     return { created: false, existed: true, sameContent: true }
   }
