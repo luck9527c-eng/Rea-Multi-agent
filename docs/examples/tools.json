@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "collected_at": "2026-10-29T15:08:01+08:00",
+  "host": {
+    "id": "example-local-windows",
+    "system": "Windows",
+    "scope": "本工作站指定文件元数据示例；不推断 DSH 运行环境"
+  },
+  "tools": [
+    {
+      "id": "ida-pro-local",
+      "name": "IDA Pro",
+      "version": null,
+      "version_source": "not_checked",
+      "capability_candidates": [
+        "binary-static"
+      ],
+      "entrypoints": [
+        {
+          "id": "gui",
+          "kind": "gui",
+          "path": "D:\\Tool\\IDAPro\\ida.exe",
+          "transport_tools": [],
+          "invocation": null,
+          "discovery": {
+            "method": "selected_file_metadata",
+            "observed_at": "2026-10-29T15:08:01+08:00",
+            "size_bytes": 12874240
+          },
+          "states": {
+            "discovered": "pass",
+            "executable": "unknown",
+            "session_ready": "unknown",
+            "target_ready": "unknown"
+          },
+          "checks": []
+        },
+        {
+          "id": "headless-candidate",
+          "kind": "cli",
+          "path": "D:\\Tool\\IDAPro\\idat.exe",
+          "transport_tools": [],
+          "invocation": null,
+          "discovery": {
+            "method": "selected_file_metadata",
+            "observed_at": "2026-10-29T15:08:01+08:00",
+            "size_bytes": 16896
+          },
+          "states": {
+            "discovered": "pass",
+            "executable": "unknown",
+            "session_ready": "unknown",
+            "target_ready": "unknown"
+          },
+          "checks": []
+        },
+        {
+          "id": "mcp-launcher-candidate",
+          "kind": "cli",
+          "path": "D:\\Tool\\IDAPro\\python311\\Scripts\\ida-pro-mcp.exe",
+          "transport_tools": [],
+          "invocation": null,
+          "discovery": {
+            "method": "selected_file_metadata",
+            "observed_at": "2026-10-29T15:08:01+08:00",
+            "size_bytes": 108336
+          },
+          "states": {
+            "discovered": "pass",
+            "executable": "unknown",
+            "session_ready": "unknown",
+            "target_ready": "unknown"
+          },
+          "checks": []
+        }
+      ],
+      "notes": [
+        "仅核查指定文件元数据，未启动程序。"
+      ],
+      "limitations": [
+        "未验证调用参数、控制通道、许可证、依赖或目标适配。",
+        "MCP launcher 文件存在不证明 DSH 已挂载或连接；GUI 存在不证明 agent 能操作。"
+      ],
+      "next_step": "当前路线需要时，查实际说明并进行最小无害验证，保留证据。"
+    },
+    {
+      "id": "ghidra-local",
+      "name": "Ghidra",
+      "version": null,
+      "version_source": "not_checked",
+      "capability_candidates": [
+        "binary-static"
+      ],
+      "entrypoints": [
+        {
+          "id": "headless-candidate",
+          "kind": "cli",
+          "path": "D:\\Tool\\ghidra_12.1.4_PUBLIC\\support\\analyzeHeadless.bat",
+          "transport_tools": [],
+          "invocation": null,
+          "discovery": {
+            "method": "selected_file_metadata",
+            "observed_at": "2026-10-29T15:08:01+08:00",
+            "size_bytes": 2930
+          },
+          "states": {
+            "discovered": "pass",
+            "executable": "unknown",
+            "session_ready": "unknown",
+            "target_ready": "unknown"
+          },
+          "checks": []
+        }
+      ],
+      "notes": [
+        "仅核查指定文件元数据，未启动程序。"
+      ],
+      "limitations": [
+        "未验证调用参数、控制通道、许可证、依赖或目标适配。"
+      ],
+      "next_step": "当前路线需要时，查实际说明并进行最小无害验证，保留证据。"
+    },
+    {
+      "id": "tshark-local",
+      "name": "TShark",
+      "version": null,
+      "version_source": "not_checked",
+      "capability_candidates": [
+        "network-observation"
+      ],
+      "entrypoints": [
+        {
+          "id": "cli",
+          "kind": "cli",
+          "path": "D:\\Tool\\Wireshark\\tshark.exe",
+          "transport_tools": [],
+          "invocation": null,
+          "discovery": {
+            "method": "selected_file_metadata",
+            "observed_at": "2026-10-29T15:08:01+08:00",
+            "size_bytes": 410440
+          },
+          "states": {
+            "discovered": "pass",
+            "executable": "unknown",
+            "session_ready": "unknown",
+            "target_ready": "unknown"
+          },
+          "checks": []
+        }
+      ],
+      "notes": [
+        "仅核查指定文件元数据，未启动程序。"
+      ],
+      "limitations": [
+        "未验证调用参数、控制通道、许可证、依赖或目标适配。"
+      ],
+      "next_step": "当前路线需要时，查实际说明并进行最小无害验证，保留证据。"
+    }
+  ],
+  "inventory_revision": "example-20261029-001",
+  "snapshot_ref": "docs/examples/ENV-tools-example.json",
+  "discovery_scope": {
+    "roots": [
+      "D:\\Tool"
+    ],
+    "max_depth": 4,
+    "max_entries": 10000,
+    "method": "selected_entries_only",
+    "coverage": "partial",
+    "selected_entries": 5,
+    "skipped": [
+      "未扫描完整 D:\\Tool",
+      "未读取 DSH MCP 注册表",
+      "未检查 PATH 或 Windows 应用注册"
+    ],
+    "errors": []
+  },
+  "registry_ref": null
+}
