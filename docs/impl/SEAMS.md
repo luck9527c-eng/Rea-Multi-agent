@@ -97,6 +97,18 @@ readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
 
 脚本失败一律 `{ok:false, ...}` 并保留 `stdout/stderr/exitCode`，**不得抛异常**，不得把脚本失败当成路线证死。
 
+**已核对的 CLI 硬事实（补充，来自 `D:\workSpace\rea-ma-notes\E3-project-skill.md`，实现必须照做）：**
+
+1. **脚本位置**：`project.py` 用扁平 import（`governance.py`/`impact.py`/`integrity.py`），**必须**从项目副本内调用：`<root>/.agents/skills/reverse-project-management/scripts/project.py`，并用 `python -B`。不能从全局 skill 目录跑项目。
+2. **解释器**：优先用项目配置里 pin 的解释器，其次 PATH 上的 `python`；实际用了哪个必须记进 `compatibility`/诊断（本机存在 3.15.2 与 3.12.14 两个，不能含糊）。
+3. **顺序不可换**：写记录 → `seal` → `index` → `check --hashes` →（项目完成时）`check --hashes --complete`。**`check` 会校验 INDEX 导航区字节相等，所以 `index` 必须在 `check` 之前**。`impact`/`audit-scope` 只做派生，不做校验。
+4. **`seal` 语义**：先对整个项目跑带哈希的校验，**通过后用 `O_EXCL` 写** `re/seals/targets/*.json` 与 `re/seals/runs/*.json`。`execution_sha256` = `run.json` 去掉 `state` 后的规范 JSON 哈希 —— 封存后**只允许改 `state`**。已有 seal 一律校验复用，**绝不重封**；更正走新 RUN。
+5. **`check --hashes --complete`** 额外要求：**不允许存在任何 `active` 路线**。别把它当成"任务全完成就通过"。
+6. **`re/env/tools.json` 与 `ENV-tools-*.json` 目前没有生产者、也没有真实实例**：插件必须**容忍缺失**，按 `tool-discovery.md` 报 unknown/gap，不得因此崩、不得自己生成清单。
+7. **skill 不提供任何锁或事务**：`re/team/lock` 由本插件提供。
+8. **`re/team/**` 对 `index` 不可见**：只有 INDEX 的手写区能链接它，插件只能在那里追加指针。
+9. **`check` fail-fast，一次只报第一条违规**：诊断里要保留原文，不要假装有聚合报告。
+
 `compatibility` 里的 `ruleDigest/scriptDigest/catalogDigest` 是绑定用的内容摘要，**不是**独立可信签名。
 
 ## 5. 测试替身（T4 提供，T5/T6/T7 使用）

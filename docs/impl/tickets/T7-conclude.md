@@ -43,7 +43,7 @@
    `anchor_ref` 统一指向 `run_id/path/locator`，`path` 必须登记在该 RUN 的 artifacts。**函数名、URL、evidence ID 单独不成立。**
 4. **归档**：把核对过的产物与 RUN 记录放进 skill 支持的正式位置；保存原提交、路径映射与原始字节哈希；保持实际命令、cwd、时间、来源与采集事件，**不因移动存储改写执行事实**。归档后正式记录才参与校验。
 5. **封存与基准比对**（`baseline.mjs`）：先与派发时冻结的 `baseline_ref` 比（目标字节、既有 seal 路径与字节哈希、依赖产物），既存项删除/读取失败/内容变化 → `BASELINE_MISMATCH`。再对尚未封存的终态 RUN 调 `projectAdapter.seal`；**已有封存只校验复用，绝不重封存、不覆盖旧 seal**。封存用 skill 自己的基线与目标身份，**不以本次提交的新哈希替换旧期望值**。
-6. **更新事实 → impact → index → check**：按 `review` 的有依据判定更新路线 history/closure、条件/争议与受影响验收；执行 `impact` 处置会阻止当前状态成立的影响；刷新 `index`；执行 `check --hashes`（项目完成另走 `--complete`）。任一脚本失败 → `CHECK_FAILED`，保留 stdout/stderr/exitCode/阶段，**不完成任务、不降门槛**。
+6. **更新事实 → impact → index → check**：按 `review` 的有依据判定更新路线 history/closure、条件/争议与受影响验收；执行 `impact` 处置会阻止当前状态成立的影响；**`index` 必须在 `check` 之前**（`check` 校验 INDEX 导航区字节相等）；执行 `check --hashes`（项目完成另走 `--complete`，它额外要求**不允许任何 `active` 路线**）。任一脚本失败 → `CHECK_FAILED`，保留 stdout/stderr/exitCode/阶段，**不完成任务、不降门槛**。`check` 是 fail-fast 只报第一条违规，原文必须保留。
 
 ### 结果分类与门槛（`src/conclude.mjs` 内表驱动）
 
