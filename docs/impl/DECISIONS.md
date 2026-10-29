@@ -139,7 +139,6 @@ schema 是 `additionalProperties:false`，`capacity` 恰好 4 个属性：`remai
 `$defs.failureData` 的阶段是 `preflight…needs_recovery`（无 `completed`）；编排契约的操作阶段是 `prepared…completed` + `needs_recovery`（无 `preflight`）。两者各留逐字常量（`envelope.FAILURE_PHASES` / `operation.OPERATION_PHASES`），不要互相翻译。
 
 ## D25 — activation「上限已声明、占用不可观测」不能导致全员 defer
-
 T4 的 `teamAdapter.capacity()` 如实返回：`memberSlots` 的 `used` 恒可数、`total/remaining` 来自声明；但 **`activations.remaining` 恒为 `null`**（真实宿主没有任何 activation 占用查询）。而 T3 的 `planBudget` 规则是「任一余额为 null → 新成员岗位 deferred + `CAPACITY_UNKNOWN`」。两者叠加会让**所有新成员岗位永远 deferred**，插件直接不可用。
 
 **裁决：把「上限未知」与「占用不可观测」分开。**
@@ -159,3 +158,20 @@ const gaps = [...budget.gaps, ...cap.gaps]   // cap.gaps 只作非阻塞诊断
 ```
 
 `rosterData.capacity` 仍然只投影 schema 的 4 个字段（D19）；`remaining_activations` 取 `budget.capacity` 里已扣预留的结果。
+
+## D26 — output.schema / parameters 不能直接注册规格的 $defs
+
+ctx.tools.register() 会用 host 的 ssertSupportedJsonSchema 校验，**支持的子集只有** 	ype / oneOf / properties / required / additionalProperties / items / enum / const + 注解。以下一律抛 UNSUPPORTED_SCHEMA，**整行插件不激活**（不是降级，是整行消失）：
+\、llOf、nyOf、if/then/else、pattern、minLength、minimum、ormat、**类型数组**（如 ["string","null"]）。
+已对照**两个**版本核对：安装目标 dsh-v0.2.1-rc.3 与 checkout  .2.2-alpha.2 的 `packages/core/tools/src/json-schema.ts`，子集与 `ONE_OF_SIBLING_KEYWORDS` 一致。
+
+**因此**：
+- 注册用的 output.schema 是 `src/tool-schema.mjs` 的 `resultOutput` —— `\.result` 的**子集投影**（八字段/required/封闭/status enum；`code` 的 enum 直接取 `\.errorCode`；string|null 与 object|null 用 `oneOf`）。
+- `parameters` 用 `inlineRefs` 就地展开 `\`（悬空 `\` 会直接进模型上下文）。
+- `ok ⇒ code=null`、非 ok 的 data 联合这类表达不了的条件，由 `envelope.mjs` + 入口的**完整** JSON Schema 校验（含 if/then/else）在运行期保证。
+- 测试里镜像了宿主的校验器；谁把 `\`/`allOf` 加回注册 schema 就红。
+- **校验**仍用逐字 `\`（漂移测试不变）—— 注册投影与校验用字分离。
+
+## D27 — envelope 的参数名以实现为准
+
+`envelope.ok/blocked/...` 解构的是 **`operationId`**（驼峰），不是 `operation_id`。信封**输出**字段才是 `operation_id`。下游照实现写；`index.js` 目前两个键都传，属兼容冗余。
