@@ -6,7 +6,7 @@
   "description": "Rea-Multi-agent 插件开发仓库：workspace 级构建与验证脚本（不发布）。",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "npm run build && node --test \"packages/dsh-redteam-lead/test/**/*.test.ts\"",
+    "test": "npm run build && node --test \"packages/dsh-redteam-lead/test/**/*.test.mjs\"",
     "typecheck": "tsc -p packages/dsh-redteam-lead/tsconfig.json --noEmit",
     "doctor": "node packages/dsh-redteam-lead/bin/doctor.mjs"
   },

@@ -120,7 +120,7 @@ schema 是 `additionalProperties:false`，`capacity` 恰好 4 个属性：`remai
 
 ## D20 — 门禁命令用显式 glob
 
-`cd packages/dsh-redteam-lead; node --test "test/**/*.test.mjs"`。裸 `node --test` 会把 `test/helpers/*.mjs` 当测试文件执行（虚增计数、将来可能产生副作用）；`node --test test` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
+**T10 起统一为仓库根形态**，并与根 `package.json` 的 `scripts.test`、`docs/impl/CONVENTIONS.md`、`packages/dsh-redteam-lead/README.md` 三处逐字相同：`npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"`。裸 `node --test` 会把 `test/helpers/*.mjs` 当测试文件执行（虚增计数、将来可能产生副作用）；`node --test <目录>` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
 
 ## D21 — `ContractError.details` 不可上线
 
@@ -219,3 +219,48 @@ oUncheckedIndexedAccess: false**。理由：本次是**机械迁移**，目标�
 产品代码已全部是 TypeScript（`src/*.ts` → `dist/`，`tsc` 0 错、`strict: true`）。**测试保持 `.mjs` 并 import `dist/*.js`** —— 它们跑的是要发货的字节，行为断言完整。
 
 未做「测试也转 TS」（T13）的理由：它只增加测试内部类型，不改变被测行为；而当前剩余工作（真实 skill 集成、第三层验收套件、验收总表、代码审查）对交付价值更高。**这是有意的降级，不是遗漏**：T13 的 ticket 保留，可随时执行，门禁届时切到 `test/**/*.test.ts`。
+
+## D32 — skill 侧三处会「炸一整个命令」的坑，以及 seal 的真实成本
+
+> 来源：T8 在真实 `project.py` 上做第二层集成时踩到并记录；本文件只记录事实与由此而来的实现约束，不改 `docs/specs/`。
+> 对应的回归用例：`test/l2/helpers.mjs`（`writeRun` 的 `state` 语义）、`test/l2/outcomes.test.mjs`（中断必须有恢复评估）、`test/l2/seal-check.test.mjs`（导航顺序与执行事实）、`test/l2/recovery.test.mjs`（重放与前向恢复）。
+
+### 1. `run.json` 里写 `"state": null` 会让 `index` 崩
+
+`run.json` 带 `"state": null` 时，真实 CLI 的 `management_summary()` 在 `state.get(...)` 上抛
+`'NoneType' object has no attribute 'get'`。**没有 state 就要整个删掉这个键**，不能写 `null`：
+
+- 写记录的一方（`test/l2/helpers.mjs` 的 `writeRun`、任何归档路径）必须 `delete run.state`；
+- 插件收口/归档时**不得**把"没有状态评估"序列化成 `state: null`；
+- 读到少了 `state` 键的旧记录是合法的，不能当损坏（`RECOVERY_REQUIRED` 只适用于真的坏 JSON）。
+
+### 2. `interrupted` 缺 `recovery` 同样会让 `index` 崩
+
+`status: 'interrupted'` 的运行必须带恢复评估（`state.recovery`）。缺它的表现不是"少一条提示"，而是
+`index` 直接失败——因为导航区摘要要数"实验恢复待办"。因此：
+
+- `interrupted` 的 RUN 要么补 `state.recovery`，要么不要进正式记录；
+- 插件对 `interrupted` 的提交必须要求恢复评估（`test/l2/outcomes.test.mjs` 的
+  "failed（中断）：interrupted 必须有恢复评估，否则 check 给出具体拒绝" 就是这条）。
+
+### 3. INDEX 的导航区是**内容派生**的，改完事实必须重跑 `index`
+
+`<!-- RPM:NAV:START -->…<!-- RPM:NAV:END -->` 之间的内容由 `inventory(root)` 现算：目标清单、
+`re/project.json` 的验收/审计/争议摘要、`re/{env,conditions,routes,runs,seals,docs,scripts}` 的文件枚举、
+待复核表与恢复待办。**它不是缓存，是当前事实的投影。** 所以：
+
+- 改 `re/project.json`（验收项、审计、争议、完成声明）、改条件/路线、加 RUN、加 seal、加环境快照之后，
+  **必须重跑 `index`**；
+- 否则 `check` 的第一条就是 `INDEX navigation stale; run index`——这是记录真的不一致，不是"忘了刷新页面"；
+- 插件侧的推导：`seal`/`index`/`check` 是**有序**的（`test/l2/seal-check.test.mjs` 的
+  "顺序不可换：seal 不刷新 INDEX…"），编排顺序照 D29（写记录 → seal → 更新事实 → impact → index → check）。
+
+### 4. 操作后果：`seal` 跑的是**全项目**校验
+
+`seal` 在写基线前调用 `validate(root, hashes=True, allow_unsealed=True, check_index=False)`，即：
+所有目标的字节哈希、所有路线/条件/锚点的结构与引用、既有 seal 的字节一致性都会在这一步被核对，
+**只有 INDEX 导航检查被跳过**。
+
+因此 seal 失败通常**不是**"这个 RUN 有问题"，而是项目里别处已经不一致（旧目标哈希变了、旧 seal 被删、
+某条路线缺锚点……）。处置顺序：按 skill 修记录 → 用**同一个 operation ID** 重入（D29 的前向恢复），
+**不要**重封存、不要为了让 seal 过去而放宽 `check` 门槛、不要删旧证据。

@@ -12,10 +12,11 @@ DSH bundle：给模式列表加一个 **红队指挥**（preset id `redteam-lead
 零运行时依赖、纯 ESM、**不 import 任何 `@deepseek-ai/*`**：本地 `link:` 安装的 bundle 按自身真实
 路径解析裸包名，宿主能力一律经注入的 `ctx` 取。
 
-> **当前交付状态**：本包当前交付的是 bundle 骨架、preset、工具注册入口与 `bin/doctor.mjs`。
-> `src/roster.mjs` / `src/dispatch.mjs` / `src/conclude.mjs` 是**占位实现**，合法调用会返回
-> `TEAM_SERVICE_UNAVAILABLE` 错误信封并写清下一步；真实编排逻辑随后续 ticket 整体替换这三个文件，
-> 不需要改 `index.js`、`cordis.patch.yml` 或本文件。
+> **当前交付状态**：三个工具、preset、`bin/doctor.mjs` 与两个适配器均已实现（源码 `src/*.ts`，
+> 发货字节 `dist/` 随仓库提交）。自动门禁 **0 失败 / 0 跳过**；**第三层（真实 DSH 团队会话）一次都没
+> 执行过**，验收矩阵里 18 条 L3 行全部 `not-run`。逐条状态见
+> [`docs/verify/acceptance-status.md`](../../docs/verify/acceptance-status.md)，安装/卸载/三层验证的完整
+> 说明见[仓库根 README](../../README.md)。
 
 ## 前置
 
@@ -33,7 +34,7 @@ DSH bundle：给模式列表加一个 **红队指挥**（preset id `redteam-lead
 
 ```powershell
 cd $env:USERPROFILE\.dsh\profiles\desktop
-pnpm add "link:D:\workSpace\rea-ma-wt\t2\packages\dsh-redteam-lead"   # 或你的 checkout 路径
+pnpm add "link:D:\workSpace\Rea-Multi-agent\packages\dsh-redteam-lead"   # 换成你自己的 checkout 路径
 ```
 
 然后编辑该目录的 `package.json`，把本包加进 `dsh.profile.bundles`（放在团队 profile 之后）：
@@ -41,7 +42,7 @@ pnpm add "link:D:\workSpace\rea-ma-wt\t2\packages\dsh-redteam-lead"   # 或你�
 ```json
 {
   "dependencies": {
-    "@local/dsh-redteam-lead": "link:D:\\workSpace\\rea-ma-wt\\t2\\packages\\dsh-redteam-lead"
+    "@local/dsh-redteam-lead": "link:D:\\workSpace\\Rea-Multi-agent\\packages\\dsh-redteam-lead"
   },
   "dsh": {
     "profile": {
@@ -68,7 +69,7 @@ pnpm add "link:D:\workSpace\rea-ma-wt\t2\packages\dsh-redteam-lead"   # 或你�
 固定入口，**只读**，不需要插件已挂载，也不需要团队服务已注册：
 
 ```powershell
-node D:\workSpace\rea-ma-wt\t2\packages\dsh-redteam-lead\bin\doctor.mjs `
+node D:\workSpace\Rea-Multi-agent\packages\dsh-redteam-lead\bin\doctor.mjs `
   --profile $env:USERPROFILE\.dsh\profiles\desktop `
   --project D:\workSpace\PJ\case01
 ```
@@ -132,16 +133,24 @@ cd $env:USERPROFILE\.dsh\profiles\desktop
 3. **locale 只影响显示名**：宿主只消费 `locale/*.json` 的 `meta.title` / `meta.description`；
    **工具描述不做本地化**（`description` 是裸字符串，直接进模型上下文），所以工具文案只有英文一份。
 4. **doctor 只报配置**：它看不到团队服务、也看不到会话状态；`runtime_ready` 永远是 `unknown`。
+5. **容量必须显式声明**（DECISIONS D1）：宿主没有受支持的只读余额查询。没有 `re/team/capacity.json`
+   或 profile `config.capacity` 时，`rt_roster` / `rt_dispatch` 返回 `CAPACITY_UNKNOWN` 并写明下一步
+   ——不猜常数、不读私有字段、不靠 spawn 试探。activation 的**占用**不可观测（D25），只以
+   `ACTIVATION_USAGE_UNOBSERVED` gap 呈现。
+6. **`re/env/tools.json` 目前没有生产者**（DECISIONS D11）：skill 侧没有生成命令，本机零个真实实例。
+   插件只容忍缺失并报 unknown/gap，绝不自己扫描或生成清单。
 
 ## 开发
 
+在**仓库根**执行（唯一门禁命令，与根 `package.json` 的 `scripts.test`、`docs/impl/CONVENTIONS.md` 逐字相同）：
+
 ```powershell
-cd packages/dsh-redteam-lead
-node --test "test/**/*.test.mjs"     # 仓库根：node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"
+npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"
 ```
 
-> 门禁命令必须写成显式 glob（DECISIONS D20）：裸 `node --test` 会把 `test/helpers/*.mjs` 也当测试文件跑；
-> `node --test test` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
-
-`test/bundle.test.mjs` 里三条「工具注册/路由」用例在 T1/T3/T4 模块尚未合入时会
-`t.skip('waiting for sibling modules …')`——这是**故意**的：不为了跑绿而造假 stub。
+- 门禁命令必须写成显式 glob（DECISIONS D20）：裸 `node --test` 会把 `test/helpers/*.mjs` 也当测试文件跑；
+  `node --test <目录>` 在 Node 24 上直接失败（位置参数按 glob 解释，不展开目录）。
+- 用 `npm.cmd` 而不是 `npm`（PowerShell 执行策略会拦 `npm.ps1`）；`dist/` 必须重建并随源码一起提交（D28）。
+- 只跑一层：`node --test "packages/dsh-redteam-lead/test/*.test.mjs"`（L1）或
+  `node --test "packages/dsh-redteam-lead/test/l2/*.test.mjs"`（L2，需要真实 Python 与权威 skill 副本）。
+- 测试用 `t.skip(具体原因)` 报告环境缺失（L2 的 Python / skill 副本），不会假通过；当前门禁是 0 跳过。
