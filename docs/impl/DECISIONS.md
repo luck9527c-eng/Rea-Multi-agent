@@ -161,22 +161,22 @@ const gaps = [...budget.gaps, ...cap.gaps]   // cap.gaps 只作非阻塞诊断
 
 ## D26 — output.schema / parameters 不能直接注册规格的 $defs
 
-ctx.tools.register() 会用 host 的 ssertSupportedJsonSchema 校验，**支持的子集只有** 	ype / oneOf / properties / required / additionalProperties / items / enum / const + 注解。以下一律抛 UNSUPPORTED_SCHEMA，**整行插件不激活**（不是降级，是整行消失）：
-\、llOf、nyOf、if/then/else、pattern、minLength、minimum、ormat、**类型数组**（如 ["string","null"]）。
-已对照**两个**版本核对：安装目标 dsh-v0.2.1-rc.3 与 checkout  .2.2-alpha.2 的 `packages/core/tools/src/json-schema.ts`，子集与 `ONE_OF_SIBLING_KEYWORDS` 一致。
+ctx.tools.register() 会用 host 的 `assertSupportedJsonSchema` 校验，**支持的子集只有** `type` / oneOf / properties / required / additionalProperties / items / enum / const + 注解。以下一律抛 UNSUPPORTED_SCHEMA，**整行插件不激活**（不是降级，是整行消失）：
+`$ref`、`allOf`、`anyOf`、if/then/else、pattern、minLength、minimum、`format`、**类型数组**（如 ["string","null"]）。
+已对照**两个**版本核对：安装目标 dsh-v0.2.1-rc.3 与 checkout `0.2.2-alpha.2` 的 `packages/core/tools/src/json-schema.ts`，子集与 `ONE_OF_SIBLING_KEYWORDS` 一致。
 
 **因此**：
-- 注册用的 output.schema 是 `src/tool-schema.mjs` 的 `resultOutput` —— `\.result` 的**子集投影**（八字段/required/封闭/status enum；`code` 的 enum 直接取 `\.errorCode`；string|null 与 object|null 用 `oneOf`）。
-- `parameters` 用 `inlineRefs` 就地展开 `\`（悬空 `\` 会直接进模型上下文）。
+- 注册用的 output.schema 是 `src/tool-schema.mjs` 的 `resultOutput` —— `$defs.result` 的**子集投影**（八字段/required/封闭/status enum；`code` 的 enum 直接取 `$defs.errorCode`；string|null 与 object|null 用 `oneOf`）。
+- `parameters` 用 `inlineRefs` 就地展开 `$ref`（悬空 `$ref` 会直接进模型上下文）。
 - `ok ⇒ code=null`、非 ok 的 data 联合这类表达不了的条件，由 `envelope.mjs` + 入口的**完整** JSON Schema 校验（含 if/then/else）在运行期保证。
-- 测试里镜像了宿主的校验器；谁把 `\`/`allOf` 加回注册 schema 就红。
-- **校验**仍用逐字 `\`（漂移测试不变）—— 注册投影与校验用字分离。
+- 测试里镜像了宿主的校验器；谁把 `$ref`/`allOf` 加回注册 schema 就红。
+- **校验**仍用逐字 `$defs`（漂移测试不变）—— 注册投影与校验用字分离。
 
 ## D27 — envelope 的参数名以实现为准
 
 `envelope.ok/blocked/...` 解构的是 **`operationId`**（驼峰），不是 `operation_id`。信封**输出**字段才是 `operation_id`。下游照实现写；`index.js` 目前两个键都传，属兼容冗余。
 
-## D28 — 改用 TypeScript：源码 .ts + 	sc 产物 dist/，运行时依赖仍为零
+## D28 — 改用 TypeScript：源码 .ts + `tsc` 产物 `dist/`，运行时依赖仍为零
 
 **背景**：原决定用纯 .mjs 的两条理由已失效 ——（a）本机 Node v24.22.1 **原生支持运行 .ts**（类型擦除默认开启，`node x.ts` 与 `node --test x.test.ts` 均实测通过）；（b）`npm.cmd` 实测可用（11.19.1），registry 可达，`typescript` 可装。此前"npm 不可用"是 **PowerShell 执行策略**拦了 `npm.ps1`（五个作用域全 Undefined → OS 默认 Restricted），与 DSH 无关，`npm.cmd` 一直能用。
 
@@ -202,15 +202,13 @@ ctx.tools.register() 会用 host 的 ssertSupportedJsonSchema 校验，**支持
 
 编排契约 §135 提到「seal 前先按事实解除会令全项目校验失败的旧状态」，而 T7 的实现顺序是 写记录 → seal → 更新事实 → impact → index → check。
 
-**裁决：保持 T7 的顺序。** 把 seal 挪到「更新事实」之后会让**封存的是尚未更新的旧事实**，比它想解决的问题更严重。若旧路线状态本身会让 seal 的全项目校验失败，t_conclude 如实返回 CHECK_FAILED，由 Lead 先按 skill 修正记录再以同一 operation ID 重入 —— **不降门槛、不静默改序**。
+**裁决：保持 T7 的顺序。** 把 seal 挪到「更新事实」之后会让**封存的是尚未更新的旧事实**，比它想解决的问题更严重。若旧路线状态本身会让 seal 的全项目校验失败，`rt_conclude` 如实返回 CHECK_FAILED，由 Lead 先按 skill 修正记录再以同一 operation ID 重入 —— **不降门槛、不静默改序**。
 
 ## D30 — TS 工具链已由 Lead 预置；注意 Windows 不能 spawn .cmd
 
-**已就位**（不要重新发明）：仓库根 package.json（	ypescript@^5.9 + @types/node@^24 为 devDependencies，scripts.build/test/typecheck）、packages/dsh-redteam-lead/tsconfig.json、scripts/build.mjs。实测 	sc 5.9.3 可用，
-pm run build 通路正常（无 .ts 时如实报 TS18003 并非零退出）。
+**已就位**（不要重新发明）：仓库根 package.json（`typescript@^5.9` + @types/node@^24 为 devDependencies，scripts.build/test/typecheck）、packages/dsh-redteam-lead/tsconfig.json、scripts/build.mjs。实测 `tsc` 5.9.3 可用，`npm run build` 通路正常（无 .ts 时如实报 TS18003 并非零退出）。
 
-**	sconfig 的取舍**：strict: true，但 **
-oUncheckedIndexedAccess: false**。理由：本次是**机械迁移**，目标是把模块边界的类型钉住，而不是在迁移途中跟每一处 obj[key] 搏斗；打开它会让迁移量成倍膨胀且容易诱发「加 ! 兜底」的伪类型安全。要开另立 ticket。
+**`tsconfig` 的取舍**：strict: true，但 **noUncheckedIndexedAccess: false**。理由：本次是**机械迁移**，目标是把模块边界的类型钉住，而不是在迁移途中跟每一处 obj[key] 搏斗；打开它会让迁移量成倍膨胀且容易诱发「加 ! 兜底」的伪类型安全。要开另立 ticket。
 
 **踩到的坑（复用价值高）**：Windows 上 Node ≥ 18.20 因 CVE-2024-27980 的修正，在 shell: false 下**拒绝 spawn .cmd/.bat**，会抛 spawn EINVAL。所以 scripts/build.mjs 用 `process.execPath` + `node_modules/typescript/bin/tsc` 的 **JS 入口**，而不是 `.bin/tsc.cmd`。任何要调外部程序的代码都适用这条：优先找 .exe 或 JS 入口，不要靠 .cmd shim，也**不要**为了跑通而打开 shell: true（那会引入注入面）。
 
