@@ -1,10 +1,19 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { ContractError } from '../src/errors.mjs'
-import { copyVerify, createExclusive, sha256Bytes, sha256File, verifyFileHash, writeJsonAtomic } from '../src/atomic.mjs'
+import {
+  DEFAULT_REPLACE_ATTEMPTS,
+  TRANSIENT_REPLACE_CODES,
+  copyVerify,
+  createExclusive,
+  sha256Bytes,
+  sha256File,
+  verifyFileHash,
+  writeJsonAtomic,
+} from '../src/atomic.mjs'
 import { makeTempProject } from './helpers/tmp.mjs'
 
 /** 断言抛 OPERATION_CONFLICT（内容/哈希冲突在契约里归到这一个稳定码）。 */
@@ -162,4 +171,154 @@ test('verifyFileHash 对缺失目标给出冲突而不是未知异常', async ()
   } finally {
     await project.dispose()
   }
+})
+
+// ---------------------------------------------------------------------------
+// 瞬时 rename/open 抖动：只对 EPERM/EACCES/EBUSY 做**有界**重试
+//
+// Windows 上并发写 %TEMP% 会让 `fs.rename` 偶发 EPERM（T5/T6/T7 都观察到，门禁约 1/6 飘红）。
+// 这是真实的健壮性缺陷，但对 EEXIST/ENOENT/哈希不一致重试会把「有意义的失败」变成静默重来，
+// 所以重试面必须窄：只有这三个码、最多 3 次、短退避。
+// ---------------------------------------------------------------------------
+
+/** 造一个带 `code` 的瞬时错误（形状与 Node 的 SystemError 一致）。 */
+function transientError(code) {
+  return Object.assign(new Error(`${code}: operation not permitted, rename`), { code })
+}
+
+/**
+ * 可计数的 io 替身：只统计 `writeFile`/`rename` 的真实尝试次数，其余走真实 fs。
+ * @param {{writeFile?: Function, rename?: Function}} [overrides]
+ */
+function countingIo(overrides = {}) {
+  const attempts = { writeFile: 0, rename: 0 }
+  const io = {
+    mkdir: (...args) => mkdir(...args),
+    rm: (...args) => rm(...args),
+    readFile: (...args) => readFile(...args),
+    writeFile: async (...args) => {
+      attempts.writeFile += 1
+      return overrides.writeFile === undefined ? writeFile(...args) : overrides.writeFile(...args)
+    },
+    rename: async (...args) => {
+      attempts.rename += 1
+      return overrides.rename === undefined ? rename(...args) : overrides.rename(...args)
+    },
+  }
+  return { io, attempts }
+}
+
+test('writeJsonAtomic 命中瞬时 EPERM 时重试：第 2 次成功且内容正确', async () => {
+  const project = await makeTempProject({ segments: [] })
+  try {
+    const dir = join(project.root, 're', 'team')
+    const file = join(dir, 'retry.json')
+    const { io, attempts } = countingIo({
+      rename: async (from, to) => {
+        if (attempts.rename === 1) throw transientError('EPERM')
+        return rename(from, to)
+      },
+    })
+
+    const result = await writeJsonAtomic(file, { revision: 2 }, { io, sleep: async () => {} })
+
+    assert.equal(attempts.rename, 2, '第一次 EPERM 后必须重试一次')
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { revision: 2 })
+    assert.equal(result.bytes, Buffer.byteLength('{\n  "revision": 2\n}\n'))
+    assert.deepEqual(await readdir(dir), ['retry.json'], '重试成功后不得残留临时文件')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('writeJsonAtomic 连续瞬时失败 → 最多 3 次后抛原始错误对象', async () => {
+  const project = await makeTempProject({ segments: [] })
+  try {
+    const dir = join(project.root, 're', 'team')
+    const file = join(dir, 'always.json')
+    const boom = transientError('EPERM')
+    const { io, attempts } = countingIo({ rename: async () => { throw boom } })
+
+    await assert.rejects(
+      () => writeJsonAtomic(file, { a: 1 }, { io, sleep: async () => {} }),
+      (error) => error === boom,
+      '耗尽重试后必须抛原文（同一个错误对象），不是包装错误',
+    )
+    assert.equal(attempts.rename, DEFAULT_REPLACE_ATTEMPTS, `最多 ${DEFAULT_REPLACE_ATTEMPTS} 次尝试`)
+    assert.deepEqual(await readdir(dir), [], '成败都不残留临时文件')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('非瞬时错误（ENOENT）不重试：一次尝试后直接抛出', async () => {
+  const project = await makeTempProject({ segments: [] })
+  try {
+    const dir = join(project.root, 're', 'team')
+    const file = join(dir, 'missing.json')
+    const boom = Object.assign(new Error('ENOENT: no such file or directory, rename'), { code: 'ENOENT' })
+    const { io, attempts } = countingIo({ rename: async () => { throw boom } })
+
+    await assert.rejects(
+      () => writeJsonAtomic(file, { a: 1 }, { io, sleep: async () => {} }),
+      (error) => error === boom,
+    )
+    assert.equal(attempts.rename, 1, 'ENOENT 是有意义的失败：不得重试')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('createExclusive 命中瞬时 EPERM 时重试：第 2 次成功', async () => {
+  const project = await makeTempProject({ segments: [] })
+  try {
+    const dir = join(project.root, 're', 'team', 'seals')
+    const file = join(dir, 'RUN-EPERM.json')
+    const { io, attempts } = countingIo({
+      writeFile: async (target, bytes, flag) => {
+        if (attempts.writeFile === 1) throw transientError('EPERM')
+        return writeFile(target, bytes, flag)
+      },
+    })
+
+    const result = await createExclusive(file, '{"sealed":true}\n', { io, sleep: async () => {} })
+
+    assert.equal(result.created, true)
+    assert.equal(attempts.writeFile, 2, 'EPERM 后必须重试一次')
+    assert.equal(await readFile(file, 'utf8'), '{"sealed":true}\n')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('createExclusive 命中 EEXIST 不重试：同内容幂等、异内容冲突，各只尝试一次', async () => {
+  const project = await makeTempProject({ segments: [] })
+  try {
+    const dir = join(project.root, 're', 'team', 'seals')
+    const file = join(dir, 'RUN-EEXIST.json')
+    const { io, attempts } = countingIo()
+
+    const first = await createExclusive(file, '{"sealed":true}\n', { io, sleep: async () => {} })
+    assert.equal(first.created, true)
+    assert.equal(attempts.writeFile, 1)
+
+    const second = await createExclusive(file, '{"sealed":true}\n', { io, sleep: async () => {} })
+    assert.equal(second.created, false)
+    assert.equal(second.sameContent, true)
+    assert.equal(attempts.writeFile, 2, 'EEXIST 是幂等信号：每次调用只尝试一次')
+
+    await assertConflict(
+      () => createExclusive(file, '{"sealed":false}\n', { io, sleep: async () => {} }),
+      '不同内容应冲突',
+    )
+    assert.equal(attempts.writeFile, 3, '内容冲突也不重试')
+    assert.equal(await readFile(file, 'utf8'), '{"sealed":true}\n', '冲突时不得覆盖原文件')
+  } finally {
+    await project.dispose()
+  }
+})
+
+test('重试只认 EPERM/EACCES/EBUSY 三个码', () => {
+  assert.deepEqual([...TRANSIENT_REPLACE_CODES].sort(), ['EACCES', 'EBUSY', 'EPERM'])
+  assert.equal(DEFAULT_REPLACE_ATTEMPTS, 3)
 })
