@@ -66,6 +66,8 @@ import { handleConclude } from './conclude.js'
 // `*Parameters` 是展开 `$ref` 后的自包含入参 schema；`resultOutput` 是宿主支持子集里的
 // `$defs.result` 投影（`assertSupportedJsonSchema` 不认 `$ref`/`allOf`/类型数组）。
 import { schemaDefs, rosterParameters, dispatchParameters, concludeParameters, resultOutput } from './tool-schema.js'
+import { recordOf } from './guards.js'
+import type { Deps, Envelope, HandlerConfig, HandlerCtx, HandlerResult } from './types.js'
 
 /** 插件名（插件清单/日志用）。 */
 export const name = 'redteam-lead-tools'
@@ -82,8 +84,14 @@ const BUNDLE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 /** `config.presetId`：本包只服务这一个 preset。 */
 const PRESET_ID = 'redteam-lead'
 
-/** 默认 handler 表；T5/T6/T7 只替换 `src/*.mjs` 的实现。 */
-const DEFAULT_HANDLERS = Object.freeze({
+/**
+ * 默认 handler 表；T5/T6/T7 只替换 `src/*.mjs` 的实现。
+ *
+ * 显式标成索引签名表（键就是各工具声明里的 `handler` 名，运行期按名取）：不标的话
+ * `Object.freeze` 的字面量类型会与 `invokeTool` 的 `handlers` 选项类型并成一个
+ * 没有索引签名的联合，`handlers[spec.handler]` 就取不出来。
+ */
+const DEFAULT_HANDLERS: Record<string, Function> = Object.freeze({
   roster: handleRoster,
   dispatch: handleDispatch,
   conclude: handleConclude,
@@ -145,7 +153,7 @@ const OPERATION_ID = /^[a-z0-9][a-z0-9_-]{0,95}$/
  * 任一形状都能取到，**不会把 operation id 悄悄丢成 null**。等 T1 统一成一处后可以收成一个键。
  * @param {string | null} operationId
  */
-function envelopeIds(operationId) {
+function envelopeIds(operationId: string | null): { operationId: string | null, operation_id: string | null } {
   return { operationId, operation_id: operationId }
 }
 
@@ -155,15 +163,25 @@ function envelopeIds(operationId) {
  * @param {unknown} args
  * @returns {string | null}
  */
-export function operationIdOf(args) {
+export function operationIdOf(args: unknown): string | null {
   if (args === null || typeof args !== 'object') return null
-  const value = args.operation_id
+  const value = recordOf(args).operation_id
   return typeof value === 'string' && OPERATION_ID.test(value) ? value : null
 }
 
+/** 宿主可选注入的服务：`agentTeams` / `tools`，缺就是 `undefined`。 */
+interface ProbeServices {
+  agentTeams: unknown
+  tools: unknown
+}
+
 /** 探针：宿主可选注入的服务，缺就是 undefined（不要让缺服务把插件拖垮）。 */
-function probeServices(ctx) {
-  const get = typeof ctx?.get === 'function' ? (service) => ctx.get(service) : () => undefined
+function probeServices(ctx: unknown): ProbeServices {
+  const context = recordOf(ctx)
+  // 等价于原来的 `(service) => ctx.get(service)`：有 `get` 就以 `ctx` 为 this 调用，没有就恒 undefined。
+  const get: (service: string) => unknown = typeof context.get === 'function'
+    ? context.get.bind(context)
+    : () => undefined
   return { agentTeams: get('agentTeams'), tools: get('tools') }
 }
 
@@ -182,6 +200,16 @@ function fileSystem() {
   }
 }
 
+/** `createDeps` 的选项：当次调用的服务探针、exec、部署配置与已解析的项目根。 */
+interface CreateDepsOptions {
+  services: ProbeServices
+  exec: unknown
+  config: Record<string, unknown>
+  ctx?: unknown
+  /** 已 `normalizeProjectRoot` 的真实根；`undefined` = 本次没有可用根。 */
+  projectRoot?: string
+}
+
 /**
  * 装配一次调用用的依赖表。**键名与 SEAMS.md 第 1 节逐字一致**（`DEP_KEYS`）。
  *
@@ -198,12 +226,12 @@ function fileSystem() {
  *           projectRoot?: string }} options
  * @returns {object} `ctx.deps`
  */
-export function createDeps({ services, exec, config, ctx = undefined, projectRoot = undefined }) {
+export function createDeps({ services, exec, config, ctx = undefined, projectRoot = undefined }: CreateDepsOptions): Deps {
   const clock = {
     now: () => Date.now(),
     isoNow: () => new Date(clock.now()).toISOString(),
   }
-  const deps = {
+  const deps: Deps = {
     envelope, errors, validate, paths, atomic, lock, identity, operation, audit,
     catalog, capability, capacity,
     teamAdapter: null,
@@ -226,24 +254,38 @@ export function createDeps({ services, exec, config, ctx = undefined, projectRoo
 }
 
 /** `ctx.config`：handler 能看到的部署配置（defaults 来自 patch 里的本包行）。 */
-function configView(config) {
-  const raw = config !== null && typeof config === 'object' ? config : {}
-  const defaults = raw.defaults !== null && typeof raw.defaults === 'object' ? raw.defaults : {}
+function configView(config: unknown): HandlerConfig {
+  const raw = recordOf(config)
+  const defaults = recordOf(raw.defaults)
   return { defaults, presetId: PRESET_ID, bundleRoot: BUNDLE_ROOT }
 }
 
+/** 校验 issue 的可读面（`validate.validateInput()` 的 `issues` 元素）。 */
+interface ValidationIssue {
+  path: string
+  message: string
+}
+
 /** 把校验 issue 压成一句人读的原因（不堆几十行）。 */
-function describeIssues(issues) {
+function describeIssues(issues: readonly ValidationIssue[]): string {
   const shown = issues.slice(0, 8).map((issue) => `${issue.path === '' ? '(root)' : issue.path}: ${issue.message}`)
   const more = issues.length > shown.length ? `（另有 ${issues.length - shown.length} 项）` : ''
   return `入参不符合契约：${shown.join('；')}${more}`
+}
+
+/** `handlerContext` 的入参。 */
+interface HandlerContextOptions {
+  deps: Deps
+  exec: unknown
+  services: ProbeServices
+  config: unknown
 }
 
 /**
  * 组装交给 handler 的上下文（SEAMS 第 1 节的 `HandlerCtx`）。
  * @param {{ deps: object, exec: unknown, services: object, config: object }} options
  */
-export function handlerContext({ deps, exec, services, config }) {
+export function handlerContext({ deps, exec, services, config }: HandlerContextOptions): HandlerCtx {
   return {
     deps,
     exec,
@@ -251,6 +293,19 @@ export function handlerContext({ deps, exec, services, config }) {
     config: configView(config),
     now: deps.clock.now,
   }
+}
+
+/** handler 的契约形状（SEAMS §1）：`(ctx, 已校验入参)` → `{envelope}`，绝不 reject。 */
+type ToolHandler = (ctx: HandlerCtx, input: Record<string, unknown>) => Promise<HandlerResult>
+
+/** `invokeTool` 的入参（测试会传假 handler 验收接缝）。 */
+interface InvokeToolOptions {
+  tool: string
+  args: unknown
+  exec?: unknown
+  ctx?: unknown
+  config?: Record<string, unknown>
+  handlers?: Record<string, Function>
 }
 
 /**
@@ -272,7 +327,7 @@ export function handlerContext({ deps, exec, services, config }) {
  * }} options
  * @returns {Promise<object>} `$defs.result` 信封
  */
-export async function invokeTool(options) {
+export async function invokeTool(options: InvokeToolOptions): Promise<Envelope> {
   const { tool, args, exec = undefined, ctx = undefined, config = {}, handlers = DEFAULT_HANDLERS } = options
   const spec = TOOL_BY_NAME.get(tool)
   if (spec === undefined) {
@@ -293,7 +348,9 @@ export async function invokeTool(options) {
   }
 
   // 「解出 action」：roster 的默认 action 是 inspect（schema 的 default 只是注解，这里显式填）。
-  const input = { ...args }
+  // 仍是一次浅拷贝（`args` 在上面已收窄为非 null 对象；`recordOf` 对它是**恒等**，
+  // 只是把副本标成索引签名记录，好让后面的 `input.action` 读成 `unknown`）。
+  const input: Record<string, unknown> = { ...recordOf(args) }
   if (spec.handler === 'roster' && input.action === undefined) input.action = 'inspect'
 
   // 1) 校验：产生任何副作用（含建适配器）之前完成。
@@ -316,7 +373,7 @@ export async function invokeTool(options) {
   const rootAttempt = await resolveProjectRoot(input)
 
   // 3) 装配：键名与 SEAMS §1 一致，六个 T5–T7 模块是真实命名空间。
-  let deps
+  let deps: Deps
   try {
     deps = createDeps({ services, exec, config, ctx, projectRoot: rootAttempt })
   } catch (thrown) {
@@ -367,7 +424,7 @@ export async function invokeTool(options) {
  * @param {{ project_root?: unknown }} input
  * @returns {Promise<string | undefined>}
  */
-async function resolveProjectRoot(input) {
+async function resolveProjectRoot(input: { project_root?: unknown }): Promise<string | undefined> {
   try {
     return await paths.normalizeProjectRoot(input?.project_root)
   } catch {
@@ -381,10 +438,13 @@ const LOCAL_FALLBACK_CODES = Object.freeze({ adapter: 'TEAM_SERVICE_UNAVAILABLE'
 /**
  * 极端兜底：适配器装配失败时，手工构造一个合法信封。
  * 只在这里出现字面构造 —— 正常路径一律经 `src/envelope.mjs`。
+ *
+ * 返回类型写死成 `Envelope` 是**契约要求**（`$defs.result` 八字段），不是装饰：
+ * 字面量在这里必须按信封收窄，否则 `status: 'error'` 会被推成 `string`。
  * @param {string} code
  * @param {unknown} thrown
  */
-function errorEnvelopeWithoutDeps(code, thrown) {
+function errorEnvelopeWithoutDeps(code: string, thrown: unknown): Envelope {
   const message = thrown instanceof Error ? thrown.message : String(thrown)
   return {
     schema_version: 1,
@@ -404,15 +464,24 @@ function errorEnvelopeWithoutDeps(code, thrown) {
   }
 }
 
-/** 状态标签。 */
-const STATUS_LABEL = Object.freeze({
+/**
+ * 状态标签。标成 `string | undefined` 的查表：`status` 来自宿主快照，可能是四种之外的
+ * 值，`STATUS_LABEL[status] ?? status` 的兜底就是为此而写。
+ */
+const STATUS_LABEL: Readonly<Record<string, string | undefined>> = Object.freeze({
   ok: '成功',
   blocked: '前置拒绝',
   partial: '部分完成（可能已有副作用）',
   error: '失败',
 })
 
-function textLine(text) {
+/** `render` 的返回元素（宿主只接受文本块）。 */
+interface TextBlock {
+  type: 'text'
+  text: string
+}
+
+function textLine(text: string): TextBlock {
   return { type: 'text', text }
 }
 
@@ -426,30 +495,34 @@ function textLine(text) {
  * @param {unknown} value 宿主校验并冻结后的信封
  * @returns {Array<{ type: 'text', text: string }>}
  */
-export function renderResult(label, value) {
+export function renderResult(label: string, value: unknown): TextBlock[] {
   try {
     if (value === null || typeof value !== 'object') return [textLine(`${label}：没有可读的返回值。`)]
+    // `value` 到这里已是非 null 对象；`recordOf` 对它是**恒等**，只把字段读成 `unknown`。
+    const view = recordOf(value)
 
-    const status = typeof value.status === 'string' ? value.status : 'unknown'
-    const code = value.code === null || value.code === undefined ? '—' : String(value.code)
+    const status = typeof view.status === 'string' ? view.status : 'unknown'
+    const code = view.code === null || view.code === undefined ? '—' : String(view.code)
     const lines = [`${label}：${STATUS_LABEL[status] ?? status}（code ${code}）`]
 
-    if (value.replayed === true) lines.push('这是同一 operation 的重放结果（replayed=true）。')
-    if (value.retryable === true) lines.push('允许以同一 operation_id 重入（retryable=true），但不代表自动重试。')
+    if (view.replayed === true) lines.push('这是同一 operation 的重放结果（replayed=true）。')
+    if (view.retryable === true) lines.push('允许以同一 operation_id 重入（retryable=true），但不代表自动重试。')
 
-    const diagnostics = Array.isArray(value.diagnostics) ? value.diagnostics : []
+    const diagnostics: unknown[] = Array.isArray(view.diagnostics) ? view.diagnostics : []
     if (diagnostics.length > 0) {
       lines.push('诊断：')
       for (const entry of diagnostics) {
-        const reason = typeof entry?.reason === 'string' ? entry.reason : String(entry?.reason ?? '')
-        const nextStep = typeof entry?.next_step === 'string' ? entry.next_step : String(entry?.next_step ?? '')
-        const entryCode = typeof entry?.code === 'string' ? entry.code : String(entry?.code ?? '')
+        // 与原来的 `entry?.reason` 逐字等价：非记录（含 null/原语）读出来就是 undefined。
+        const item = recordOf(entry)
+        const reason = typeof item.reason === 'string' ? item.reason : String(item.reason ?? '')
+        const nextStep = typeof item.next_step === 'string' ? item.next_step : String(item.next_step ?? '')
+        const entryCode = typeof item.code === 'string' ? item.code : String(item.code ?? '')
         lines.push(`- [${entryCode}] ${reason}`)
         if (nextStep.length > 0) lines.push(`  下一步：${nextStep}`)
       }
     }
 
-    lines.push(...summarizeData(label, value.data))
+    lines.push(...summarizeData(label, view.data))
     return [textLine(lines.join('\n'))]
   } catch {
     return [textLine(`${label}：结果无法渲染（render 兜底）。`)]
@@ -457,48 +530,82 @@ export function renderResult(label, value) {
 }
 
 /** 按工具给 data 一段摘要；字段一律先判类型，缺就跳过。 */
-function summarizeData(label, data) {
+function summarizeData(label: string, data: unknown): string[] {
   if (data === null || data === undefined || typeof data !== 'object') return ['data：无']
-  const lines = []
-  const push = (key, value) => {
+  // 同上：`data` 已是非 null 对象，`recordOf` 恒等，只为把字段读成 `unknown`。
+  const view = recordOf(data)
+  const lines: string[] = []
+  const push = (key: string, value: unknown): void => {
     if (value !== undefined && value !== null) lines.push(`${key}：${String(value)}`)
   }
 
   if (label === 'rt_roster') {
-    push('action', data.action)
-    push('project_root', data.project_root)
-    push('compatibility', data.compatibility)
-    if (Array.isArray(data.posts)) push('posts', data.posts.length)
-    if (Array.isArray(data.gaps)) push('gaps', data.gaps.length)
-    push('recommended_members', data.recommended_members)
-    push('proposal_hash', data.proposal_hash)
-    push('binding_ref', data.binding_ref)
+    push('action', view.action)
+    push('project_root', view.project_root)
+    push('compatibility', view.compatibility)
+    if (Array.isArray(view.posts)) push('posts', view.posts.length)
+    if (Array.isArray(view.gaps)) push('gaps', view.gaps.length)
+    push('recommended_members', view.recommended_members)
+    push('proposal_hash', view.proposal_hash)
+    push('binding_ref', view.binding_ref)
   } else if (label === 'rt_dispatch') {
-    push('dispatch_id', data.dispatch_id)
-    push('attempt_id', data.attempt_id)
-    push('task_id', data.task_id)
-    push('member', data.member)
-    push('route_id', data.route_id)
-    push('revision', data.revision)
-    push('phase', data.phase)
-    push('contract_ref', data.contract_ref)
-    push('work_dir', data.work_dir)
-    lines.push(`started_at：${data.started_at === null || data.started_at === undefined ? '未开始（等待成员 start.json）' : String(data.started_at)}`)
+    push('dispatch_id', view.dispatch_id)
+    push('attempt_id', view.attempt_id)
+    push('task_id', view.task_id)
+    push('member', view.member)
+    push('route_id', view.route_id)
+    push('revision', view.revision)
+    push('phase', view.phase)
+    push('contract_ref', view.contract_ref)
+    push('work_dir', view.work_dir)
+    lines.push(`started_at：${view.started_at === null || view.started_at === undefined ? '未开始（等待成员 start.json）' : String(view.started_at)}`)
   } else if (label === 'rt_conclude') {
-    push('dispatch_id', data.dispatch_id)
-    push('attempt_id', data.attempt_id)
-    push('task_id', data.task_id)
-    push('phase', data.phase)
-    push('outcome', data.outcome)
-    push('route_status', data.route_status)
-    push('receipt_ref', data.receipt_ref)
-    push('audit_written', data.audit_written)
-    if (Array.isArray(data.checks)) push('checks', data.checks.length)
+    push('dispatch_id', view.dispatch_id)
+    push('attempt_id', view.attempt_id)
+    push('task_id', view.task_id)
+    push('phase', view.phase)
+    push('outcome', view.outcome)
+    push('route_status', view.route_status)
+    push('receipt_ref', view.receipt_ref)
+    push('audit_written', view.audit_written)
+    if (Array.isArray(view.checks)) push('checks', view.checks.length)
   } else {
-    push('phase', data.phase)
+    push('phase', view.phase)
   }
 
   return lines.length === 0 ? ['data：无'] : lines
+}
+
+/**
+ * 宿主注册表的**最小面**：本包只用到 `register`（返回值是 fiber 的 disposer，本包不接）。
+ *
+ * 这几个 `interface` 只是给 `apply` 里那个对象字面量一个上下文类型，好让
+ * `render` / `execute` / `presentCall` 的形参不必写 `any`。字段名与既有注册对象逐字一致，
+ * 多一个少一个都会在下面报错 —— 所以它同时也是「注册形状不许漂移」的静态钉子。
+ */
+interface ToolRegistry {
+  register(definition: RegisteredTool): unknown
+}
+
+/** 一个注册进宿主的工具定义。 */
+interface RegisteredTool {
+  name: string
+  description: string
+  /** 原始 JSON Schema（自包含、无 `$ref`）；宿主不做入参校验，由 `invokeTool` 自己校验。 */
+  parameters: unknown
+  output: {
+    /** 宿主支持子集里的 schema（`$defs.result` 的投影）。 */
+    schema: unknown
+    render: (args: unknown, value: unknown) => TextBlock[]
+  }
+  execute: (args: unknown, exec: unknown) => Promise<Envelope>
+  /** UI-only、必须纯。 */
+  presentCall: (args: unknown) => { card: string, title: string, kind: string, rawInput: unknown }
+}
+
+/** `apply` 的上下文：至少要有工具注册表（可选服务一律走 `ctx.get` 探针）。 */
+interface PluginContext {
+  tools: ToolRegistry
 }
 
 /**
@@ -506,7 +613,7 @@ function summarizeData(label, data) {
  * @param {object} ctx Cordis 上下文（需要 `ctx.tools.register` 与可选的 `ctx.get`）
  * @param {object} [config] 本包行的 `config`（可带 `defaults`）
  */
-export function apply(ctx, config = {}) {
+export function apply(ctx: PluginContext, config: Record<string, unknown> = {}): void {
   for (const spec of TOOLS) {
     ctx.tools.register({
       name: spec.name,
