@@ -10,6 +10,11 @@
  * `核对身份与前提 → 校验提交 → 锚点闭集 → 归档 → 基准比对 + seal → 更新事实 → impact →
  *  index → check --hashes`
  *
+ * **seal 顺序裁决（DECISIONS D29）**：编排契约 §135 提到「seal 前先按事实解除会令全项目校验
+ * 失败的旧状态」，但这里**保持 seal 在「更新事实」之前** —— 反过来会让 seal 封存的是
+ * **尚未更新的旧事实**，比它想解决的问题更严重。若旧状态确实挡住 seal，如实返回
+ * `CHECK_FAILED`，由 Lead 先按 skill 修好记录再以同一 operation ID 重入：不降门槛、不静默改序。
+ *
  * 关键不变量：
  * - 只有 Lead 可调；工兵/裸子代理 `ROLE_REQUIRED` 且零副作用（身份先于任何写）。
  * - 同 `operation_id` 重放返回原回执（`replayed=true`），内容冲突 `OPERATION_CONFLICT`；
@@ -103,6 +108,9 @@ export const RECEIPTS_DIR = 're/team/receipts'
 
 /** 派发记录目录（T6 写、T7 读）。 */
 export const DISPATCHES_DIR = 're/team/dispatches'
+
+/** attempt 关联记录目录（T6 写、T7 读：task/member/契约摘要在契约落盘之后才存在）。 */
+export const ATTEMPTS_DIR = 're/team/attempts'
 
 const OPERATION_ID = /^[a-z0-9][a-z0-9_-]{0,95}$/
 const DISPATCH_ID = /^D-[a-z0-9][a-z0-9_-]{0,63}$/
@@ -1392,7 +1400,24 @@ function receiptPathFor(dispatchId, attemptId) {
   return `${receiptDirOf(dispatchId, attemptId)}/receipt.json`
 }
 
-/** 读派发记录：T6 写，T7 只读；兼容顶层字段与 `contract` 内嵌两种形状。 */
+/**
+ * 读派发记录：T6 写，T7 只读。
+ *
+ * **装配接缝（T12）**：T6 的契约与 T7 的读取方对同一份记录有四处形状差异，全部在这里
+ * 显式对齐（而不是在测试里造一份 T7 想要的记录）：
+ *
+ * 1. `anchors_required`：契约把它放在 `post.anchors_required`（岗位模板的默认锚点）；
+ *    顶层没有这个键。缺失会让锚点门槛**静默变松**，所以必须回退到 `post`。
+ * 2. `task_id` / `member`：契约**不能**带它们 —— 契约在任务创建之前就落盘并封哈希。
+ *    它们写在 attempt 关联记录 `re/team/attempts/<dispatch>.<attempt>.json` 里
+ *    （T6 的 `writeAttemptRecord`），这里读回来做前置核对。
+ * 3. `contract_sha256`：契约文件不内嵌自己的哈希（哈希就是文件字节的 SHA256），
+ *    同样从 attempt 记录取，用于和提交声明的 `contract_sha256` 交叉核对。
+ * 4. `baseline_ref`：本包的 `src/baseline.mjs` 冻结的快照是**对象**（内联）而不是路径；
+ *    `loadBaseline()` 的 `embedded` 分支正是为它准备的。路径形状仍然兼容。
+ *
+ * 兼容顶层字段与 `contract` 内嵌两种形状（旧记录）。
+ */
 async function readDispatchContext({ root, dispatchId, fs, paths }) {
   const ref = `${DISPATCHES_DIR}/${dispatchId}.json`
   let text
@@ -1422,20 +1447,29 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
     }
   }
   const pick = (key) => (record[key] !== undefined ? record[key] : record.contract?.[key])
+  const attemptId = pick('attempt_id') ?? null
+  const attempt = await readAttemptLink({ root, dispatchId, attemptId, fs, paths })
+  if (attempt.ok !== true) {
+    return { ok: false, code: 'RECOVERY_REQUIRED', issues: attempt.issues }
+  }
+  const link = attempt.record
+  const post = pick('post')
+  const rawBaseline = pick('baseline_ref')
   const compatibility = pick('compatibility')
   const flat = {
     ref,
     dispatch_id: pick('dispatch_id') ?? dispatchId,
-    attempt_id: pick('attempt_id') ?? null,
-    task_id: pick('task_id') ?? null,
+    attempt_id: attemptId,
+    task_id: pick('task_id') ?? link?.task_id ?? null,
     route_id: pick('route_id') ?? null,
-    member: pick('member') ?? pick('member_name') ?? null,
-    contract_sha256: pick('contract_sha256') ?? null,
+    member: pick('member') ?? pick('member_name') ?? link?.member ?? null,
+    contract_sha256: pick('contract_sha256') ?? link?.contract_sha256 ?? null,
     rule_digest: pick('rule_digest') ?? (typeof compatibility?.ruleDigest === 'string' ? compatibility.ruleDigest : null),
-    baseline_ref: pick('baseline_ref') ?? null,
-    baseline: pick('baseline') ?? null,
+    // 路径（项目内相对）与内联快照都收：`loadBaseline` 用 `ref` 读文件、用 `embedded` 直接校验。
+    baseline_ref: typeof rawBaseline === 'string' ? rawBaseline : null,
+    baseline: pick('baseline') ?? (isPlainObject(rawBaseline) ? rawBaseline : null),
     target_ids: pick('target_ids') ?? [],
-    anchors_required: pick('anchors_required') ?? [],
+    anchors_required: pick('anchors_required') ?? (Array.isArray(post?.anchors_required) ? post.anchors_required : []),
     evidence_required: pick('evidence_required') ?? [],
     work_dir: pick('work_dir') ?? null,
     contract_ref: pick('contract_ref') ?? null,
@@ -1448,6 +1482,38 @@ async function readDispatchContext({ root, dispatchId, fs, paths }) {
     }
   }
   return { ok: true, record: flat }
+}
+
+/**
+ * 读 attempt 关联记录（`re/team/attempts/<dispatch>.<attempt>.json`，T6 写的恢复关联）。
+ *
+ * 记录**不存在**是正常的（旧记录/未落盘）：返回 `{ok:true, record:null}`，由前置检查保守处理。
+ * 记录**存在但损坏**是 `RECOVERY_REQUIRED` —— 那意味着 task/member 关联不可信，
+ * 不能当作「没有绑定」继续放行。
+ */
+async function readAttemptLink({ root, dispatchId, attemptId, fs, paths }) {
+  if (typeof attemptId !== 'string' || !ATTEMPT_ID.test(attemptId)) return { ok: true, record: null }
+  const ref = `${ATTEMPTS_DIR}/${dispatchId}.${attemptId}.json`
+  let text
+  try {
+    text = await fs.readFile(paths.resolveInProject(root, ref), 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { ok: true, record: null }
+    return {
+      ok: false,
+      issues: [diag('RECOVERY_REQUIRED', `读不了 attempt 关联记录 ${ref}（${error?.code ?? 'unknown'}）`, '确认 re/team/attempts 可读；读失败不能当作没有绑定')],
+    }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    return {
+      ok: false,
+      issues: [diag('RECOVERY_REQUIRED', `attempt 关联记录不是合法 JSON：${ref}（${error instanceof Error ? error.message : String(error)}）`, '按恢复流程核对记录来源；不要覆盖它')],
+    }
+  }
+  return { ok: true, record: isPlainObject(parsed) ? parsed : null }
 }
 
 async function checkPremises({ envelope: en, team, project, dispatch, input, operationId, root }) {

@@ -72,6 +72,32 @@ function uniqueStrings(value) {
   return out
 }
 
+/**
+ * 把 baseline 采集结果投影成**契约里的 `baseline_ref`**（装配接缝，T12）。
+ *
+ * - `src/baseline.mjs`（T7，生产路径）：`{ok, ref, baseline}` → 内联**快照对象**。
+ *   收口侧 `loadBaseline({ref, embedded})` 的 `embedded` 就是它（同时校验
+ *   `schema_version`/`dispatch_id`/`targets[].target_id,path,sha256`）。
+ * - `src/contract.mjs`（T6，仅 `deps.baseline` 缺席时的回退）：`{ok, baseline_ref}` 已是内联形状。
+ *
+ * 契约里的 target 记录沿用 `id`（T6 契约的既有形状，任务板/诊断都读它），
+ * 同时保留快照的 `target_id`（T7 `validateBaselineShape` 读它）—— 同一个身份两个键名，
+ * 由装配层显式对齐，不从任何一侧偷偷改形状。
+ */
+function baselineRefForContract(capture) {
+  if (isPlainObject(capture?.baseline)) {
+    const snapshot = capture.baseline
+    const targets = (Array.isArray(snapshot.targets) ? snapshot.targets : []).map((target) => (
+      isPlainObject(target) && typeof target.id !== 'string' && typeof target.target_id === 'string'
+        ? { ...target, id: target.target_id }
+        : target
+    ))
+    return { ...snapshot, targets }
+  }
+  if (isPlainObject(capture?.baseline_ref)) return capture.baseline_ref
+  return null
+}
+
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 }
@@ -1172,10 +1198,28 @@ async function preflight({ ctx, deps, envelope, request, root, dispatchId, attem
     }
   }
 
-  // baseline：真实目标字节哈希 + 相关既有 seal
+  // baseline：真实目标字节哈希 + 相关既有 seal。
+  //
+  // **装配接缝（T12）**：`deps.baseline` 是 T7 的 `src/baseline.mjs`（SEAMS §7 规定基准快照归它），
+  // 它的 `captureBaseline({dispatchId, attemptId, ...})` 会把快照写进
+  // `re/team/baselines/<dispatch>.json` 并返回 `{ref, baseline}`。收口侧 `loadBaseline()`
+  // 认的正是这个形状（`ref` = 项目内路径 / `embedded` = 快照对象），所以契约里必须冻**它**，
+  // 而不是另造一份 T6 时代的 `{frozen_at, targets:[{id,…}]}` 内联对象 —— 那样收口会
+  // 以「基准快照路径不是项目内相对路径」直接 RECOVERY_REQUIRED（T12 之前从未跑过这条缝）。
   const dependencyRunIds = Array.isArray(route.dependency_runs) ? route.dependency_runs.filter(nonEmpty) : []
   const capture = deps.baseline && typeof deps.baseline.captureBaseline === 'function'
-    ? await deps.baseline.captureBaseline({ root, targetIds: request.target_ids, projectAdapter, now: deps.clock?.isoNow?.() })
+    ? await deps.baseline.captureBaseline({
+      root,
+      dispatchId,
+      attemptId,
+      targetIds: request.target_ids,
+      projectAdapter,
+      now: typeof deps.clock?.isoNow === 'function' ? deps.clock.isoNow() : new Date().toISOString(),
+      clock: deps.clock,
+      atomic: deps.atomic,
+      paths: deps.paths,
+      fs: deps.fs,
+    })
     : await contractMod.captureBaseline({
       root,
       targetIds: request.target_ids,
@@ -1207,7 +1251,7 @@ async function preflight({ ctx, deps, envelope, request, root, dispatchId, attem
       budget,
       memberDecision,
       resourcePlan,
-      baseline: capture.baseline_ref,
+      baseline: capture,
       routeTargets,
       gaps: [...budget.gaps, ...(capacity.gaps ?? [])],
       callerName,
@@ -1399,7 +1443,7 @@ async function runLocked(params) {
       })
     }
 
-    let baselineRef = plan?.baseline ?? data.baseline_ref ?? null
+    let baselineRef = isPlainObject(data.baseline_ref) ? data.baseline_ref : baselineRefForContract(plan?.baseline)
     if (baselineRef === null) {
       const capture = await contractMod.captureBaseline({
         root,
