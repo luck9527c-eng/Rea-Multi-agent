@@ -85,7 +85,17 @@ readRun(runId)         -> {ok, run}
 readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
 ```
 
-CLI 的退出码与 JSON 输出按实际命令处理；`seal`/`index` 只有文本输出时保留 stdout 作诊断，不发明未提供的参数。脚本失败一律 `{ok:false, ...}` 并保留 `stdout/stderr/exitCode`，**不得抛异常**，不得把脚本失败当成路线证死。
+**CLI 事实（已核对 `reverse-project-management`，详见 `D:\workSpace\rea-ma-notes\E3-project-skill.md`）：**
+
+- 只有 7 个子命令：`init | index | check | impact | audit-scope | probe | seal`。**没有** `run/route/condition/env/complete`；`--complete` 是 `check` 的 flag。
+- **没有 `--json` 开关**。可解析的只有：`check`（单行 JSON）、`impact`（pretty JSON）、`audit-scope`（pretty JSON）。`init/index/seal` 是文本，只当诊断保留。`seal` 的 stdout 形如 `Sealed <RUN>; ...`。
+- 退出码：`0` 成功；`1` 任意校验/IO 错误且 stderr 有 `ERROR: <text>`（**fail-fast，只报第一条**）；`2` argparse 用法错误。
+- **写策略**：只有 `init/index/seal/probe --output` 写文件。`routes/runs/conditions/disputes/targets/project.json` 是**普通 JSON 文件，由本插件直接读写**，CLI 只校验它们。所以 `readRoute/readRun/readSeals` 直接读文件，不走 CLI；`check`/`impact`/`audit-scope` 只读不写。
+- `seal` 是**一次性**：`re/seals/runs/<RUN>.json` 与 `re/seals/targets/T-*.json`（不存在才建）。已有封存只校验复用，重复 seal 不得覆盖。
+- `init` 在已有任何 target 时**拒绝**（退出 1），所以插件永不自动 init 已有项目。
+- `python` 与 `project.py` 的实际路径**必须从项目配置/探测得到**，不硬编码；Node 侧用 `child_process.spawn` 传参数组，**不拼 shell 字符串**。
+
+脚本失败一律 `{ok:false, ...}` 并保留 `stdout/stderr/exitCode`，**不得抛异常**，不得把脚本失败当成路线证死。
 
 `compatibility` 里的 `ruleDigest/scriptDigest/catalogDigest` 是绑定用的内容摘要，**不是**独立可信签名。
 
