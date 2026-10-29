@@ -7,7 +7,8 @@
 > - `docs/verify/l3-checklist.md` 已生成（七步 × 54 条断言），**一条都没跑过**；
 > - `packages/dsh-redteam-lead/scripts/l3-verify.mjs` 的 `collect` / `diff` / `checklist` 只在**人造的
 >   `re/` 目录树**上验证过（见 T9 的报告），没有在真实会话里用过；
-> - `docs/verify/acceptance-status.md` 里所有 L3 行都必须是 `not-run`，直到有人按本文件填完记录。
+> - `docs/verify/acceptance-status.md`（T10 已补全 A01–A44 全表）里所有 L3 行都是 `not-run`，
+>   直到有人按本文件填完记录；L1/L2 行的判定见该表的证据列。
 >
 > 不要把"脚本能生成清单"读成"验收已通过"。
 
