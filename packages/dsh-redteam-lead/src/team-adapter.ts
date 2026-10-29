@@ -26,9 +26,14 @@
  *   gaps: [{code, detail, nextStep}],
  * }
  * ```
+ *
+ * 宿主服务的形状是**外部事实**：本模块只声明自己真正调用的方法子集，所有值按 `unknown`
+ * 收、按需收窄（`guards.recordOf`），不假定宿主的对象形状。
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+
+import { isRecord, recordOf, thrownCode } from './guards.js';
 
 /** 适配器契约版本（写进 re/team/binding.json 的 `adapter.contract_version`）。 */
 export const CONTRACT_VERSION = 1;
@@ -61,7 +66,13 @@ const COMMON = {
   TEAM_DISPOSED: SERVICE_UNAVAILABLE,
 };
 
-const MAPS = {
+/** 宿主服务方法的分组（决定套哪张码表）。 */
+type FailureContext = 'spawn' | 'message' | 'task' | 'interrupt' | 'read';
+
+/** 宿主原始码 → 本包稳定码。 */
+type CodeMap = Record<string, string>;
+
+const MAPS: Record<FailureContext, CodeMap> = {
   spawn: {
     ...COMMON,
     ACTIVATION_LIMIT_REACHED: CAPACITY_EXHAUSTED,
@@ -97,7 +108,7 @@ const MAPS = {
   },
 };
 
-const RETRYABLE = {
+const RETRYABLE: Record<string, boolean> = {
   [SERVICE_UNAVAILABLE]: true,
   [DELIVERY_FAILED]: true,
   TEAM_TASK_BLOCKED: true,
@@ -115,22 +126,360 @@ const TASK_ACTIONS = new Set([
 
 const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
 
-function isNonEmptyString(value) {
+/** 适配器诊断（`code`/`detail` 必有，`nextStep`/`hostCode` 视分支而定）。 */
+export interface AdapterDiagnostic {
+  code: string;
+  detail: string;
+  nextStep?: string;
+  hostCode?: string | null;
+}
+
+/** 失败分支的公共形状：`ok:false` + 稳定码 + 人读原因（SEAMS 第 6 节）。 */
+export interface FailureBranch {
+  ok: false;
+  code: string;
+  reason: string;
+  retryable?: boolean;
+  nextStep?: string;
+  diagnostics?: AdapterDiagnostic[];
+}
+
+/**
+ * 把成功分支的负载字段在失败分支上声明为可选。
+ *
+ * 失败时这些字段**可能**缺席（大多数分支），也可能带部分负载（例如 `updateTask` 的
+ * `actualRevision`）；声明成可选正好覆盖两种情况，并且让 `x.ok === true` 之后收窄成
+ * 必有字段，避免下游到处写非空判断。
+ */
+export type FailureOf<P extends object> = FailureBranch & { [K in keyof P]?: P[K] };
+
+/** 名册一行（`listMembers()` 投影）。 */
+export interface TeamMemberRow {
+  id: string;
+  name: string;
+  role: string;
+  status: string;
+}
+
+/** `membership()` 投影的成员身份。宿主给什么就投影什么（下游用 `recordOf` 收窄）。 */
+export interface MembershipMember {
+  id: unknown;
+  name: unknown;
+  role: unknown;
+  root: unknown;
+}
+
+/** `spawnTeammate()` 投影出的成员（SEAMS §3 的 `{id, name, role, status}` + 可选诊断）。 */
+export interface SpawnedMember {
+  id: string;
+  name: string;
+  role: string;
+  status: string;
+  diagnostics?: unknown[];
+}
+
+/** 宿主任务视图 → SEAMS §3 的 task 形状（`ownerName` 投影成 `owner`）。 */
+export interface TeamTask {
+  id: string;
+  revision: number;
+  status: string;
+  owner: string | null;
+  subject: string;
+  description: string;
+  blockedBy: string[];
+  ready: boolean;
+  writeScopes: string[];
+}
+
+/** 容量声明里的一个缺口（绝不猜上限）。 */
+export interface CapacityGap {
+  code: string;
+  detail: string;
+  nextStep: string;
+}
+
+/** 席位（`used` 恒可数；`total`/`remaining` 只来自显式声明）。 */
+export interface MemberSlots {
+  known: boolean;
+  remaining: number | null;
+  total: number | null;
+  used: number | null;
+}
+
+/** activation 池（只声明上限；当前占用不可观测）。 */
+export interface ActivationSlots {
+  known: boolean;
+  remaining: number | null;
+  total: number | null;
+}
+
+/** 容量来源与声明身份。 */
+export interface CapacityEvidence {
+  source: string;
+  declaredAt?: unknown;
+  declaredBy?: unknown;
+  maxMembers?: number;
+  maxActiveSubagents?: number;
+  usedSeats: number | null;
+}
+
+/** `capacity()` 的返回：两支都带容量投影（服务缺席时也要说清「数不到已用席位」）。 */
+export interface TeamCapacityResult {
+  ok: boolean;
+  code?: string;
+  reason?: string;
+  memberSlots: MemberSlots;
+  activations: ActivationSlots;
+  evidence: CapacityEvidence;
+  gaps: CapacityGap[];
+}
+
+/** `re/team/capacity.json` 校验通过后的声明。 */
+export interface DeclaredCapacityKnown {
+  known: true;
+  maxMembers: number;
+  maxActiveSubagents: number;
+  declaredAt: unknown;
+  declaredBy: unknown;
+  source: string;
+  path: string;
+}
+
+/** 声明缺失/非法：只给缺口，不给数字。 */
+export interface DeclaredCapacityMissing {
+  known: false;
+  gap: CapacityGap;
+}
+
+/** `readDeclaredCapacity()` 的产物。 */
+export type DeclaredCapacity = DeclaredCapacityKnown | DeclaredCapacityMissing;
+
+/** `createTeamAdapter()` 的入参：两种形态（装配上下文 / 显式注入）的并集，全部按 `unknown` 收。 */
+export interface TeamAdapterOptions {
+  ctx?: unknown;
+  services?: unknown;
+  exec?: unknown;
+  config?: unknown;
+  agent?: unknown;
+  projectRoot?: unknown;
+  /** SEAMS §1 的装配表会一并传下来；本适配器不解释它。 */
+  deps?: unknown;
+}
+
+/** `spawnTeammate()` 的入参（形状由调用方给，适配器只做校验）。 */
+export interface SpawnTeammateRequest {
+  name?: unknown;
+  prompt?: unknown;
+  description?: unknown;
+  context?: unknown;
+  provider?: unknown;
+  signal?: AbortSignal;
+}
+
+/** `sendMessage()` 的入参。 */
+export interface SendMessageRequest {
+  target?: unknown;
+  message?: unknown;
+  content?: unknown;
+  signal?: AbortSignal;
+}
+
+/** `interruptAgent()` 的入参。 */
+export interface InterruptRequest {
+  target?: unknown;
+}
+
+/** `createTask()` 的入参。 */
+export interface CreateTaskRequest {
+  subject?: unknown;
+  description?: unknown;
+  blockedBy?: unknown;
+  writeScopes?: unknown;
+}
+
+/** `updateTask()` 的入参（`expectedRevision` 是「变更前」的 revision）。 */
+export interface UpdateTaskRequest {
+  taskId?: unknown;
+  expectedRevision?: unknown;
+  action?: unknown;
+  owner?: unknown;
+  subject?: unknown;
+  description?: unknown;
+  blockedBy?: unknown;
+  writeScopes?: unknown;
+}
+
+/** 宿主 spawn 的入参（本适配器按 SEAMS §3 组装出来的形状）。 */
+interface HostSpawnRequest {
+  name: string;
+  description: string;
+  prompt: unknown[];
+  context: string;
+  provider: string;
+  signal: AbortSignal;
+}
+
+/** 宿主 sendMessage 的入参。 */
+interface HostSendRequest {
+  target: string;
+  content: unknown[];
+  signal: AbortSignal;
+}
+
+/** 宿主 createTask 的入参。 */
+interface HostCreateTaskRequest {
+  subject: string;
+  description: string;
+  blockedBy?: unknown;
+  writeScopes?: unknown;
+}
+
+/** 宿主 updateTask 的入参（只带调用方给了的字段）。 */
+interface HostUpdateTaskRequest {
+  taskId: string;
+  expectedRevision: number;
+  action: string;
+  owner?: unknown;
+  subject?: unknown;
+  description?: unknown;
+  blockedBy?: unknown;
+  writeScopes?: unknown;
+}
+
+/**
+ * 本适配器真正调用的宿主方法子集。
+ *
+ * 入参与返回值一律按 `unknown` 收：宿主视图的形状由服务层负责，适配器只做投影与映射。
+ */
+interface HostTeamService {
+  tryMembership?: (agent: unknown) => unknown;
+  membership: (agent: unknown) => unknown;
+  listMembers: (agent: unknown) => unknown;
+  spawnTeammate: (agent: unknown, request: HostSpawnRequest) => unknown;
+  sendMessage: (agent: unknown, request: HostSendRequest) => unknown;
+  interrupt: (agent: unknown, target: string) => unknown;
+  createTask: (agent: unknown, request: HostCreateTaskRequest) => unknown;
+  updateTask: (agent: unknown, request: HostUpdateTaskRequest) => unknown;
+  getTask: (agent: unknown, taskId: string) => unknown;
+  listTasks: (agent: unknown) => unknown;
+}
+
+/** `{ get(name) }` 形状的装配上下文（E2 笔记里的 `ctx.get('agentTeams')`）。 */
+interface GetterHost {
+  get(name: string): unknown;
+}
+
+/** `membership()` 的结果。 */
+export type MembershipResult =
+  | { ok: true; member: MembershipMember }
+  | FailureOf<{ member: MembershipMember }>;
+
+/** `listMembers()` 的结果。 */
+export type ListMembersResult =
+  | { ok: true; members: TeamMemberRow[] }
+  | FailureOf<{ members: TeamMemberRow[] }>;
+
+/** `spawnTeammate()` 的结果。 */
+export type SpawnTeammateResult =
+  | { ok: true; member: SpawnedMember | null }
+  | FailureOf<{ member: SpawnedMember | null }>;
+
+/** `sendMessage()` 的结果。 */
+export type SendMessageResult =
+  | { ok: true; messageId: unknown }
+  | FailureOf<{ messageId: unknown }>;
+
+/** `interruptAgent()` 的结果（`previousStatus` 只可能是 running|inactive，D10）。 */
+export type InterruptResult =
+  | { ok: true; previousStatus: string }
+  | FailureOf<{ previousStatus: string }>;
+
+/** `createTask()` 的结果。 */
+export type CreateTaskResult =
+  | { ok: true; task: TeamTask | null }
+  | FailureOf<{ task: TeamTask | null }>;
+
+/** `updateTask()` 的结果（CAS 冲突时额外带宿主给的实际 revision）。 */
+export type UpdateTaskResult =
+  | { ok: true; task: TeamTask | null; actualRevision?: number | null }
+  | FailureOf<{ task: TeamTask | null; actualRevision: number | null }>;
+
+/** `getTask()` 的结果。 */
+export type GetTaskResult =
+  | { ok: true; task: TeamTask | null }
+  | FailureOf<{ task: TeamTask | null }>;
+
+/** `listTasks()` 的结果。 */
+export type ListTasksResult =
+  | { ok: true; tasks: (TeamTask | null)[] }
+  | FailureOf<{ tasks: (TeamTask | null)[] }>;
+
+/** `createTeamAdapter()` 返回的实例（`types.ts` 的 `TeamAdapter` 就是这个形状）。 */
+export interface TeamAdapterApi {
+  contract_version: number;
+  CONTRACT_VERSION: number;
+  hasService(): boolean;
+  readDeclaredCapacity(root?: unknown): Promise<DeclaredCapacity>;
+  membership(agent?: unknown): Promise<MembershipResult>;
+  listMembers(agent?: unknown): Promise<ListMembersResult>;
+  spawnTeammate(request?: SpawnTeammateRequest): Promise<SpawnTeammateResult>;
+  sendMessage(request?: SendMessageRequest): Promise<SendMessageResult>;
+  interruptAgent(request?: InterruptRequest): Promise<InterruptResult>;
+  capacity(): Promise<TeamCapacityResult>;
+  createTask(request?: CreateTaskRequest): Promise<CreateTaskResult>;
+  updateTask(request?: UpdateTaskRequest): Promise<UpdateTaskResult>;
+  getTask(taskId?: unknown): Promise<GetTaskResult>;
+  listTasks(): Promise<ListTasksResult>;
+}
+
+function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function isPositiveInteger(value) {
-  return Number.isSafeInteger(value) && value >= 1;
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+}
+
+/**
+ * 已经过 `isPositiveInteger()` 校验的值。
+ *
+ * 存在的理由：`problems` 式校验只收集问题、不产生控制流收窄，返回对象时需要一处
+ * 「命题已在上文证明」的断言点。不变式：每个调用点都紧跟在同一字段的
+ * `isPositiveInteger()` 校验之后，且只有 `problems` 为空才会走到返回值。
+ */
+function provenPositive(value: unknown): number {
+  return value as number;
+}
+
+/** 是否是「装配上下文里的 getter」（等价于原来的 `ctx && typeof ctx.get === 'function'`）。 */
+function isGetterHost(value: unknown): value is GetterHost {
+  return isRecord(value) && typeof value.get === 'function';
+}
+
+/**
+ * 宿主服务视图。
+ *
+ * 只校验「是对象或函数」，与原实现的信任边界一致（原来只判 `=== undefined`）：
+ * 方法缺失/形状漂移会在调用处抛，由各方法的 `try/catch` 映射成 `RECOVERY_REQUIRED`。
+ */
+function asHostTeamService(value: unknown): HostTeamService | null {
+  if (isRecord(value) || typeof value === 'function') {
+    const service: unknown = value;
+    // 不变式：宿主团队服务必然是对象/函数（服务层实例）；这里只把 `unknown` 认成
+    // 「有这些方法的对象」，与迁移前直接 `teams.xxx(...)` 的信任边界一致。
+    return service as HostTeamService;
+  }
+  return null;
 }
 
 /** 把 string / ContentBlock[] 统一成宿主要的 ContentBlock[]。 */
-function toContent(value) {
+function toContent(value: unknown): unknown[] | undefined {
   if (Array.isArray(value)) return value;
   if (typeof value === 'string') return [{ type: 'text', text: value }];
   return undefined;
 }
 
-function unavailable(operation) {
+function unavailable(operation: string): FailureBranch {
   return {
     ok: false,
     code: SERVICE_UNAVAILABLE,
@@ -144,7 +493,12 @@ function unavailable(operation) {
   };
 }
 
-function invalid(operation, reason, extra = {}) {
+/** 参数不合法时的失败分支；`extra` 只带本方法特有的上下文（`actualRevision`/`supportedActions`）。 */
+function invalid(
+  operation: string,
+  reason: string,
+  extra: { actualRevision?: number | null; supportedActions?: string[] } = {},
+): FailureBranch & { actualRevision?: number | null; supportedActions?: string[] } {
   return {
     ok: false,
     code: INVALID_ARGUMENT,
@@ -156,12 +510,10 @@ function invalid(operation, reason, extra = {}) {
 }
 
 /** 宿主异常 → 稳定码。原始码放 `hostCode`，原始文案放 `reason`。 */
-function failureFrom(error, context) {
-  const hostCode = error && typeof error === 'object' && typeof error.code === 'string'
-    ? error.code
-    : undefined;
+function failureFrom(error: unknown, context: FailureContext): FailureBranch {
+  const hostCode = thrownCode(error) ?? undefined;
   const map = MAPS[context] ?? MAPS.read;
-  let code;
+  let code: string;
   if (hostCode !== undefined && TASK_PASSTHROUGH.has(hostCode) && (context === 'task' || context === 'read')) {
     code = hostCode;
   } else if (hostCode !== undefined && map[hostCode] !== undefined) {
@@ -190,7 +542,7 @@ function failureFrom(error, context) {
 }
 
 /** 容量声明缺失/非法时的 gap（绝不猜上限）。 */
-function capacityGap(code, detail, nextStep) {
+function capacityGap(code: string, detail: string, nextStep: string): CapacityGap {
   return { code, detail, nextStep };
 }
 
@@ -204,7 +556,7 @@ const DECLARE_NEXT_STEP =
  * 文件缺失/JSON 坏/字段不合法都返回 `{known:false, gap}`，不抛。
  * @param {string} projectRoot 项目根
  */
-export async function readDeclaredCapacity(projectRoot) {
+export async function readDeclaredCapacity(projectRoot: unknown): Promise<DeclaredCapacity> {
   if (!isNonEmptyString(projectRoot)) {
     return {
       known: false,
@@ -212,11 +564,11 @@ export async function readDeclaredCapacity(projectRoot) {
     };
   }
   const file = path.join(projectRoot, 're', 'team', 'capacity.json');
-  let text;
+  let text: string;
   try {
     text = await readFile(file, 'utf8');
   } catch (error) {
-    const missing = error && typeof error === 'object' && error.code === 'ENOENT';
+    const missing = thrownCode(error) === 'ENOENT';
     return {
       known: false,
       gap: capacityGap(
@@ -226,7 +578,7 @@ export async function readDeclaredCapacity(projectRoot) {
       ),
     };
   }
-  let parsed;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
@@ -239,13 +591,13 @@ export async function readDeclaredCapacity(projectRoot) {
       ),
     };
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (!isRecord(parsed) || Array.isArray(parsed)) {
     return {
       known: false,
       gap: capacityGap('CAPACITY_DECLARATION_INVALID', `${file} 必须是 JSON 对象`, DECLARE_NEXT_STEP),
     };
   }
-  const problems = [];
+  const problems: string[] = [];
   if (parsed.schema_version !== 1) problems.push('schema_version 必须是 1');
   if (!isNonEmptyString(parsed.declared_at) || !ISO_WITH_ZONE.test(parsed.declared_at)) {
     problems.push('declared_at 必须是带时区的 ISO 8601 时间');
@@ -261,8 +613,8 @@ export async function readDeclaredCapacity(projectRoot) {
   }
   return {
     known: true,
-    maxMembers: parsed.maxMembers,
-    maxActiveSubagents: parsed.maxActiveSubagents,
+    maxMembers: provenPositive(parsed.maxMembers),
+    maxActiveSubagents: provenPositive(parsed.maxActiveSubagents),
     declaredAt: parsed.declared_at,
     declaredBy: parsed.declared_by,
     source: 'declared:re/team/capacity.json',
@@ -270,17 +622,33 @@ export async function readDeclaredCapacity(projectRoot) {
   };
 }
 
-/** 归一 profile config 里的容量声明；非法返回 `{ok:false, gap}`。 */
-function normalizeConfigCapacity(config) {
-  const declared = config && typeof config === 'object' ? config.capacity : undefined;
+/** profile config 里的容量声明（合法时）。 */
+interface ConfigCapacityKnown {
+  ok: true;
+  maxMembers: number;
+  maxActiveSubagents: number;
+  declaredAt: unknown;
+  declaredBy: unknown;
+  source: string;
+}
+
+/** profile config 里的容量声明（非法时）。 */
+interface ConfigCapacityInvalid {
+  ok: false;
+  gap: CapacityGap;
+}
+
+/** 归一 profile config 里的容量声明；没有声明返回 `null`，非法返回 `{ok:false, gap}`。 */
+function normalizeConfigCapacity(config: unknown): ConfigCapacityKnown | ConfigCapacityInvalid | null {
+  const declared = isRecord(config) ? config.capacity : undefined;
   if (declared === undefined || declared === null) return null;
-  if (typeof declared !== 'object' || Array.isArray(declared)) {
+  if (!isRecord(declared) || Array.isArray(declared)) {
     return {
       ok: false,
       gap: capacityGap('CAPACITY_DECLARATION_INVALID', 'config.capacity 必须是对象', DECLARE_NEXT_STEP),
     };
   }
-  const problems = [];
+  const problems: string[] = [];
   if (!isPositiveInteger(declared.maxMembers)) problems.push('maxMembers 必须是 >=1 的整数');
   if (!isPositiveInteger(declared.maxActiveSubagents)) problems.push('maxActiveSubagents 必须是 >=1 的整数');
   if (problems.length > 0) {
@@ -291,24 +659,29 @@ function normalizeConfigCapacity(config) {
   }
   return {
     ok: true,
-    maxMembers: declared.maxMembers,
-    maxActiveSubagents: declared.maxActiveSubagents,
+    maxMembers: provenPositive(declared.maxMembers),
+    maxActiveSubagents: provenPositive(declared.maxActiveSubagents),
     declaredAt: declared.declared_at ?? null,
     declaredBy: declared.declared_by ?? 'profile-config',
     source: 'declared:profile-config',
   };
 }
 
-/** 已用席位：恒从 listMembers 数 teammate（含 failed），这是唯一受支持的「已用」来源。 */
-function countUsedSeats(service, agent) {
+/**
+ * 已用席位：恒从 listMembers 数 teammate（含 failed），这是唯一受支持的「已用」来源。
+ *
+ * 行按宿主形状标注（`{role}`）而不是 `recordOf` 兜底：迁移前的 `row.role` 在行不是对象时
+ * 会抛，由 `capacity()` 的 `try/catch` 记成 `CAPACITY_USED_UNKNOWN`；这里保持同一条路径。
+ */
+function countUsedSeats(service: HostTeamService, agent: unknown): number {
   const rows = service.listMembers(agent);
   if (!Array.isArray(rows)) throw new TypeError('listMembers did not return an array');
-  return rows.filter((row) => row.role === 'teammate').length;
+  return rows.filter((row: { role?: unknown }) => row.role === 'teammate').length;
 }
 
-function projectMember(view) {
-  if (view === null || typeof view !== 'object') return null;
-  return {
+function projectMember(view: unknown): SpawnedMember | null {
+  if (!isRecord(view)) return null;
+  const projected = {
     id: view.id,
     name: view.name,
     role: view.role,
@@ -317,12 +690,15 @@ function projectMember(view) {
       ? { diagnostics: [...view.diagnostics] }
       : {}),
   };
+  // 不变式：宿主成员视图由 SEAMS §3 钉死为 `{id, name, role, status}`；这里逐字段原样投影，
+  // 不校验、不改值，与迁移前的 `{id: view.id, …}` 完全一致。
+  return projected as SpawnedMember;
 }
 
 /** 宿主任务视图 → SEAMS 的 task 形状；`ownerName` 投影成 `owner`。 */
-function projectTask(view) {
-  if (view === null || typeof view !== 'object') return null;
-  return {
+function projectTask(view: unknown): TeamTask | null {
+  if (!isRecord(view)) return null;
+  const projected = {
     id: view.id,
     revision: view.revision,
     status: view.status,
@@ -333,6 +709,21 @@ function projectTask(view) {
     ready: view.ready === true,
     writeScopes: Array.isArray(view.writeScopes) ? [...view.writeScopes] : [],
   };
+  // 不变式：宿主任务视图由 SEAMS §3 钉死（`revision` 是 number、`status` 是三种字面量之一）；
+  // 这里逐字段原样投影，与迁移前的 `{revision: view.revision, …}` 完全一致。
+  return projected as TeamTask;
+}
+
+/**
+ * 名册一行：宿主视图逐字段投影（`{id, name, role, status}` 见 SEAMS §3）。
+ *
+ * 入参按宿主行形状标注、不做 `recordOf` 兜底：与迁移前一样，行不是对象时读字段会抛
+ * （由调用方的 `try/catch` 映射成失败），不会静默变成一行 undefined。
+ */
+function projectMemberRow(view: { id?: unknown; name?: unknown; role?: unknown; status?: unknown }): TeamMemberRow {
+  const projected = { id: view.id, name: view.name, role: view.role, status: view.status };
+  // 不变式：SEAMS §3 的 `listMembers()` 行形状是 `{id, name, role, status}`；投影不校验、不改值。
+  return projected as TeamMemberRow;
 }
 
 /**
@@ -342,20 +733,21 @@ function projectTask(view) {
  * - `createTeamAdapter({ ctx })`：从装配上下文取 `services` / `exec` / `config` / `root`；
  * - `createTeamAdapter({ services, exec, agent, config, projectRoot })`：显式注入。
  */
-export function createTeamAdapter(input = {}) {
+export function createTeamAdapter(input: TeamAdapterOptions = {}): TeamAdapterApi {
   const ctx = input.ctx ?? undefined;
-  const services = input.services ?? ctx?.services ?? undefined;
-  const exec = input.exec ?? ctx?.exec ?? undefined;
-  const config = input.config ?? ctx?.config ?? {};
+  const ctxView = recordOf(ctx);
+  const services = input.services ?? ctxView.services ?? undefined;
+  const exec = input.exec ?? ctxView.exec ?? undefined;
+  const config = input.config ?? ctxView.config ?? {};
   const explicitAgent = input.agent ?? undefined;
   const declaredProjectRoot = input.projectRoot
-    ?? (ctx && typeof ctx.root === 'string' ? ctx.root : undefined)
-    ?? (config && typeof config === 'object' ? config.projectRoot : undefined);
+    ?? (typeof ctxView.root === 'string' ? ctxView.root : undefined)
+    ?? (isRecord(config) ? config.projectRoot : undefined);
 
-  function service() {
-    const injected = services && typeof services === 'object' ? services.agentTeams : undefined;
+  function service(): unknown {
+    const injected = isRecord(services) ? services.agentTeams : undefined;
     if (injected !== undefined && injected !== null) return injected;
-    if (ctx && typeof ctx.get === 'function') {
+    if (isGetterHost(ctx)) {
       try {
         const resolved = ctx.get('agentTeams');
         if (resolved !== undefined && resolved !== null) return resolved;
@@ -366,35 +758,35 @@ export function createTeamAdapter(input = {}) {
     return undefined;
   }
 
-  function callerAgent(override) {
+  function callerAgent(override?: unknown): unknown {
     if (override !== undefined) return override;
     if (explicitAgent !== undefined) return explicitAgent;
-    return exec && typeof exec === 'object' ? exec.agent : undefined;
+    return isRecord(exec) ? exec.agent : undefined;
   }
 
-  function projectRoot() {
+  function projectRoot(): string | undefined {
     if (isNonEmptyString(declaredProjectRoot)) return declaredProjectRoot;
     return undefined;
   }
 
-  const adapter = {
+  const adapter: TeamAdapterApi = {
     contract_version: CONTRACT_VERSION,
     CONTRACT_VERSION,
 
     /** 团队服务是否可用（doctor/identity 用）。 */
-    hasService() {
+    hasService(): boolean {
       return service() !== undefined;
     },
 
     /** 见文件头。 */
-    async readDeclaredCapacity(root) {
+    async readDeclaredCapacity(root: unknown): Promise<DeclaredCapacity> {
       return readDeclaredCapacity(root ?? projectRoot());
     },
 
     /** 解析调用者在团队里的身份；只接受宿主给的活 agent。 */
-    async membership(...args) {
-      const teams = service();
-      if (teams === undefined) return unavailable('membership');
+    async membership(...args: unknown[]): Promise<MembershipResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('membership');
       // 显式传 undefined 表示「没有活 agent」；不传才回落到装配上下文里的 exec.agent。
       const live = args.length > 0 ? args[0] : callerAgent();
       if (live === undefined || live === null || typeof live !== 'object') {
@@ -411,7 +803,7 @@ export function createTeamAdapter(input = {}) {
         };
       }
       try {
-        const resolved = typeof teams.tryMembership === 'function'
+        const resolved: unknown = typeof teams.tryMembership === 'function'
           ? teams.tryMembership(live)
           : teams.membership(live);
         if (resolved === undefined || resolved === null) {
@@ -427,36 +819,32 @@ export function createTeamAdapter(input = {}) {
             }],
           };
         }
-        return {
-          ok: true,
-          member: {
-            id: resolved.id,
-            name: resolved.name,
-            role: resolved.role,
-            root: resolved.root && typeof resolved.root === 'object' ? resolved.root.id : null,
-          },
+        const member = recordOf(resolved);
+        const rootView = member.root;
+        const projected = {
+          id: member.id,
+          name: member.name,
+          role: member.role,
+          root: rootView !== null && typeof rootView === 'object' ? recordOf(rootView).id : null,
         };
+        // 不变式：SEAMS §3 的成员视图是 `{id, name, role, root}`；这里逐字段原样投影。
+        return { ok: true, member: projected as MembershipMember };
       } catch (error) {
         return failureFrom(error, 'read');
       }
     },
 
     /** 名册（含 Lead 行与 failed 行）。 */
-    async listMembers(agent) {
-      const teams = service();
-      if (teams === undefined) return unavailable('listMembers');
+    async listMembers(agent: unknown): Promise<ListMembersResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('listMembers');
       const live = callerAgent(agent);
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       try {
         const rows = teams.listMembers(live);
         return {
           ok: true,
-          members: (Array.isArray(rows) ? rows : []).map((row) => ({
-            id: row.id,
-            name: row.name,
-            role: row.role,
-            status: row.status,
-          })),
+          members: (Array.isArray(rows) ? rows : []).map(projectMemberRow),
         };
       } catch (error) {
         return failureFrom(error, 'read');
@@ -468,9 +856,9 @@ export function createTeamAdapter(input = {}) {
      * @param {{name: string, prompt: string|object[], description?: string,
      *          context?: 'fresh'|'fork', provider?: string, signal?: AbortSignal}} request
      */
-    async spawnTeammate(request = {}) {
-      const teams = service();
-      if (teams === undefined) return unavailable('spawnTeammate');
+    async spawnTeammate(request: SpawnTeammateRequest = {}): Promise<SpawnTeammateResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('spawnTeammate');
       const live = callerAgent();
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       const content = toContent(request.prompt);
@@ -483,7 +871,7 @@ export function createTeamAdapter(input = {}) {
       const description = isNonEmptyString(request.description)
         ? request.description.trim().slice(0, 200)
         : deriveDescription(content, request.name);
-      const hostRequest = {
+      const hostRequest: HostSpawnRequest = {
         name: request.name,
         description,
         prompt: content,
@@ -492,8 +880,8 @@ export function createTeamAdapter(input = {}) {
         signal: request.signal ?? new AbortController().signal,
       };
       try {
-        const result = await teams.spawnTeammate(live, hostRequest);
-        return { ok: true, member: projectMember(result?.member) };
+        const result: unknown = await teams.spawnTeammate(live, hostRequest);
+        return { ok: true, member: projectMember(recordOf(result).member) };
       } catch (error) {
         return failureFrom(error, 'spawn');
       }
@@ -503,9 +891,9 @@ export function createTeamAdapter(input = {}) {
      * 向一个成员投递消息。
      * @param {{target: string, message?: string, content?: object[], signal?: AbortSignal}} request
      */
-    async sendMessage(request = {}) {
-      const teams = service();
-      if (teams === undefined) return unavailable('sendMessage');
+    async sendMessage(request: SendMessageRequest = {}): Promise<SendMessageResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('sendMessage');
       const live = callerAgent();
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       if (!isNonEmptyString(request.target)) return invalid('sendMessage', 'target 必须是非空的成员名');
@@ -514,33 +902,33 @@ export function createTeamAdapter(input = {}) {
         return invalid('sendMessage', 'message/content 必须是非空文本');
       }
       try {
-        const result = await teams.sendMessage(live, {
+        const result: unknown = await teams.sendMessage(live, {
           target: request.target,
           content,
           signal: request.signal ?? new AbortController().signal,
         });
-        return { ok: true, messageId: result?.messageId };
+        return { ok: true, messageId: recordOf(result).messageId };
       } catch (error) {
         return failureFrom(error, 'message');
       }
     },
 
     /** 中断一个 teammate，返回中断前状态（只可能 running|inactive，D10）。 */
-    async interruptAgent(request = {}) {
-      const teams = service();
-      if (teams === undefined) return unavailable('interruptAgent');
+    async interruptAgent(request: InterruptRequest = {}): Promise<InterruptResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('interruptAgent');
       const live = callerAgent();
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       if (!isNonEmptyString(request.target)) return invalid('interruptAgent', 'target 必须是非空的成员名');
       try {
-        const result = teams.interrupt(live, request.target);
-        if (result?.previousStatus === 'running' || result?.previousStatus === 'inactive') {
+        const result = recordOf(teams.interrupt(live, request.target));
+        if (result.previousStatus === 'running' || result.previousStatus === 'inactive') {
           return { ok: true, previousStatus: result.previousStatus };
         }
         return {
           ok: false,
           code: RECOVERY_REQUIRED,
-          reason: `unexpected previousStatus ${JSON.stringify(result?.previousStatus)}`,
+          reason: `unexpected previousStatus ${JSON.stringify(result.previousStatus)}`,
           retryable: false,
           diagnostics: [{
             code: RECOVERY_REQUIRED,
@@ -556,14 +944,20 @@ export function createTeamAdapter(input = {}) {
     /**
      * 容量：已用席位可数，上限必须显式声明（见文件头与 D1）。
      */
-    async capacity() {
+    async capacity(): Promise<TeamCapacityResult> {
       const teams = service();
       const root = projectRoot();
       const declaration = await readDeclaredCapacity(root);
       const configured = normalizeConfigCapacity(config);
-      const gaps = [];
+      const gaps: CapacityGap[] = [];
 
-      let declared = null;
+      let declared: {
+        maxMembers: number;
+        maxActiveSubagents: number;
+        declaredAt: unknown;
+        declaredBy: unknown;
+        source: string;
+      } | null = null;
       if (declaration.known === true) {
         declared = {
           maxMembers: declaration.maxMembers,
@@ -589,7 +983,7 @@ export function createTeamAdapter(input = {}) {
         if (configured !== null && configured.ok === false) gaps.push(configured.gap);
       }
 
-      let used = null;
+      let used: number | null = null;
       if (teams === undefined) {
         gaps.push(capacityGap(
           'CAPACITY_USED_UNKNOWN',
@@ -602,7 +996,9 @@ export function createTeamAdapter(input = {}) {
           gaps.push(capacityGap('CAPACITY_USED_UNKNOWN', '没有宿主的活 exec.agent，数不到已用席位', '在 Agent 作用域内调用 rt_roster/rt_dispatch'));
         } else {
           try {
-            used = countUsedSeats(teams, live);
+            const host = asHostTeamService(teams);
+            if (host === null) throw new TypeError('agentTeams is not an object');
+            used = countUsedSeats(host, live);
           } catch (error) {
             gaps.push(capacityGap(
               'CAPACITY_USED_UNKNOWN',
@@ -614,9 +1010,11 @@ export function createTeamAdapter(input = {}) {
       }
 
       const memberSlotsKnown = declared !== null && used !== null;
-      const memberSlots = {
+      let remaining: number | null = null;
+      if (declared !== null && used !== null) remaining = Math.max(0, declared.maxMembers - used);
+      const memberSlots: MemberSlots = {
         known: memberSlotsKnown,
-        remaining: memberSlotsKnown ? Math.max(0, declared.maxMembers - used) : null,
+        remaining,
         total: declared === null ? null : declared.maxMembers,
         used,
       };
@@ -627,12 +1025,12 @@ export function createTeamAdapter(input = {}) {
           '把 maxActiveSubagents 当硬上限保守派发；真正的额度由宿主 ACTIVATION_LIMIT_REACHED 兜底，不要用成员名册或子代理列表推算占用',
         ));
       }
-      const activations = {
+      const activations: ActivationSlots = {
         known: declared !== null,
         remaining: null,
         total: declared === null ? null : declared.maxActiveSubagents,
       };
-      const evidence = {
+      const evidence: CapacityEvidence = {
         source: declared === null ? 'unavailable' : declared.source,
         ...(declared === null ? {} : {
           declaredAt: declared.declaredAt ?? null,
@@ -654,9 +1052,9 @@ export function createTeamAdapter(input = {}) {
      * 建任务；宿主保证 `pending` + 无 owner + revision 1。
      * @param {{subject: string, description: string, blockedBy?: string[]}} request
      */
-    async createTask(request = {}) {
-      const teams = service();
-      if (teams === undefined) return unavailable('createTask');
+    async createTask(request: CreateTaskRequest = {}): Promise<CreateTaskResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('createTask');
       const live = callerAgent();
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       if (!isNonEmptyString(request.subject)) return invalid('createTask', 'subject 必须是非空字符串');
@@ -667,7 +1065,7 @@ export function createTeamAdapter(input = {}) {
         return invalid('createTask', 'blockedBy 必须是任务 ID 数组');
       }
       try {
-        const view = await teams.createTask(live, {
+        const view: unknown = await teams.createTask(live, {
           subject: request.subject,
           description: request.description,
           ...(request.blockedBy === undefined ? {} : { blockedBy: request.blockedBy }),
@@ -685,25 +1083,26 @@ export function createTeamAdapter(input = {}) {
      *          subject?: string, description?: string, blockedBy?: string[],
      *          writeScopes?: string[]}} request
      */
-    async updateTask(request = {}) {
-      const teams = service();
-      if (teams === undefined) return unavailable('updateTask');
+    async updateTask(request: UpdateTaskRequest = {}): Promise<UpdateTaskResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('updateTask');
       const live = callerAgent();
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       if (!isNonEmptyString(request.taskId)) return invalid('updateTask', 'taskId 必须是非空字符串');
-      if (!Number.isSafeInteger(request.expectedRevision) || request.expectedRevision < 1) {
+      const expectedRevision = request.expectedRevision;
+      if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
         return invalid('updateTask', 'expectedRevision 必须是 >=1 的整数（提交的是变更前 revision）', {
           actualRevision: null,
         });
       }
-      if (!TASK_ACTIONS.has(request.action)) {
+      if (typeof request.action !== 'string' || !TASK_ACTIONS.has(request.action)) {
         return invalid('updateTask', `unsupported task action ${JSON.stringify(request.action)}`, {
           supportedActions: [...TASK_ACTIONS],
         });
       }
-      const hostRequest = {
+      const hostRequest: HostUpdateTaskRequest = {
         taskId: request.taskId,
-        expectedRevision: request.expectedRevision,
+        expectedRevision,
         action: request.action,
         ...(request.owner === undefined ? {} : { owner: request.owner }),
         ...(request.subject === undefined ? {} : { subject: request.subject }),
@@ -712,7 +1111,7 @@ export function createTeamAdapter(input = {}) {
         ...(request.writeScopes === undefined ? {} : { writeScopes: request.writeScopes }),
       };
       try {
-        const view = await teams.updateTask(live, hostRequest);
+        const view: unknown = await teams.updateTask(live, hostRequest);
         return { ok: true, task: projectTask(view) };
       } catch (error) {
         const failure = failureFrom(error, 'task');
@@ -724,9 +1123,9 @@ export function createTeamAdapter(input = {}) {
     },
 
     /** 读一条任务（含墓碑）。 */
-    async getTask(taskId) {
-      const teams = service();
-      if (teams === undefined) return unavailable('getTask');
+    async getTask(taskId: unknown): Promise<GetTaskResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('getTask');
       const live = callerAgent();
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       if (!isNonEmptyString(taskId)) return invalid('getTask', 'taskId 必须是非空字符串');
@@ -738,13 +1137,13 @@ export function createTeamAdapter(input = {}) {
     },
 
     /** 列当前未删除任务。 */
-    async listTasks() {
-      const teams = service();
-      if (teams === undefined) return unavailable('listTasks');
+    async listTasks(): Promise<ListTasksResult> {
+      const teams = asHostTeamService(service());
+      if (teams === null) return unavailable('listTasks');
       const live = callerAgent();
       if (live === undefined) return { ok: false, code: ROLE_REQUIRED, reason: 'no live exec.agent' };
       try {
-        const views = teams.listTasks(live);
+        const views: unknown = teams.listTasks(live);
         return { ok: true, tasks: (Array.isArray(views) ? views : []).map(projectTask) };
       } catch (error) {
         return failureFrom(error, 'read');
@@ -755,28 +1154,36 @@ export function createTeamAdapter(input = {}) {
   return adapter;
 
   /** CAS 冲突时的「实际 revision」：先重读任务，读不到再从宿主文案里取。 */
-  async function readActualRevision(teams, live, taskId, failure) {
+  async function readActualRevision(
+    teams: HostTeamService,
+    live: unknown,
+    taskId: string,
+    failure: FailureBranch,
+  ): Promise<number | null> {
     try {
-      const view = teams.getTask(live, taskId);
-      if (view !== null && typeof view === 'object' && Number.isSafeInteger(view.revision)) {
-        return view.revision;
+      const view = recordOf(teams.getTask(live, taskId));
+      const revision = view.revision;
+      if (typeof revision === 'number' && Number.isSafeInteger(revision)) {
+        return revision;
       }
     } catch {
       // 读不到就退回文案解析
     }
-    const message = typeof failure?.reason === 'string' ? failure.reason : '';
+    const message = typeof failure.reason === 'string' ? failure.reason : '';
     const matched = /current revision is (\d+)/u.exec(message);
     return matched === null ? null : Number.parseInt(matched[1], 10);
   }
 }
 
 /** 从 prompt 文本派生宿主需要的 description（≤200，非空）。 */
-function deriveDescription(content, name) {
-  const text = content
-    .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text)
-    .join('\n')
-    .trim();
+function deriveDescription(content: unknown[], name: string): string {
+  const parts: string[] = [];
+  for (const block of content) {
+    const view = recordOf(block);
+    if (view.type !== 'text' || typeof view.text !== 'string') continue;
+    parts.push(view.text);
+  }
+  const text = parts.join('\n').trim();
   if (text.length === 0) return `teammate ${name}`;
   const firstLine = text.split(/\r?\n/u)[0].trim();
   return (firstLine.length > 0 ? firstLine : text).slice(0, 200);

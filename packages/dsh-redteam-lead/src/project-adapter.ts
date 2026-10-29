@@ -18,6 +18,9 @@
  *   退出码 1 时要区分「拒绝覆盖已封存（可复用）」与真失败。
  *
  * 所有方法永不 reject：脚本失败一律 `{ok:false, code, exitCode, stdout, stderr, ...}`。
+ *
+ * 类型约定：CLI 的入参/产物、`spawn` 的注入替身、`re/routes|runs/**` 的 JSON 内容全部按
+ * `unknown` 收；本模块只在**自己真正解释**的地方收窄（`guards.recordOf` / `guards.isRecord`）。
  */
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -26,6 +29,7 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { CONTRACT_VERSION, SKILL_COPY_RELATIVE, computeDigests } from './compatibility.js';
+import { isRecord, thrownCode } from './guards.js';
 
 const CHECK_FAILED = 'CHECK_FAILED';
 const PROJECT_NOT_CONFIGURED = 'PROJECT_NOT_CONFIGURED';
@@ -46,7 +50,322 @@ const PYTHON_PATH_PATTERNS = [
   /\/(?:[^\s`"'<>|*?]+\/)*python(?:\d+(?:\.\d+)?)?/gu,
 ];
 
-function invalid(operation, reason) {
+/** 适配器诊断（`code`/`detail` 必有，`nextStep` 视分支而定）。 */
+export interface ProjectDiagnostic {
+  code: string;
+  detail: string;
+  nextStep?: string;
+}
+
+/** `stderr` 里一行 `ERROR: <text>`（fail-fast，只有第一条）。 */
+export interface FailureRow {
+  kind: string;
+  message: string;
+  raw?: string;
+}
+
+/** 失败分支可能携带的上下文（不同方法的并集；不存在的一律缺席）。 */
+export interface ProjectFailure {
+  ok: false;
+  code: string;
+  /** `check` 的失败分支只有 `failures`，没有人读原因的句子，故可缺。 */
+  reason?: string;
+  nextStep?: string;
+  notFound?: boolean;
+  exitCode?: number | null;
+  stdout?: string;
+  stderr?: string;
+  stage?: string;
+  timedOut?: boolean;
+  alreadySealed?: boolean;
+  called?: boolean;
+  reused?: boolean;
+  failures?: FailureRow[];
+  diagnostics?: ProjectDiagnostic[];
+}
+
+/**
+ * 把成功分支的负载字段在失败分支上声明为可选。
+ *
+ * 失败时这些字段可能缺席，也可能带部分负载（例如 `check` 失败时仍带 `json`/`stderr`）；
+ * `ok === true` 之后收窄成必有字段，下游不必到处写非空判断。
+ */
+export type FailureOf<P extends object> = ProjectFailure & { [K in keyof P]?: P[K] };
+
+/** `probe()` 的一个接入缺口。 */
+export interface ProbeGap {
+  code: string;
+  detail: string;
+  nextStep: string;
+  blocking: boolean;
+}
+
+/** `probe()` 产出的项目接入实况（SEAMS §4 的 `compatibility`）。 */
+export interface ProbeCompatibility {
+  projectRoot: string;
+  indexPresent: boolean;
+  configPresent: boolean;
+  skillCopyPresent: boolean;
+  hasTeamRules: boolean;
+  hasToolInventoryRules: boolean;
+  pythonOk: boolean;
+  projectPyPresent: boolean;
+  versions: {
+    adapter: number;
+    python: string | null;
+    pythonExe: string | null;
+    pythonSource: string;
+    projectPy: string | null;
+    schemaVersion: unknown;
+  };
+  skillCopyPath: string;
+  layoutKind: string;
+  ruleDigest: string | null;
+  scriptDigest: string | null;
+  catalogDigest: string | null;
+}
+
+/** `probe()` 的负载。 */
+export interface ProbePayload {
+  compatibility: ProbeCompatibility;
+  gaps: ProbeGap[];
+}
+
+/** `probe()` 的结果（`ok` 为「没有 blocking 缺口」，不是恒 true）。 */
+export type ProbeResult = ({ ok: boolean } & ProbePayload) | FailureOf<ProbePayload>;
+
+/** `seal()` 的负载（一次性封存的三种成功形态共用）。 */
+export interface SealPayload {
+  alreadySealed: boolean;
+  reused: boolean;
+  called: boolean;
+  /** CLI 没跑起来时（「已封存」竞态分支）没有实际输出，故可缺。 */
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number | null;
+  reason?: string;
+}
+
+/** `seal()` 的结果。 */
+export type SealResult = ({ ok: true } & SealPayload) | FailureOf<SealPayload>;
+
+/** CLI 阶段（`impact`/`audit-scope`/`check`）的负载。 */
+export interface CliStagePayload {
+  json: unknown;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** `impact()`/`auditScope()` 的结果。 */
+export type CliStageResult = ({ ok: true } & CliStagePayload) | FailureOf<CliStagePayload>;
+
+/** `index()` 的负载（`index` 是文本命令，`json` 恒为 null）。 */
+export interface IndexPayload {
+  json: null;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+}
+
+/** `index()` 的结果。 */
+export type IndexResult = ({ ok: true } & IndexPayload) | FailureOf<IndexPayload>;
+
+/** `check()` 的负载（单行 JSON + 逐条失败）。 */
+export interface CheckPayload extends CliStagePayload {
+  failures: FailureRow[];
+}
+
+/** `check()` 的结果。 */
+export type CheckResult = ({ ok: true } & CheckPayload) | FailureOf<CheckPayload>;
+
+/** `readSeals()` 的一条封存。 */
+export interface SealRow {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+
+/** `readSeals()` 的负载。 */
+export interface SealsPayload {
+  seals: SealRow[];
+}
+
+/** `readSeals()` 的结果。 */
+export type ReadSealsResult = ({ ok: true } & SealsPayload) | FailureOf<SealsPayload>;
+
+/**
+ * `readRoute()`/`readRun()` 的结果。
+ *
+ * 记录内容是 JSON，形状由 skill 定义，本适配器不解释；成功/失败用同一形状表达，
+ * 下游一律先判 `ok` 再取 `route`/`run`（与原实现的用法一致）。
+ */
+export interface RecordReadResult {
+  ok: boolean;
+  route?: unknown;
+  run?: unknown;
+  code?: string;
+  reason?: string;
+  nextStep?: string;
+  notFound?: boolean;
+  diagnostics?: ProjectDiagnostic[];
+}
+
+/** `probe()` 的入参。 */
+export interface ProbeInput {
+  projectRoot?: unknown;
+}
+
+/** `seal()` 的入参。 */
+export interface SealInput {
+  runId?: unknown;
+}
+
+/** `check()` 的入参。 */
+export interface CheckInput {
+  hashes?: unknown;
+  complete?: unknown;
+}
+
+/** 解释器探测来源（写进 `compatibility.versions.pythonSource`）。 */
+export type PythonSource = 'explicit' | 'project-config' | 'path';
+
+/** 一次解释器探测的结果。 */
+export interface ProbedInterpreter {
+  exe: string;
+  version: string;
+  source: string;
+}
+
+/** 实际选用的解释器。 */
+export interface ResolvedPython {
+  exe: string | null;
+  version: string | null;
+  source: string;
+  ok: boolean;
+}
+
+/** CLI 产物里记下的解释器身份。 */
+export interface PythonIdentity {
+  exe: string;
+  version: string | null;
+  source: string;
+}
+
+/** `spawn` 的 options 子集（只声明本适配器真的传的四个键）。 */
+export interface SpawnOptionsLike {
+  cwd?: string;
+  shell?: boolean;
+  windowsHide?: boolean;
+  env?: Record<string, string | undefined>;
+}
+
+/** 子进程的 stdout/stderr 流（只声明用到的两个方法）。 */
+export interface SpawnStreamLike {
+  setEncoding?: (encoding: BufferEncoding) => unknown;
+  on: (event: string, listener: (chunk: unknown) => void) => unknown;
+}
+
+/** `child_process.spawn` 的返回值的可用子集。 */
+export interface SpawnedChildLike {
+  stdout?: SpawnStreamLike | null;
+  stderr?: SpawnStreamLike | null;
+  on: (event: string, listener: (...args: unknown[]) => void) => unknown;
+  kill: () => unknown;
+}
+
+/** 注入的 `spawn` 形状（测试替身与 `node:child_process.spawn` 共用）。 */
+export type SpawnLike = (
+  file: string,
+  argv: string[],
+  options: SpawnOptionsLike,
+) => SpawnedChildLike;
+
+/** 一次子进程的原始产物（不判定业务含义）。 */
+export interface ProcessOutcome {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  error?: string;
+  timedOut: boolean;
+}
+
+/** `python -B project.py` 的一次运行结果：要么是「跑不了」的失败，要么是原始三件套。 */
+export interface CliFailure {
+  ok: false;
+  code: string;
+  reason?: string;
+  nextStep?: string;
+  exitCode?: number | null;
+  stdout?: string;
+  stderr?: string;
+}
+
+/** 解释器与脚本都就绪时的运行结果。 */
+export interface CliSuccess {
+  ok: boolean;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  command: string;
+  argv: Array<string | undefined>;
+  python: PythonIdentity;
+  reason?: string;
+  timedOut?: boolean;
+  code?: undefined;
+  nextStep?: undefined;
+}
+
+/** `runCli()` 的结果（用 `code` 区分「跑不了」与「跑了」）。 */
+export type CliRun = CliFailure | CliSuccess;
+
+/** `parseJson()` 的结果。 */
+export interface ParsedJson {
+  parsed: unknown;
+  error: string | null;
+}
+
+/** `createProjectAdapter()` 的入参（测试注入 + 装配层透传的键都在这里）。 */
+export interface ProjectAdapterOptions {
+  /** 项目根（必填才能跑 CLI）。 */
+  projectRoot?: unknown;
+  /** 显式解释器路径（优先于项目配置与 PATH）。 */
+  python?: unknown;
+  /** 显式 project.py 路径（默认项目副本路径）。 */
+  projectPy?: unknown;
+  /** 注入 `child_process.spawn` 形状的函数（测试用）。 */
+  spawn?: unknown;
+  /** 追加/覆盖环境变量。 */
+  env?: Record<string, string>;
+  /** 单次 CLI 超时（毫秒）。 */
+  timeoutMs?: unknown;
+  /** 岗位目录路径（默认包内副本 → 仓库 spec）。 */
+  catalogPath?: string;
+  /** 装配层会一并传下来的上下文；本适配器不解释它们。 */
+  config?: unknown;
+  ctx?: unknown;
+  services?: unknown;
+  exec?: unknown;
+  deps?: unknown;
+}
+
+/** `createProjectAdapter()` 返回的实例（`types.ts` 的 `ProjectAdapter` 就是这个形状）。 */
+export interface ProjectAdapterApi {
+  contract_version: number;
+  CONTRACT_VERSION: number;
+  projectRoot: string | undefined;
+  probe(input?: ProbeInput): Promise<ProbeResult>;
+  seal(input?: SealInput): Promise<SealResult>;
+  impact(): Promise<CliStageResult>;
+  auditScope(): Promise<CliStageResult>;
+  index(): Promise<IndexResult>;
+  check(input?: CheckInput): Promise<CheckResult>;
+  readRoute(routeId?: unknown): Promise<RecordReadResult>;
+  readRun(runId?: unknown): Promise<RecordReadResult>;
+  readSeals(): Promise<ReadSealsResult>;
+}
+
+function invalid(operation: string, reason: string): ProjectFailure {
   return {
     ok: false,
     code: INVALID_ARGUMENT,
@@ -55,7 +374,7 @@ function invalid(operation, reason) {
   };
 }
 
-function notConfigured(reason, extra = {}) {
+function notConfigured(reason: string, extra?: Pick<ProjectFailure, 'nextStep'>): ProjectFailure {
   return {
     ok: false,
     code: PROJECT_NOT_CONFIGURED,
@@ -64,7 +383,21 @@ function notConfigured(reason, extra = {}) {
   };
 }
 
-function failCheck(reason, extra = {}) {
+function failCheck(
+  reason: string,
+  extra?: Pick<
+    ProjectFailure,
+    | 'exitCode'
+    | 'stdout'
+    | 'stderr'
+    | 'stage'
+    | 'failures'
+    | 'diagnostics'
+    | 'alreadySealed'
+    | 'called'
+    | 'timedOut'
+  >,
+): ProjectFailure {
   return {
     ok: false,
     code: CHECK_FAILED,
@@ -74,7 +407,7 @@ function failCheck(reason, extra = {}) {
 }
 
 /** stderr 里 `ERROR: <text>` 是契约（fail-fast，只有第一条）。 */
-function parseFailures(stderr) {
+function parseFailures(stderr: unknown): FailureRow[] {
   if (typeof stderr !== 'string') return [];
   return stderr
     .split(/\r?\n/u)
@@ -83,7 +416,7 @@ function parseFailures(stderr) {
     .map((line) => ({ kind: 'script', message: line.slice('ERROR:'.length).trim(), raw: line }));
 }
 
-function parseJson(text) {
+function parseJson(text: unknown): ParsedJson {
   if (typeof text !== 'string') return { parsed: null, error: 'no stdout' };
   const trimmed = text.trim();
   if (trimmed.length === 0) return { parsed: null, error: 'empty stdout' };
@@ -94,7 +427,7 @@ function parseJson(text) {
   }
 }
 
-async function isFile(target) {
+async function isFile(target: string): Promise<boolean> {
   try {
     return (await stat(target)).isFile();
   } catch {
@@ -102,7 +435,7 @@ async function isFile(target) {
   }
 }
 
-async function isDirectory(target) {
+async function isDirectory(target: string): Promise<boolean> {
   try {
     return (await stat(target)).isDirectory();
   } catch {
@@ -111,14 +444,14 @@ async function isDirectory(target) {
 }
 
 /** 递归列出目录下所有 `.json` 文件（相对路径用 `/`）。 */
-async function walkJson(root, prefix = '') {
+async function walkJson(root: string, prefix = ''): Promise<string[]> {
   let entries;
   try {
     entries = await readdir(path.join(root, ...prefix.split('/').filter(Boolean)), { withFileTypes: true });
   } catch {
     return [];
   }
-  const found = [];
+  const found: string[] = [];
   for (const entry of entries) {
     const relative = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
     if (entry.isDirectory()) {
@@ -129,6 +462,16 @@ async function walkJson(root, prefix = '') {
   }
   return found;
 }
+
+/** 注入的 `spawn` 是不是函数（测试替身与 `node:child_process.spawn` 都按此收）。 */
+function isSpawnLike(value: unknown): value is SpawnLike {
+  return typeof value === 'function';
+}
+
+/** 安全路径校验的结果：要么锚在项目内的绝对路径，要么一句可直接返回的失败。 */
+type SafeRecordPath =
+  | { ok: true; target: string }
+  | { ok: false; result: ProjectFailure };
 
 /**
  * 建一个 projectAdapter。
@@ -142,28 +485,30 @@ async function walkJson(root, prefix = '') {
  * @param {number} [options.timeoutMs] 单次 CLI 超时（毫秒）
  * @param {string} [options.catalogPath] 岗位目录路径（默认包内副本 → 仓库 spec）
  */
-export function createProjectAdapter(options = {}) {
+export function createProjectAdapter(options: ProjectAdapterOptions = {}): ProjectAdapterApi {
   const declaredRoot = typeof options.projectRoot === 'string' && options.projectRoot.length > 0
     ? path.resolve(options.projectRoot)
     : undefined;
-  const spawnFn = typeof options.spawn === 'function' ? options.spawn : nodeSpawn;
-  const timeoutMs = Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0
-    ? options.timeoutMs
+  const spawnFn: SpawnLike = isSpawnLike(options.spawn) ? options.spawn : nodeSpawn;
+  const declaredTimeout = options.timeoutMs;
+  const timeoutMs = typeof declaredTimeout === 'number'
+    && Number.isSafeInteger(declaredTimeout)
+    && declaredTimeout > 0
+    ? declaredTimeout
     : DEFAULT_TIMEOUT_MS;
-  const extraEnv = {
+  const extraEnv: Record<string, string> = {
     PYTHONIOENCODING: 'utf8',
     PYTHONUTF8: '1',
     ...options.env,
   };
 
-  let pythonPromise;
+  let pythonPromise: Promise<ResolvedPython> | undefined;
 
-  function root(input) {
-    const value = typeof input === 'string' && input.length > 0 ? path.resolve(input) : declaredRoot;
-    return value;
+  function root(input: unknown): string | undefined {
+    return typeof input === 'string' && input.length > 0 ? path.resolve(input) : declaredRoot;
   }
 
-  function projectPyPath() {
+  function projectPyPath(): string | undefined {
     if (typeof options.projectPy === 'string' && options.projectPy.length > 0) {
       return path.resolve(options.projectPy);
     }
@@ -171,10 +516,15 @@ export function createProjectAdapter(options = {}) {
   }
 
   /** 跑一次子进程，收集 stdout/stderr/exitCode；不抛。 */
-  function runProcess(file, argv, { cwd, timeout = timeoutMs } = {}) {
+  function runProcess(
+    file: string,
+    argv: string[],
+    runOptions: { cwd?: string; timeout?: number } = {},
+  ): Promise<ProcessOutcome> {
+    const { cwd, timeout = timeoutMs } = runOptions;
     return new Promise((resolve) => {
       let settled = false;
-      let child;
+      let child: SpawnedChildLike;
       try {
         child = spawnFn(file, argv, {
           cwd,
@@ -203,7 +553,7 @@ export function createProjectAdapter(options = {}) {
           // 已经结束
         }
       }, timeout);
-      const finish = (exitCode, error) => {
+      const finish = (exitCode: number | null, error?: string): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -225,7 +575,7 @@ export function createProjectAdapter(options = {}) {
   }
 
   /** 探测候选解释器的版本；返回 `{exe, version, source}` 或 null。 */
-  async function probeInterpreter(exe, source) {
+  async function probeInterpreter(exe: string, source: string): Promise<ProbedInterpreter | null> {
     const result = await runProcess(exe, ['--version'], { cwd: declaredRoot });
     const matched = String(result.stdout ?? '').match(/Python (\d+\.\d+\.\d+)/u)
       ?? String(result.stderr ?? '').match(/Python (\d+\.\d+\.\d+)/u);
@@ -235,10 +585,10 @@ export function createProjectAdapter(options = {}) {
   }
 
   /** 从项目配置 markdown 里找真实存在的解释器路径（D8 的 pin 解释器场景）。 */
-  async function configPythonCandidate() {
+  async function configPythonCandidate(): Promise<string | null> {
     if (declaredRoot === undefined) return null;
     const config = path.join(declaredRoot, 'docs', 'agents', 'reverse-project-management.md');
-    let text;
+    let text: string;
     try {
       text = await readFile(config, 'utf8');
     } catch {
@@ -253,9 +603,9 @@ export function createProjectAdapter(options = {}) {
   }
 
   /** 解析实际要用的解释器：显式 > 项目配置 pin > PATH 上的 python/python3。 */
-  async function resolvePython() {
+  async function resolvePython(): Promise<ResolvedPython> {
     if (pythonPromise !== undefined) return pythonPromise;
-    pythonPromise = (async () => {
+    pythonPromise = (async (): Promise<ResolvedPython> => {
       if (typeof options.python === 'string' && options.python.length > 0) {
         const probed = await probeInterpreter(options.python, 'explicit');
         return {
@@ -283,7 +633,7 @@ export function createProjectAdapter(options = {}) {
    * 跑 `python -B <project.py> <argv...>`，返回原始三件套（不判定业务含义）。
    * @param {string[]} argv 子命令及其参数（不含解释器与脚本路径）
    */
-  async function runCli(argv) {
+  async function runCli(argv: Array<string | undefined>): Promise<CliRun> {
     if (declaredRoot === undefined) {
       return notConfigured('没有 projectRoot，跑不了项目 skill CLI');
     }
@@ -299,7 +649,9 @@ export function createProjectAdapter(options = {}) {
         nextStep: '在项目配置里登记解释器路径，或在 profile/环境里提供 python；不要假设某个固定路径',
       });
     }
-    const args = ['-B', projectPy, ...argv];
+    // 不变式：上面已确认 `declaredRoot` 存在，而 argv 里唯一可能缺席的元素就是调用方传的
+    // `declaredRoot`；argv 只在「没有 projectRoot」时才是 undefined，那条路径已经早返回。
+    const args = ['-B', projectPy, ...argv] as string[];
     const result = await runProcess(python.exe, args, { cwd: declaredRoot });
     return {
       ok: result.exitCode === 0,
@@ -315,11 +667,17 @@ export function createProjectAdapter(options = {}) {
   }
 
   /** 校验 ID 并把它锚在项目目录里（防 `..` 逃逸）。 */
-  function safeRecordPath(baseDir, id, pattern, label) {
+  function safeRecordPath(
+    baseDir: string,
+    id: unknown,
+    pattern: RegExp,
+    label: string,
+    projectRoot: string,
+  ): SafeRecordPath {
     if (typeof id !== 'string' || !pattern.test(id)) {
       return { ok: false, result: invalid(`read${label}`, `${label} 标识不合法：${JSON.stringify(id)}`) };
     }
-    const base = path.join(declaredRoot, ...baseDir.split('/'));
+    const base = path.join(projectRoot, ...baseDir.split('/'));
     const target = path.resolve(base, id);
     const relative = path.relative(base, target);
     if (relative.startsWith('..') || path.isAbsolute(relative)) {
@@ -328,16 +686,22 @@ export function createProjectAdapter(options = {}) {
     return { ok: true, target };
   }
 
-  async function readRecord(baseDir, id, pattern, label, fileRelative) {
+  async function readRecord(
+    baseDir: string,
+    id: unknown,
+    pattern: RegExp,
+    label: string,
+    fileRelative: (target: string) => string,
+  ): Promise<RecordReadResult> {
     if (declaredRoot === undefined) return notConfigured('没有 projectRoot，读不到项目记录');
-    const safe = safeRecordPath(baseDir, id, pattern, label);
+    const safe = safeRecordPath(baseDir, id, pattern, label, declaredRoot);
     if (safe.ok === false) return safe.result;
     const file = fileRelative(safe.target);
-    let text;
+    let text: string;
     try {
       text = await readFile(file, 'utf8');
     } catch (error) {
-      const missing = error && typeof error === 'object' && error.code === 'ENOENT';
+      const missing = thrownCode(error) === 'ENOENT';
       return {
         ok: false,
         code: PROJECT_NOT_CONFIGURED,
@@ -359,16 +723,16 @@ export function createProjectAdapter(options = {}) {
     return { ok: true, [label === 'Route' ? 'route' : 'run']: parsed };
   }
 
-  const adapter = {
+  const adapter: ProjectAdapterApi = {
     contract_version: CONTRACT_VERSION,
     CONTRACT_VERSION,
     projectRoot: declaredRoot,
 
     /** 探测项目侧的可接入性：INDEX、项目配置、skill 副本、团队规则、Python、project.py。 */
-    async probe(input = {}) {
+    async probe(input: ProbeInput = {}): Promise<ProbeResult> {
       const projectRoot = root(input.projectRoot);
       if (projectRoot === undefined) return invalid('probe', 'probe 需要 projectRoot');
-      const gaps = [];
+      const gaps: ProbeGap[] = [];
       const skillCopy = path.join(projectRoot, ...SKILL_COPY_RELATIVE.split('/'));
       const indexPresent = await isFile(path.join(projectRoot, 'INDEX.md'));
       if (!indexPresent) {
@@ -444,15 +808,15 @@ export function createProjectAdapter(options = {}) {
         if (!gaps.some((existing) => existing.code === gap.code)) gaps.push({ ...gap, blocking: false });
       }
 
-      let schemaVersion = null;
+      let schemaVersion: unknown = null;
       try {
-        const projectRecord = JSON.parse(await readFile(path.join(projectRoot, 're', 'project.json'), 'utf8'));
-        schemaVersion = projectRecord?.schema_version ?? null;
+        const projectRecord: unknown = JSON.parse(await readFile(path.join(projectRoot, 're', 'project.json'), 'utf8'));
+        schemaVersion = isRecord(projectRecord) ? (projectRecord.schema_version ?? null) : null;
       } catch {
         schemaVersion = null;
       }
 
-      const compatibility = {
+      const compatibility: ProbeCompatibility = {
         projectRoot,
         indexPresent,
         configPresent,
@@ -483,7 +847,7 @@ export function createProjectAdapter(options = {}) {
     },
 
     /** 一次性封存：已有 seal 文件时不调用 CLI；退出码 1 时区分「已封存」与真失败。 */
-    async seal(input = {}) {
+    async seal(input: SealInput = {}): Promise<SealResult> {
       if (declaredRoot === undefined) return notConfigured('没有 projectRoot，跑不了 seal');
       const runId = input.runId;
       if (typeof runId !== 'string' || !RUN_ID.test(runId)) {
@@ -538,7 +902,7 @@ export function createProjectAdapter(options = {}) {
     },
 
     /** `impact`：纯派生，pretty JSON。 */
-    async impact() {
+    async impact(): Promise<CliStageResult> {
       const result = await runCli(['impact', declaredRoot]);
       if (typeof result.code === 'string') return result;
       if (result.ok !== true) {
@@ -563,7 +927,7 @@ export function createProjectAdapter(options = {}) {
     },
 
     /** `audit-scope`：纯派生，pretty JSON。 */
-    async auditScope() {
+    async auditScope(): Promise<CliStageResult> {
       const result = await runCli(['audit-scope', declaredRoot]);
       if (typeof result.code === 'string') return result;
       if (result.ok !== true) {
@@ -588,7 +952,7 @@ export function createProjectAdapter(options = {}) {
     },
 
     /** `index`：文本输出，只当诊断；失败保留 stderr。 */
-    async index() {
+    async index(): Promise<IndexResult> {
       const result = await runCli(['index', declaredRoot]);
       if (typeof result.code === 'string') return result;
       if (result.ok !== true) {
@@ -613,8 +977,8 @@ export function createProjectAdapter(options = {}) {
      * `check [--hashes] [--complete]`：单行 JSON。
      * @param {{hashes?: boolean, complete?: boolean}} input
      */
-    async check(input = {}) {
-      const argv = ['check', declaredRoot];
+    async check(input: CheckInput = {}): Promise<CheckResult> {
+      const argv: Array<string | undefined> = ['check', declaredRoot];
       if (input.hashes === true) argv.push('--hashes');
       if (input.complete === true) argv.push('--complete');
       const result = await runCli(argv);
@@ -655,21 +1019,21 @@ export function createProjectAdapter(options = {}) {
     },
 
     /** 直接读 `re/routes/<id>.json`（CLI 只校验，不提供读命令）。 */
-    async readRoute(routeId) {
+    async readRoute(routeId?: unknown): Promise<RecordReadResult> {
       return readRecord('re/routes', routeId, ROUTE_ID, 'Route', (target) => `${target}.json`);
     },
 
     /** 直接读 `re/runs/<id>/run.json`。 */
-    async readRun(runId) {
+    async readRun(runId?: unknown): Promise<RecordReadResult> {
       return readRecord('re/runs', runId, RUN_ID, 'Run', (target) => path.join(target, 'run.json'));
     },
 
     /** 直接枚举 `re/seals/**`（目标基线与执行基线）。 */
-    async readSeals() {
+    async readSeals(): Promise<ReadSealsResult> {
       if (declaredRoot === undefined) return notConfigured('没有 projectRoot，读不到 re/seals');
       const sealsDir = path.join(declaredRoot, 're', 'seals');
       const relatives = await walkJson(sealsDir);
-      const seals = [];
+      const seals: SealRow[] = [];
       for (const relative of relatives.sort()) {
         const file = path.join(sealsDir, ...relative.split('/'));
         try {
