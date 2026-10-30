@@ -17,7 +17,7 @@
 
 | 工具 | 必填输入 | 可选输入及默认值 | ok 的 data |
 |---|---|---|---|
-| rt_roster | project_root | action=inspect；target_kinds=[]（仅诊断）；max_posts=6；reserved_member_slots=1；reserved_activations=2；bind/takeover 时另需 operation_id、proposal_hash，takeover 需 recovery_ref | action、project/session/team、compatibility、posts、gaps、capacity、recommended_members、proposal_hash；变更时含 binding_ref |
+| rt_roster | project_root | action=inspect；target_kinds=[]（仅诊断）；max_posts=6；bind/takeover 时另需 operation_id、proposal_hash，takeover 需 recovery_ref | action、project/session/team、compatibility、posts、gaps、proposal_hash；变更时含 binding_ref |
 | rt_dispatch | project_root、operation_id、post_id、route_id、target_ids、objective、evidence_required、prohibited | capability_needs=[]（只追加）；depends_on_tasks=[]；resource_needs=[]（与配置合并）；timebox_ms=1800000；delivery_timeout_ms=60000；retry_of=null | dispatch/attempt/task/member/route、revision、phase=delivered、contract_ref、work_dir、started_at=null 或实际开始时间 |
 | rt_conclude | project_root、operation_id、dispatch_id、attempt_id、task_id、expected_revision、submission_ref、submission_sha256、review | 无其他隐式默认 | identities、phase=completed、outcome、route_status、receipt_ref、checks、audit_written |
 
@@ -39,13 +39,13 @@ evidence_required 与 prohibited 也只追加到目录默认要求，不能以�
 
 [岗位目录](roster-catalog.json)是四模板、默认能力、优先级、锚点类别和禁止事项的唯一数据源。priority 越小越先保留，同值按 post_id 排序；缺省 enabled=true。environment 按需加入，不因默认模板自动建岗；web-attack 为显式 disabled，不参与可用岗位计数。
 
-mixed 必须给至少两个不同 target_kinds，取相应模板岗位的并集，按 post_id 去重。先展示所有候选岗位及其状态，再选出工具需求可满足且在预算内的岗位；裁掉的标 deferred 并返回覆盖缺口，缺工具的标 vacant，disabled 单列。不为凑 ≥4 岗创建空任务。没有可用岗位时 recommended_members=0，不写空岗任务。
+mixed 必须给至少两个不同 target_kinds，取相应模板岗位的并集，按 post_id 去重。先展示所有候选岗位及其状态，再选出工具需求可满足且在预算内的岗位；裁掉的标 deferred 并返回覆盖缺口，缺工具的标 vacant，disabled 单列。不为凑 ≥4 岗创建空任务。没有可用岗位时不写空岗任务。
 
-成员席位余额与 activation 余额分别从宿主快照读取，不能把二者都推定为 8；历史失败成员计入已用席位。可新增成员数受 `remaining_member_slots - reserved_member_slots` 与 `remaining_activations - reserved_activations` 共同限制，再与 max_posts 和可复用岗位结合；负值按 0。复用仍需检查宿主的实际启动额度，不假定 inactive 自动释放名额。无法取得或保守确定可用额度时返回 CAPACITY_UNKNOWN，不估计后盲目创建。当前文档未公开统一的剩余席位/activation 余额查询方法；实现 adapter 前必须确定可验证的配置/计数来源与并发限制，不能臆造 getCapacity 或读取宿主私有字段。此接入仍待解决，不能因此声称现有接口已满足全部派发前置条件。
+岗位能不能派只看两件事：**能力是否满足**与操作者的 `max_posts`。宿主不公开席位与 activation 上限的读数（`maxMembers` 没有 getter，`maxActiveSubagents` 在团队服务里不存在），本插件不预测、不预留、也不为「学一次上限」而试探；已用席位数只作为一条诊断如实报出（来自宿主名册，含失败成员），不参与裁剪。宿主的强制在它自己那边：被拒时按宿主原话返回 `CAPACITY_EXHAUSTED`。
 
-默认预算为最多六岗、至少一席失败替换预留和两个 activation 供零碎活/恢复；这是部署值均为 8 且无既有占用时的建议上限，不是所有环境都能创建六人。主规格不再用一个常数等式替代运行时计数。
+默认 `max_posts=6` 是**操作者愿意在一次提议里保留的岗位数**，不是对宿主能创建多少成员的预测；不同环境可能有更低的上限，由宿主拒绝时如实报告。
 
-按排序逐岗选择时，已运行的岗位保留为 assigned 并计入 max_posts，不因降低预算取消它；空闲已有成员按宿主报告的本次 activation 增量计费，不再扣一个新席位；新成员扣一席及其启动额度。任一增量未知则该岗 deferred 并报告 CAPACITY_UNKNOWN。recommended_members 只计本提议需要新建的成员，不把复用人数再加进去。
+按排序逐岗选择时，已运行的岗位保留为 assigned 并计入 max_posts，不因降低 `max_posts` 取消它；其余岗位按能力判定 vacant 或 assigned，超出 `max_posts` 的标 deferred 并报 `CAPACITY_EXHAUSTED`。不按 activation 增量计费，也不预留席位。
 
 ## 能力绑定与就绪判定
 
@@ -120,7 +120,7 @@ project/session/epoch 使用该操作首次捕获的授权上下文；查询到�
 
 | 操作阶段 | 已保存内容与可见状态 | 重入行为 |
 |---|---|---|
-| prepared | 契约/基准/尝试身份与资源预留；尚无成功派发 | 读当前绑定/容量/资源后续做未完成步骤 |
+| prepared | 契约/基准/尝试身份与资源预留；尚无成功派发 | 读当前绑定/资源后续做未完成步骤 |
 | member_ready | 成员身份及就绪结果；创建失败也记已用席位 | 复用已知成员，不再 spawn；就绪失败交回阻塞 |
 | task_created | task_id，任务可暂时 pending | 继续该任务的指派，不创建第二个 task |
 | assigned | task owner/revision，in_progress；信封未确认接收 | 只交付同一信封，实验不得提前开始 |
@@ -157,5 +157,7 @@ Lead 每轮先回读状态、start/submission、过期时间和 impact，再处�
 | 派发前置 | UNKNOWN_CAPABILITY、CAPABILITY_MISSING、CAPABILITY_NOT_READY、CAPACITY_UNKNOWN、CAPACITY_EXHAUSTED、POST_DISABLED、MEMBER_BUSY、DEPENDENCY_BLOCKED、RESOURCE_BINDING_MISSING、RESOURCE_BUSY |
 | 交付与恢复 | DELIVERY_FAILED、START_ACK_TIMEOUT、RECOVERY_REQUIRED、OPERATION_CONFLICT、REVISION_CONFLICT、STALE_ATTEMPT |
 | 收口 | SUBMISSION_INVALID、BASELINE_MISMATCH、CHECK_FAILED、UNREVIEWED_COMPLETION |
+
+`CAPACITY_UNKNOWN` 是**保留码**：T23 起本插件不再产生它（容量不可读不再是拒绝理由），保留只为已登记码集合稳定；`CAPACITY_EXHAUSTED` 仍用于 `max_posts` 用尽与宿主拒绝。
 
 前置拒绝 status=blocked 且无新成员/任务/正式路线变更；非法参数/角色 status=error；已持久化或触及宿主后失败 status=partial。审计失败作为 ok 的诊断，不伪称没有实际副作用。所有码必须给出具体对象与下一步，不只透传栈或宿主异常。

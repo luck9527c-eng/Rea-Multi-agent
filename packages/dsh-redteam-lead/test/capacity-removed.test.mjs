@@ -15,7 +15,7 @@ const PACKAGE_ROOT = fileURLToPath(new URL('../', import.meta.url));
 const SRC = path.join(PACKAGE_ROOT, 'src');
 const DIST = path.join(PACKAGE_ROOT, 'dist');
 
-/** 已随 T23 删除的标识符 / 路径（出现即失败）。 */
+/** 已随 T23/T25 删除的标识符 / 路径 / 键名（出现即失败）。 */
 const TRIPWIRES = [
   'capacity-observed',
   'capacity-observing',
@@ -30,6 +30,10 @@ const TRIPWIRES = [
   'observeCapacity',
   'resolveCapacity',
   'parseHostCapacityLimit',
+  // T25：容量已从规格与 wire data 删除，这些特判/占位名不得回来。
+  'CAPACITY_ARGUMENT_OBSOLETE',
+  'NO_CAPACITY_PLAN',
+  'remaining_member_slots',
 ];
 
 /** 递归收集某个目录下的 `.ts` / `.js` / `.mjs` 文件（不含 node_modules）。 */
@@ -71,4 +75,23 @@ test('capacity-source 模块已删除，capacity 模块只剩岗位计划', asyn
 
   const source = await readFile(path.join(SRC, 'capacity.ts'), 'utf8')
   assert.match(source, /export function planPosts/u, '岗位计划还在（它不含任何容量判定）')
+})
+
+test('T25：规格的 rosterInput/dispatchInput/rosterData 不再声明容量键', async () => {
+  const specPath = path.join(PACKAGE_ROOT, '..', '..', 'docs', 'specs', 'rt-tools.schema.json')
+  const spec = JSON.parse(await readFile(specPath, 'utf8'))
+  const forbidden = ['capacity', 'reserved_member_slots', 'reserved_activations']
+
+  for (const defName of ['rosterInput', 'dispatchInput']) {
+    const props = Object.keys(spec.$defs[defName].properties)
+    for (const key of forbidden) {
+      assert.equal(props.includes(key), false, `$defs.${defName}.properties 不得再声明 ${key}`)
+    }
+  }
+
+  const data = spec.$defs.rosterData
+  for (const key of [...forbidden, 'recommended_members']) {
+    assert.equal(data.required.includes(key), false, `$defs.rosterData.required 不得再引用 ${key}`)
+    assert.equal(Object.hasOwn(data.properties, key), false, `$defs.rosterData.properties 不得再声明 ${key}`)
+  }
 })

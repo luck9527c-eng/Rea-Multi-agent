@@ -648,11 +648,10 @@ function summarizeData(label: string, data: unknown): string[] {
     lines.push(`session_id：${scalarOrNull(view.session_id)}`)
     lines.push(`team_id：${scalarOrNull(view.team_id)}`)
     push('compatibility', view.compatibility)
-    // 容量一行不再渲染（T23：本插件不做容量规划；`capacity` 字段只是 wire 的必备键）。
+    // 容量与「建议几人」都不再渲染（T23/T25：本插件不做容量规划，wire data 里也没有这两个键）。
     // A38：每条缺口带 code 与一行 reason。
     lines.push(...postsLines(view.posts, gapReasonSet(view.gaps)))
     lines.push(...gapsLines(view.gaps))
-    push('recommended_members', view.recommended_members)
     push('proposal_hash', view.proposal_hash)
     push('binding_ref', view.binding_ref)
   } else if (label === 'rt_dispatch') {

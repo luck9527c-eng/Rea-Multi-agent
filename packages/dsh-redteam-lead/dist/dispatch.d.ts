@@ -42,17 +42,6 @@ interface DispatchRequest {
     timebox_ms: number;
     delivery_timeout_ms: number;
     retry_of: Record<string, unknown> | null;
-    /**
-     * 收到但**已废止**的 `capacity` 入参（T23）：`docs/specs` 仍声明它，校验会放行。
-     *
-     * 值本身**一个字段都不读**（不解析、不落盘、不进任何判定），只用来回一条
-     * `CAPACITY_ARGUMENT_OBSOLETE`。键名与位置保持原样还有一个硬理由：
-     * `operationInputHash()` 对**规范化后的请求**求哈希，升级前登记过的 operation
-     * 里带着 `capacity`，改名/挪位置会让它们在恢复时被判 `OPERATION_CONFLICT`。
-     *
-     * **可选**而不是 `null` 占位：没声明时不能凭空多出一个键（同样的哈希兼容理由）。
-     */
-    capacity?: unknown;
 }
 /** `normalizeDispatchInput` 的结果：形状错误时 `value` 为空对象（调用方不会读它）。 */
 type NormalizedDispatch = {
