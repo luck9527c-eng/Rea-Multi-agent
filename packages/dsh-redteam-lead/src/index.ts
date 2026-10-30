@@ -112,10 +112,13 @@ export const TOOLS = Object.freeze([
     parameters: rosterParameters,
     title: 'Inspect or bind the red-team roster',
     description:
-      'Read-only roster diagnosis for a reverse-engineering project (action=inspect, default), or bind/takeover ' +
-      'the project+session binding (Lead only). Reports project-skill compatibility gaps, candidate posts, ' +
-      'capacity, recommended members and a proposal hash. Action=bind/takeover additionally needs operation_id, ' +
-      'proposal_hash and at least one target_kind; takeover also needs recovery_ref.',
+      'Lead only. Step 1 of the project ledger. action=inspect (default) is read-only roster diagnosis: skill ' +
+      'compatibility gaps, candidate posts, capacity, recommended members, proposal hash. Read gaps[] before ' +
+      'dispatching — it says which posts are dispatchable and what is missing (tool inventory, capability ' +
+      'registration, capacity). Step 2 is action=bind/takeover to bind project+session; it needs operation_id, ' +
+      'proposal_hash and at least one target_kind (takeover also needs recovery_ref), and it refuses while any ' +
+      'gap is CAPACITY_EXHAUSTED or CAPACITY_UNKNOWN. On CAPACITY_UNKNOWN the project has no capacity source ' +
+      'yet: put one in re/team/capacity.json, or pass capacity on that call.',
   },
   {
     name: 'rt_dispatch',
@@ -124,10 +127,12 @@ export const TOOLS = Object.freeze([
     parameters: dispatchParameters,
     title: 'Dispatch one contract to a teammate',
     description:
-      'Lead only. Persist one dispatch contract for a route and target set, spawn or reuse the teammate for a ' +
-      'post, create and assign the host task, then deliver the contract envelope. Returns dispatch/attempt/task/' +
-      'member identities plus the contract and work-directory references. A partial envelope means side effects ' +
-      'may already exist — resume with the same operation_id.',
+      'Lead only. Step 3, one post at a time. Persist one dispatch contract for a route and target set, spawn or ' +
+      'reuse the teammate for that post, create and assign the host task, then deliver the contract envelope. ' +
+      'The contract ref (re/team/dispatches/<id>.json) is what the member executes and what rt_conclude later ' +
+      'checks the submission against. Returns dispatch/attempt/task/member identities plus the contract and ' +
+      'work-directory references. A partial envelope means side effects may already exist — resume with the same ' +
+      'operation_id.',
   },
   {
     name: 'rt_conclude',
@@ -136,9 +141,11 @@ export const TOOLS = Object.freeze([
     parameters: concludeParameters,
     title: 'Conclude one dispatch and complete its task',
     description:
-      'Lead only. Validate one submission against its dispatch baseline and anchor set, run the project-skill ' +
-      'checks (impact / seal / index / check --hashes), write the receipt, then complete the host task. ' +
-      'Repeat with the same operation_id returns the original receipt.',
+      'Lead only. Step 4, after the member returns its submission.json. Validate that submission against the ' +
+      'dispatch baseline and anchor set, run the project-skill checks (impact / seal / index / check --hashes), ' +
+      'write the receipt, then complete the host task. Only this receipt closes the finding — do not hand-write ' +
+      'one or accept the work by eye. A failed check leaves the receipt unwritten and the dispatch open. Repeat ' +
+      'with the same operation_id returns the original receipt.',
   },
 ])
 

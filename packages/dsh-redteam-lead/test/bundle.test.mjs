@@ -378,9 +378,12 @@ test('persona 行：complete=false（否则吃掉 team:policy 段）、带 runti
   assert.equal(typeof persona.config.prefix, 'string')
   assert.ok(persona.config.prefix.trim().length > 0, 'persona prefix 不能为空')
 
-  // 角色中立：工兵继承同一 preset 时也读这条人设，角色由 runtime context 的 team:identity 注入。
-  assert.ok(!persona.config.prefix.includes('指挥'), 'persona 不得写死「指挥」口吻')
-  assert.ok(!persona.config.prefix.includes('你是'), 'persona 不得用第二人称写死角色')
+  // 人设现在**点明身份**（资深逆向工程师 / 决策者 / 智囊），所以不再禁第二人称。
+  // 但工兵继承同一 preset、也读这一段，所以必须同时给出两条角色分支；
+  // 只写"你是团队的决策者"会让成员以为自己是 Lead、拒绝干活。
+  assert.ok(persona.config.prefix.includes('收到派发契约'), '必须写明"收到契约"这条角色分支')
+  assert.ok(persona.config.prefix.includes('Lead'), '必须写明无契约时按 Lead 走')
+  assert.ok(!persona.config.prefix.includes('红队指挥'), '不得把「红队指挥」写成人设身份（工兵会误认）')
 
   // 证据纪律必须真的在：锚点 / 未验证推测 / 缺什么
   for (const phrase of ['锚点', '未验证推测', '缺']) {
@@ -407,15 +410,17 @@ test('persona 行：complete=false（否则吃掉 team:policy 段）、带 runti
     )
   }
 
-  // 回归：人设必须写清 rt_* 的流程。实测过没有这段的版本 —— 三个工具都在 request/header 里，
+  // 回归：人设必须点明 rt_* 的存在。实测过没有这段的版本 —— 三个工具都在 request/header 里，
   // 模型却一次都没调用（pwsh 44 次），因为宿主注入的 Agent Teams 说明覆盖了"怎么协作"，
   // 而人设只写了"怎么说话"。删掉这段就会静默退回到那个状态，所以要钉住。
   for (const tool of ['rt_roster', 'rt_dispatch', 'rt_conclude']) {
-    assert.ok(persona.config.prefix.includes(tool), `persona 必须写明 ${tool} 的用途，否则模型知道有却不用`)
+    assert.ok(persona.config.prefix.includes(tool), `persona 必须点明 ${tool}，否则模型知道有却不用`)
   }
-  for (const phrase of ['编排', 'submission.json', '收据']) {
-    assert.ok(persona.config.prefix.includes(phrase), `persona 的 rt_* 段必须包含：${phrase}`)
-  }
+  // 但**只点存在性**：第几步调、参数、容量处置都归工具描述（模型决策时读的是那里），
+  // 人设里不该再铺一遍流程 —— 那是在拿 10% 的 prompt 席位去替工具描述打工。
+  assert.ok(persona.config.prefix.includes('编排'), 'persona 必须有一段点明项目账目归 rt_*')
+  assert.ok(!persona.config.prefix.includes('submission.json'), '流程细节应留在工具描述，不要塞回人设')
+  assert.ok(!persona.config.prefix.includes('CAPACITY_UNKNOWN'), '容量处置应留在工具描述，不要塞回人设')
 })
 
 test('patch 里没有 sandbox / approval 声明（服务泄漏会让整棵 preset broken）', () => {
@@ -838,6 +843,9 @@ test('三工具注册：raw JSON Schema（自包含）、output.schema 为宿主
     assert.ok(Array.isArray(definition.parameters.required) && definition.parameters.required.length > 0)
     assert.equal(typeof definition.description, 'string')
     assert.ok(definition.description.length > 40, 'description 是模型读的说明，不能敷衍')
+    // 编排顺序写在**工具描述**里：模型决定调不调时读的是它，而不是人设第 2 段。
+    // 实测过没有顺序的人设版 —— 三个工具都在，却 0 次调用。
+    assert.match(definition.description, /Step \d/u, `${toolName}.description 必须写明它处在编排的第几步`)
     // 入参必须自包含：悬空 $ref 模型解析不了
     assert.deepEqual(collectRefs(definition.parameters), [], `${toolName}.parameters 不得残留 $ref`)
 
