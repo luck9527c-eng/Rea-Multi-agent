@@ -80,6 +80,8 @@ skill 侧**没有**生成命令，本机**零个真实实例**；唯一具体样
 
 一次失败 spawn 会烧掉名字 + 席位。因此 `rt_dispatch`：**先**查名字唯一性与已用席位、**再** spawn；spawn 失败后必须把该成员记成 `failed` 并计入已用席位，**不得**用同名重试。
 
+**T18c 补正（机械口径）**：只有**已经写下成员行之后**才失败的 spawn 才会烧。「宿主因容量拒绝」有两种时机 —— `TEAM_MEMBER_LIMIT` 在 `appendAndFlush` **之前**抛（没有成员行 → 名字仍空闲、席位没消耗 → **同名重试合法**），`ACTIVATION_LIMIT_REACHED` 在成员行 append **之后**抛（catch 把它 settle 成 `failed` → 名字与席位都烧掉）。判断只写在 `dispatch.ts` 的 `capacityRefusalBurned()` 一处；宿主证据与逐字诊断见 D40 的 T18c 补记。
+
 ## D13 — 目标构建 = 已安装的 rc.3，E1 报的「fatal difference」对我们是无操作
 
 E1 发现：`@deepseek-ai/dsh-tool-subagent-control/list-agents` 这个子路径在 rc.3 存在、在 0.2.2 已移除；`mountPreset()` 会因**任何一行**起不来而把**整个 preset** 标成 broken。所以「保留 `tool-subagent-list-agents` 行」是致命的。
@@ -465,14 +467,15 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 | 写入时机 | **只在**宿主因容量拒绝了一次**真实需要**的 spawn 之后（`CAPACITY_EXHAUSTED`）；绝不为了探测而派发 |
 | 观测中标记 | `re/team/capacity-observing.json`（spawn 前写、spawn 结束删；只在容量未知时写） |
 | 回执 | `status=partial`、`code=CAPACITY_EXHAUSTED`、`data.member` 点名被烧的成员；`hostCode` 与观测值落点写进诊断（D21：`failureData` 是封闭对象，细节只能进文本） |
-| 同名重试 | **禁止**（D12），失败分支不重试，下一次派发自然用 `-2` |
+| 同名重试 | 写成员行**之后**才失败的（`ACTIVATION_LIMIT_REACHED` 与运行期故障）**禁止**（D12），失败分支不重试，下一次派发自然用 `-2`；`TEAM_MEMBER_LIMIT` 在写成员行**之前**就拒绝，名字仍空闲，容量解决后可用同名（T18c，见补记） |
 | 免拒绝范围 | 只有 `capacity_source === 'unknown'`；**已声明**容量（项目/调用/观测）仍按原预算裁剪，行为不变 |
 
 **诊断原文（未声明时，逐字）**：
 
 > 容量未声明（capacity_source=unknown）：re/team/capacity.json 与 profile config.capacity 都没有声明，
 > 本会话也还没有观测值，当前已用席位 N。本次派发照派，但**不保证**有位置：
-> 宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位（该名字不会再用，D12）
+> 宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位：activation 池满会烧掉名字，
+> 成员席位满发生在写成员行之前（名字还在，可以同名重试，T18c）
 
 ### 补记（T18b，2026-10-30）：上限有了**准确值**，不只是「你已经到顶了」
 
@@ -523,4 +526,61 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 进程被杀就留下来了。并发拒绝的诊断现在同时给出标记内的 `started_at` 与**该文件的 mtime**
 （`readObservationMarker().modified_at`），操作者据此判断是「刚刚有人在观测」还是「很久以前的残骸」；
 处置仍是先核对名册、再手工删文件（插件不自动清理别人的标记）。已知限制同步写进 README。
+
+### 补记（T18c，2026-10-30）：两条容量码的**损坏语义不同** —— 名字与席位不是每次都烧
+
+> ticket T18c（本仓库没有单独落 ticket 文件；上下文见 D12 的补正与本节）。
+> 实现：`src/dispatch.ts`（`capacityRefusalBurned()` + 两句 `refusal*Clause()`；failure 文案与诊断共用）。
+> 用例：`test/t18c-burn-semantics.test.mjs`（T18c-1…3）与 `test/fake-team.test.mjs` 的
+> 「两条容量拒绝的席位语义不同」；替身修正见 `test/helpers/fake-team.mjs`。
+
+**缺陷**：容量碰撞的 failure 文案与诊断对两条码**都说**「该名字与席位已被烧掉，不得同名重试（D12）」。
+`TEAM_MEMBER_LIMIT` 实际发生在写成员行**之前**，名字仍然空闲、席位没有消耗。把「名字还在」说成
+「已烧掉」，等于让 Lead 放弃一个还能用的名字、跳过唯一一次本该成功的重试 —— 与 T15 的假绿同类：
+替身编了一个不存在的损失，测试再给那个损失背书。
+
+**宿主事实（逐字核对）**：
+
+| 宿主码 | 抛出点 | 成员行 | 名字 | 席位 |
+|---|---|---|---|---|
+| `TEAM_MEMBER_LIMIT` | `journal.transact` 内的席位上限检查，**在 `appendAndFlush` 之前** | 没有 | 仍空闲 | 未消耗 → **同名重试合法** |
+| `ACTIVATION_LIMIT_REACHED` | `subagents.startActivation` → `ActivationPool.reserve` 池满抛，**在成员行 append 之后**；catch 把该行 settle 成 `phase:'failed'` | 有（`failed`） | 被占用 | 计入 `state.members.length` → **烧掉** |
+
+**rc.3（运行构建）vs checkout（源码）—— 两者顺序一致，没有偏离**：
+
+| 环节 | rc.3 安装构建（`_l3-verify/evidence/_agent-team.js`） | checkout（`deepseek-harness` @ 0.2.2-alpha.2） |
+|---|---|---|
+| 席位上限检查抛错 | `1024`（`throw … TEAM_MEMBER_LIMIT`） | `roster.ts:257-259` |
+| 成员行 `appendAndFlush` | `1025`（在 1024 **之后**） | `roster.ts:260` |
+| `startActivation`（activation 池满在这里抛） | `1032` | `roster.ts:264` |
+| catch → `settleProvisioning` | `1044-1057`（写 failed 行在 `1174`） | `roster.ts:276-296` → `447-465` |
+
+`ACTIVATION_LIMIT_REACHED` 的抛出点本身在 `dsh-subagent`：安装 asar 里的 `ActivationPool.reserve()`
+与 checkout `packages/subagent/subagent/src/activation.ts:24-35` **逐字相同**（`throw` 在 `slots.add`
+**之前** → 失败**不**占 activation 槽），由 `manager.ts:744` 的 `pool.reserve(this.maxActiveSubagents())`
+在 `materialize()` 最开始调用，早于任何成员行。**结论：按 checkout 的语义实现 = 按运行构建实现。**
+
+**落地口径（新）**：`capacityRefusalBurned(hostCode)` 是唯一判断点；认不出的宿主码按「已烧掉」说
+（宁可保守，也不给一个可能失败的「同名重试没问题」的承诺）。
+
+**两句诊断原文（逐字，`envelope.diagnostics[0]`；`TEAM_MEMBER_LIMIT` 的形态以解析到 N 为例）**：
+
+> `[CAPACITY_EXHAUSTED]` 宿主拒绝创建成员 `rt-cross-check`（hostCode=TEAM_MEMBER_LIMIT）：该名字没有被占用、
+> 也没有消耗席位 —— 宿主在写成员行之前就拒绝了（宿主报的成员上限 1 席）
+> `next_step`：先解决容量（复用空闲成员、等一个成员释放，或放宽 maxMembers），再用同名 `rt-cross-check` 重试
+
+> `[CAPACITY_EXHAUSTED]` 宿主拒绝创建成员 `rt-cross-check`（hostCode=ACTIVATION_LIMIT_REACHED）：该名字与席位
+> 已被烧掉，不得同名重试（D12）
+> `next_step`：不要用同名重试（D12）；下一次派发会自动用下一个名字
+
+**观测值口径不变但更准**：`basis.used_at_observation` 现在如实反映「这次拒绝有没有写下成员行」——
+`TEAM_MEMBER_LIMIT` 不写，所以连续两次成员席位满的 `used` 相同（T18b-5 原先断言的 `2` 是替身假行的产物）。
+
+**替身修正（这才是假绿的根）**：`fake-team.mjs` 的 `failNextSpawn({code})` 以前**一律**在写完
+provisioning 行之后抛，于是注入的 `TEAM_MEMBER_LIMIT` 也留下一个 `failed` 行（名字与席位都被「烧掉」）。
+现在按码选抛出点（`PRE_APPEND_SPAWN_CODES`）：`TEAM_LEAD_REQUIRED` / `TEAM_INVALID_MEMBER_NAME` /
+`TEAM_MEMBER_NAME_TAKEN` / `TEAM_MEMBER_LIMIT` 在写行**之前**抛，其余（`ACTIVATION_LIMIT_REACHED`、
+运行期故障）仍在写行**之后**。受影响并已更正的旧用例：T18b-2 / T18b-4 / T18b-5（它们曾靠那条假行把
+`used` 顶到 ≥ 1；真实前提是「席位满只可能在 `used >= maxMembers >= 1` 时发生」，所以现在预置一名队友，
+T18b-5 的 `used_at_observation` 如实改为 `1`）。
 

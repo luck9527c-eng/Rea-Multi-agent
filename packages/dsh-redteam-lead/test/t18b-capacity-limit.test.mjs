@@ -64,8 +64,12 @@ const ROUTE = Object.freeze({
  * 未声明容量的派发项目（与 T18 的 `dispatchFixture` 同形状）。
  *
  * 容量必须**未声明**：这正是「撞一次就学」唯一会发生的场合。
+ *
+ * `members` 预置队友：观测值的兜底口径是「观测当时的已用席位」，而 `used === 0` 时
+ * `recordCapacityObservation` 会拒绝落盘（0 不能当上限）。`TEAM_MEMBER_LIMIT` 在真实宿主里
+ * 只可能在 `used >= maxMembers >= 1` 时发生，所以成员席位满的用例必须给一个已用席位。
  */
-function dispatchFixture(t) {
+function dispatchFixture(t, { members = [] } = {}) {
   const project = makeTempProject({
     t,
     files: {
@@ -87,7 +91,7 @@ function dispatchFixture(t) {
     t,
     role: 'lead',
     projectRoot: project.root,
-    teamOpts: { members: [] },
+    teamOpts: { members },
     projectOpts: { routes: { 'R-001': ROUTE }, seals: [] },
     capacity: { known: false },
     tools: { lead: FULL_TOOLS },
@@ -161,7 +165,8 @@ test('T18b-1 `active child limit: 4` → max_active_subagents=4（不是已用�
 // ---------------------------------------------------------------------------
 
 test('T18b-2 `Team member limit 6 reached` → max_members=6，且余量按 6-1 算', async (t) => {
-  const { project, ctx, team, input } = dispatchFixture(t)
+  // 预置 1 名队友：成员席位满在 used=0 时不可能发生（T18c），观测值才有真实口径。
+  const { project, ctx, team, input } = dispatchFixture(t, { members: [{ name: 'rt-existing' }] })
   team.failNextSpawn({ code: 'TEAM_MEMBER_LIMIT', message: memberMessage(6) })
 
   const { envelope } = await handleDispatch(ctx, input())
@@ -211,7 +216,7 @@ test('T18b-3 消息里没有可解析的数字 → 回落为 used_at_observation
 // ---------------------------------------------------------------------------
 
 test('T18b-4 已有解析值，再撞一次但消息不可解析 → 保留原值、不降级、不改 observed_at', async (t) => {
-  const { project, ctx, team, input } = dispatchFixture(t)
+  const { project, ctx, team, input } = dispatchFixture(t, { members: [{ name: 'rt-existing' }] })
 
   team.failNextSpawn({ code: 'TEAM_MEMBER_LIMIT', message: memberMessage(6) })
   await handleDispatch(ctx, input())
@@ -238,7 +243,7 @@ test('T18b-4 已有解析值，再撞一次但消息不可解析 → 保留原�
 // ---------------------------------------------------------------------------
 
 test('T18b-5 同会话再撞一次且解析出不同的 N → 覆盖数值并更新 observed_at', async (t) => {
-  const { project, ctx, team, input } = dispatchFixture(t)
+  const { project, ctx, team, input } = dispatchFixture(t, { members: [{ name: 'rt-existing' }] })
 
   team.failNextSpawn({ code: 'TEAM_MEMBER_LIMIT', message: memberMessage(6) })
   await handleDispatch(ctx, input())
@@ -253,7 +258,11 @@ test('T18b-5 同会话再撞一次且解析出不同的 N → 覆盖数值并更
   const after = await readJsonFile(project.root, OBSERVED_PATH)
   assert.equal(after.max_members, 3, '新的准确值必须覆盖旧的')
   assert.equal(after.basis.parsed_limit, 3)
-  assert.equal(after.basis.used_at_observation, 2, '第二次碰撞时失败成员已计入：used=2')
+  assert.equal(
+    after.basis.used_at_observation,
+    1,
+    '两次都是成员席位满：宿主在写成员行之前就拒绝，已用席位不得凭空 +1（T18c）',
+  )
   assert.equal(after.basis.message, memberMessage(3))
   assert.notEqual(after.observed_at, first.observed_at, '覆盖必须更新 observed_at（值可能因改设置而失效）')
   assert.match(after.observed_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/u)

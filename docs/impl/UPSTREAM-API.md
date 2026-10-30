@@ -183,6 +183,12 @@ makeTempProject({t, files}) / makeTempDir(t) / makeClock(start) / makeFakeTools(
 - `ACTIVATION_LIMIT_REACHED` 发生在成员行 `appendAndFlush` **之后**，catch 里把该行 settle 成 `phase:'failed'`
   → 名字与席位确实被烧掉（D12），`used` 含这一行。
 
+rc.3 安装构建与 checkout 对这两条顺序**一致**（`_agent-team.js:1024/1025/1032/1051` vs
+`roster.ts:257-260/264/276-296`），`ActivationPool.reserve()` 在 asar 里与 `activation.ts:24-35` 逐字相同
+（`throw` 在 `slots.add` **之前** → 失败的预留不占 activation 槽）。**这条事实决定的不只是观测值**：
+`src/dispatch.ts` 的 `capacityRefusalBurned()` 用同一个判断决定失败文案说「名字没被占用、可同名重试」
+还是「已烧掉、不得同名重试」（T18c，见 DECISIONS 的 D40 补记）。
+
 消费方：`src/capacity-source.ts` 的 `parseHostCapacityLimit()`（正则只认这两条码）。拿不到数字就回落为
 观测当时的已用席位数（T18 语义），并在诊断里说明「回落」—— 不抛、不猜。**宿主改措辞时**，先更新本表，
 再更新那两条正则与 `test/t18b-capacity-limit.test.mjs`。
