@@ -846,6 +846,16 @@ test('三工具注册：raw JSON Schema（自包含）、output.schema 为宿主
     // 编排顺序写在**工具描述**里：模型决定调不调时读的是它，而不是人设第 2 段。
     // 实测过没有顺序的人设版 —— 三个工具都在，却 0 次调用。
     assert.match(definition.description, /Step \d/u, `${toolName}.description 必须写明它处在编排的第几步`)
+    // 红队会话实测：模型第一次收口就把派发的 operation_id 拿去复用，撞 OPERATION_CONFLICT（T24）。
+    // 三个 id 的分工必须写在描述里 —— 那里才是模型决策时读的地方。
+    if (toolName === 'rt_conclude') {
+      assert.match(
+        definition.description,
+        /never reuse the dispatch's operation_id/u,
+        'rt_conclude.description 必须写明「不要复用派发的 operation_id」'
+      )
+      assert.match(definition.description, /dispatch_id and attempt_id/u, 'rt_conclude.description 必须指出要用 dispatch_id/attempt_id')
+    }
     // 入参必须自包含：悬空 $ref 模型解析不了
     assert.deepEqual(collectRefs(definition.parameters), [], `${toolName}.parameters 不得残留 $ref`)
 

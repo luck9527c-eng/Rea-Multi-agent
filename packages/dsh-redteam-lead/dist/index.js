@@ -103,7 +103,8 @@ export const TOOLS = Object.freeze([
             'Step 2 is action=bind/takeover to bind project+session; it needs operation_id, proposal_hash and at ' +
             'least one target_kind (takeover also needs recovery_ref), and it refuses while any gap is ' +
             'CAPACITY_EXHAUSTED (max_posts overflow). There is no capacity plan: the host does not expose its ' +
-            'member/activation limits, so this tool reports how many seats are used and leaves the limit to the host.',
+            'member/activation limits, so this tool reports how many seats are used and leaves the limit to the host. ' +
+            'operation_id is the idempotency key of this call — a new operation needs a new one.',
     },
     {
         name: 'rt_dispatch',
@@ -115,7 +116,8 @@ export const TOOLS = Object.freeze([
             'reuse the teammate for that post, create and assign the host task, then deliver the contract envelope. ' +
             'The contract ref (re/team/dispatches/<id>.json) is what the member executes and what rt_conclude later ' +
             'checks the submission against. Returns dispatch/attempt/task/member identities plus the contract and ' +
-            'work-directory references. A partial envelope means side effects may already exist — resume with the same ' +
+            'work-directory references. Feed the returned dispatch_id and attempt_id to rt_conclude; this call\'s ' +
+            'operation_id is not reusable there. A partial envelope means side effects may already exist — resume with the same ' +
             'operation_id.',
     },
     {
@@ -128,7 +130,8 @@ export const TOOLS = Object.freeze([
             'dispatch baseline and anchor set, run the project-skill checks (impact / seal / index / check --hashes), ' +
             'write the receipt, then complete the host task. Only this receipt closes the finding — do not hand-write ' +
             'one or accept the work by eye. A failed check leaves the receipt unwritten and the dispatch open. Repeat ' +
-            'with the same operation_id returns the original receipt.',
+            'with the same operation_id returns the original receipt. operation_id is the idempotency key of this ' +
+            'conclude — never reuse the dispatch\'s operation_id; pass its dispatch_id and attempt_id as the target.',
     },
 ]);
 const TOOL_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
