@@ -1709,11 +1709,17 @@ async function openCapacityGate({ root, sessionId, teamAdapter, capacitySource: 
         if (used !== null) {
             const remaining = Math.max(0, fresh.record.max_members - used);
             if (remaining < 1) {
+                // 上限是**哪一类拒绝**教会的，决定「再派一次会不会烧」（T19）：席位满（`TEAM_MEMBER_LIMIT`）
+                // 在写成员行之前就拒绝，什么都没烧，说「避免再烧」是虚报；activation 池满与认不出的码
+                // 照旧保守说。判断只走 T18c 的 `capacityRefusalBurned()` 一处（D12 补正）。
+                const burned = capacityRefusalBurned(fresh.record.basis.host_code);
                 return {
                     refusal: {
                         code: 'CAPACITY_EXHAUSTED',
                         reason: `本会话已观测到成员上限 maxMembers=${fresh.record.max_members}，当前已用 ${used} 席：到顶，`
-                            + '不再创建成员（避免再烧一个名字与席位）',
+                            + (burned
+                                ? '不再创建成员（避免再烧一个名字与席位）'
+                                : '宿主会在写成员行之前拒绝，名字与席位都不会被占用（同名重试仍然合法，T18c）'),
                         nextStep: '复用已有成员或等一个成员释放；要放宽上限就在 re/team/capacity.json 显式声明（并在本次调用传 capacity）；'
                             + '不要靠再撞一次去试探余额',
                     },
@@ -1798,12 +1804,17 @@ async function recordCapacityObservation(params) {
         return { ...settled, ref: null, error: `写 ${capacitySource.OBSERVED_CAPACITY_PATH} 失败：${thrownMessage(error)}` };
     }
 }
-/** 解析出的那个数字落在哪个维度（两条宿主消息各只讲一件事）。 */
+/**
+ * 解析出的那个数字落在哪个维度（两条宿主消息各只讲一件事）。
+ *
+ * 返回值一律**可以直接接在中文之后**：`activation` 是 Latin 开头，不补分隔就会粘成
+ * 「解析出的activation」（T19 第 3 条修的就是这个 typo），所以这个维度自带一个分隔空格。
+ */
 function parsedLimitDimension(hostCode) {
     if (hostCode === 'TEAM_MEMBER_LIMIT')
         return '成员席位数';
     if (hostCode === 'ACTIVATION_LIMIT_REACHED')
-        return 'activation 池大小';
+        return ' activation 池大小';
     return '上限';
 }
 /** 观测到的两个上限（`max_members`/`max_active_subagents`）。 */
@@ -2357,7 +2368,12 @@ async function runLocked(params) {
                             reason: capacityFailureReason(intentName, hostCode, spawned.reason, observed),
                             nextStep: capacityFailureNextStep(intentName, hostCode, observed),
                             phase: 'member_ready',
-                            extra: { member: intent.name },
+                            // T19：席位满（`TEAM_MEMBER_LIMIT`）没有写下成员行，这个名字在名册里**不存在**；
+                            // 回执点名它就是承诺一个不存在的对象。焚烧类（activation 池满 / 认不出的码）才点名。
+                            // 不点名只能**不带这个键**：`$defs.failureData.member` 是 `$defs/text`
+                            // （`string` / `minLength:1`），写 `null` 会让整封回执过不了 `$defs.result`，
+                            // 入口会把它换成 `RECOVERY_REQUIRED`（T19 用例钉住了这一点）。
+                            extra: capacityRefusalBurned(hostCode) ? { member: intent.name } : {},
                             diagnostics: capacityFailureDiagnostics(code, intentName, hostCode, observed),
                         });
                     }

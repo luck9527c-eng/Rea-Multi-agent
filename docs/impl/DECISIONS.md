@@ -584,3 +584,29 @@ provisioning 行之后抛，于是注入的 `TEAM_MEMBER_LIMIT` 也留下一个 
 `used` 顶到 ≥ 1；真实前提是「席位满只可能在 `used >= maxMembers >= 1` 时发生」，所以现在预置一名队友，
 T18b-5 的 `used_at_observation` 如实改为 `1`）。
 
+### 补记（T19，2026-10-30）：非焚烧类拒绝的**措辞**与**回执字段**
+
+> ticket 的 T19 段（[`tickets/T19-T20-diagnostics-and-render.md`](tickets/T19-T20-diagnostics-and-render.md)）。
+> 实现：`src/dispatch.ts`（`openCapacityGate()` 的拒绝文案、容量碰撞回执的 `member`、`parsedLimitDimension()`）。
+> 用例：`test/t19-refusal-wording.test.mjs`（T19-1…5）。
+
+1. **闸门拒绝文案按「上限是哪类拒绝教会的」分支**（`openCapacityGate()` 重读观测值那一段）：
+   - `basis.host_code === 'TEAM_MEMBER_LIMIT'`（什么都没烧）→
+     「宿主会在写成员行之前拒绝，名字与席位都不会被占用（同名重试仍然合法，T18c）」；
+   - `ACTIVATION_LIMIT_REACHED` 与认不出的码 → 保留原文「不再创建成员（避免再烧一个名字与席位）」。
+   判断仍只走 `capacityRefusalBurned()`（T18c 的唯一判断点），不新增第二套口径。
+2. **`data.member` 只在焚烧类出现。** `TEAM_MEMBER_LIMIT` 没有写下成员行，回执点名 `rt-cross-check`
+   等于承诺一个名册里不存在的对象；因此非焚烧类回执**不带** `member` 键，焚烧类照旧点名。
+   **不能写 `member: null`**（ticket 的原文写法）：`$defs.failureData.member` 是 `$defs/text`
+   （`string` / `minLength:1`），`null` 过不了 `$defs.result`，入口 `index.ts` 会把整封回执换成
+   `RECOVERY_REQUIRED` —— 比原来的虚报更糟。T19-1 用入口同一条 `validateInput(schemaDefs,'result',…)`
+   把这个形状钉住；要改成字面 `null`，必须先让规格允许（`docs/specs/**` 由 Lead 维护）。
+   上面「落地口径」表里「`data.member` 点名被烧的成员」一行按本条收窄。
+3. **typo**：`解析出的activation 池大小准确值` → `解析出的 activation 池大小准确值`
+   （`parsedLimitDimension()` 对 Latin 开头的维度自带分隔空格；同一句里的
+   「宿主消息里的 activation 池大小」也一并修正）。
+4. **本票没动、但同样属于「看起来像虚报」的两处**（另立票，不要顺手改）：
+   `capacityMarkerGuard()` 的「现在再派发可能再撞一次、再烧一个成员名与席位」与
+   `capacitySourceGap('unknown')` 的「最多烧一个成员名与席位」—— 席位满一样烧不着。
+   另外非焚烧类拒绝的回执仍带 `phase: 'member_ready'`（成员行其实没写），改它等于改阶段机语义。
+
