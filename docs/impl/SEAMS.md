@@ -1,0 +1,172 @@
+# 接缝定义（Lead 定义，实现方遵守）
+
+> 这份文件把「谁调谁、传什么」钉死，让 T4/T5/T6/T7 可以并行实现而不互相等。
+> 任何一方要改接缝，先报 Lead 改本文件，不要在代码里私改签名。
+
+## 1. 装配上下文 `ctx`
+
+`index.js`（T2）为每个工具调用组装一次上下文并交给 handler：
+
+```js
+/** @typedef {object} HandlerCtx */
+const ctx = {
+  deps,        // { envelope, errors, validate, paths, atomic, lock, identity, operation, audit,
+               //   catalog, capability, capacity, teamAdapter, projectAdapter, compatibility,
+               //   binding, contract, resources, submission, anchors, baseline,
+               //   clock, fs }  —— 尚未实现的键为 null
+  exec,        // 宿主执行上下文原样携带；身份只能从它取
+  services,    // { agentTeams?, tools? } —— 宿主可选注入，缺为 undefined
+  config,      // { defaults, presetId, bundleRoot }
+  now,         // () => number(ms)
+};
+```
+
+handler 形状（T2 固定，T5/T6/T7 实现）：
+
+```js
+export async function handleRoster(ctx, input)   // input 已通过对应 $defs 校验
+export async function handleDispatch(ctx, input)
+export async function handleConclude(ctx, input)
+// 三者都 resolve 为 { envelope }，绝不 reject。
+```
+
+`deps.clock`：`{ now(), isoNow() }`；测试可注入假时钟。`deps.fs`：`fs/promises` 的薄封装（测试可注入内存实现），至少含 `readFile/writeFile/rename/mkdir/stat/lstat/readdir/unlink/open`。
+
+### `ctx.services.tools`（宿主可选注入；T5/T6 只用来核对「执行者实际可见的工具名」）
+
+```js
+const tools = {
+  schemas(agent),   // → [{ name, description, parameters }, …]（**数组**，工具名在元素的 .name 上）
+  get(name, agent), // → 该工具的定义（含 name/parameters/execute）；不可见时 undefined
+}
+```
+
+`schemas()` 返回的是 **schema 对象数组**，**不是**「按名字为键的对象」：宿主 `dsh-tools` 的实现是
+`schemas(scope) { return [...visible.values()].map((d) => this.schemaOf(d, true)) }`，而 `schemaOf()`
+投影出 `{name, description, parameters}`（`run_code` 绑定循环也印证：`for (const schema of registry.schemas(exec.agent)) { … schema.name … }`）。
+对数组做 `Object.keys()` 只会得到 `["0","1",…]` —— T15 的 P0 就是替身按错的形状建模、真会话里
+每个能力族都判缺失、任何派发都被 `CAPABILITY_MISSING` 拒。名字解析**统一**走
+`capability.toolNamesFromSchemas()`（数组／`{function:{name}}` 变体／按名字为键的旧形状／任意可迭代；
+认不出一律给空集，不抛），不要在调用点再自己读一遍形状。
+
+### `deps` 的两种形状（已定，别再猜）
+
+| 键 | 形状 |
+|---|---|
+| `envelope`, `errors`, `validate`, `paths`, `atomic`, `lock`, `identity`, `operation`, `audit`, `catalog`, `capability`, `capacity`, `compatibility`, `binding`, `contract`, `resources`, `submission`, `anchors`, `baseline` | **模块命名空间**（`import * as envelope from './envelope.mjs'`），直接用其导出函数 |
+| `teamAdapter`, `projectAdapter` | **工厂函数**：`createTeamAdapter({ services, exec, config, deps })` / `createProjectAdapter({ services, exec, config, deps })`。**每次工具调用新建一次**，把当次的 exec/services/config 绑进去；不跨调用复用实例 |
+
+`identity.resolveCaller(ctx)` 内部用 `ctx.deps.teamAdapter.membership(ctx.exec.agent)` —— 下面 §3 的 `membership(agent)` 是**带 agent 参数**的，§2 里不重复写。
+
+## 2. `identity`（T1 提供）
+
+```js
+resolveCaller(ctx) -> Promise<
+  | { ok: true, role: 'lead' | 'teammate' | 'other', name: string|null, root: string|null }
+  | { ok: false, code: 'ROLE_REQUIRED' | 'TEAM_SERVICE_UNAVAILABLE', diagnostic }
+>
+```
+
+只读 `ctx.exec.agent` + `ctx.deps.teamAdapter.membership()`。**入参里的任何 `role` 字段一律忽略。**
+
+## 3. `teamAdapter`（T4 提供，薄封装宿主）
+
+所有方法 `async`，永不 reject；失败用 `{ok:false, code, reason?, retryable?}`。
+
+```js
+membership(agent)                        -> {ok, member?: {id, name, role, root}} | {ok:false, code}
+listMembers()                            -> {ok, members: [{id, name, role, status}]}
+spawnTeammate({name, prompt})            -> {ok, member} | {ok:false, code: 'CAPACITY_EXHAUSTED'|'ACTIVATION_LIMIT_REACHED'|..., retryable}
+sendMessage({target, message})           -> {ok} | {ok:false, code:'DELIVERY_FAILED', reason}
+interruptAgent({target})                 -> {ok, previousStatus: 'running'|'inactive'}
+usedSeats()                              -> {ok: true, used: number} | {ok: false, used: null, code, reason, nextStep}
+createTask({subject, description, blockedBy}) -> {ok, task} | {ok:false, code}
+updateTask({taskId, expectedRevision, action, owner?}) -> {ok, task} | {ok:false, code:'REVISION_CONFLICT'|'TEAM_TASK_*'}
+getTask(taskId)                          -> {ok, task} | {ok:false, code}
+listTasks()                              -> {ok, tasks: []}
+```
+
+`task` 统一投影为 `{id, revision, status: 'pending'|'in_progress'|'completed', owner: string|null, subject, description, blockedBy: []}`。
+
+**`usedSeats()` 只回答一件能数到的事**（T23 起替换原来的 `capacity()`，见 [DECISIONS.md](DECISIONS.md) D41）：
+
+- `used` 恒为 `listMembers().filter(r => r.role === 'teammate').length`，**包含失败成员**（它们占着名册行）。
+- 数不到就是 `used: null` + 一条原因（服务缺席 / 没有活 agent / `listMembers` 失败），**不回落成 0**。
+- **没有** `total` / `remaining`，也**不读**任何容量声明：宿主不提供上限读数（`maxMembers` 是 `TeamService` 的
+  构造函数参数，没有 getter；`maxActiveSubagents` 在团队服务里不存在）。上限的唯一体现是宿主自己拒绝时抛的
+  `TEAM_MEMBER_LIMIT` / `ACTIVATION_LIMIT_REACHED`（适配器映射成 `CAPACITY_EXHAUSTED`，原话留在 `reason`）。
+- **禁止**：猜 8/16、读 `service.config` 或任何私有字段、用 `listChildren()` 算术当余额、**靠 spawn 试探余额**。
+
+## 4. `projectAdapter`（T4 提供，跑项目 skill 的真实 CLI）
+
+```js
+probe({projectRoot})   -> {ok, compatibility: {projectRoot, indexPresent, configPresent, skillCopyPresent,
+                                               hasTeamRules, pythonOk, versions:{...},
+                                               ruleDigest, scriptDigest, catalogDigest},
+                           gaps: [ {code, detail, nextStep} ]}
+seal({runId})          -> {ok, alreadySealed: boolean, stdout, exitCode}
+impact()               -> {ok, json, exitCode}      // 解析 skill 的 JSON 输出
+index()                -> {ok, json, exitCode}
+check({hashes, complete}) -> {ok, json, exitCode, failures: []}
+auditScope()           -> {ok, json, exitCode}
+readRoute(routeId)     -> {ok, route} | {ok:false, code:'PROJECT_NOT_CONFIGURED'}
+readRun(runId)         -> {ok, run}
+readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
+```
+
+**CLI 事实（已核对 `reverse-project-management`，详见 `D:\workSpace\rea-ma-notes\E3-project-skill.md`）：**
+
+- 只有 7 个子命令：`init | index | check | impact | audit-scope | probe | seal`。**没有** `run/route/condition/env/complete`；`--complete` 是 `check` 的 flag。
+- **没有 `--json` 开关**。可解析的只有：`check`（单行 JSON）、`impact`（pretty JSON）、`audit-scope`（pretty JSON）。`init/index/seal` 是文本，只当诊断保留。`seal` 的 stdout 形如 `Sealed <RUN>; ...`。
+- 退出码：`0` 成功；`1` 任意校验/IO 错误且 stderr 有 `ERROR: <text>`（**fail-fast，只报第一条**）；`2` argparse 用法错误。
+- **写策略**：只有 `init/index/seal/probe --output` 写文件。`routes/runs/conditions/disputes/targets/project.json` 是**普通 JSON 文件，由本插件直接读写**，CLI 只校验它们。所以 `readRoute/readRun/readSeals` 直接读文件，不走 CLI；`check`/`impact`/`audit-scope` 只读不写。
+- `seal` 是**一次性**：`re/seals/runs/<RUN>.json` 与 `re/seals/targets/T-*.json`（不存在才建）。已有封存只校验复用，重复 seal 不得覆盖。
+- `init` 在已有任何 target 时**拒绝**（退出 1），所以插件永不自动 init 已有项目。
+- `python` 与 `project.py` 的实际路径**必须从项目配置/探测得到**，不硬编码；Node 侧用 `child_process.spawn` 传参数组，**不拼 shell 字符串**。
+
+脚本失败一律 `{ok:false, ...}` 并保留 `stdout/stderr/exitCode`，**不得抛异常**，不得把脚本失败当成路线证死。
+
+**已核对的 CLI 硬事实（补充，来自 `D:\workSpace\rea-ma-notes\E3-project-skill.md`，实现必须照做）：**
+
+1. **脚本位置**：`project.py` 用扁平 import（`governance.py`/`impact.py`/`integrity.py`），**必须**从项目副本内调用：`<root>/.agents/skills/reverse-project-management/scripts/project.py`，并用 `python -B`。不能从全局 skill 目录跑项目。
+2. **解释器**：优先用项目配置里 pin 的解释器，其次 PATH 上的 `python`；实际用了哪个必须记进 `compatibility`/诊断（本机存在 3.15.2 与 3.12.14 两个，不能含糊）。
+3. **顺序不可换**：写记录 → `seal` → `index` → `check --hashes` →（项目完成时）`check --hashes --complete`。**`check` 会校验 INDEX 导航区字节相等，所以 `index` 必须在 `check` 之前**。`impact`/`audit-scope` 只做派生，不做校验。
+4. **`seal` 语义**：先对整个项目跑带哈希的校验，**通过后用 `O_EXCL` 写** `re/seals/targets/*.json` 与 `re/seals/runs/*.json`。`execution_sha256` = `run.json` 去掉 `state` 后的规范 JSON 哈希 —— 封存后**只允许改 `state`**。已有 seal 一律校验复用，**绝不重封**；更正走新 RUN。
+5. **`check --hashes --complete`** 额外要求：**不允许存在任何 `active` 路线**。别把它当成"任务全完成就通过"。
+6. **`re/env/tools.json` 与 `ENV-tools-*.json` 目前没有生产者、也没有真实实例**：插件必须**容忍缺失**，按 `tool-discovery.md` 报 unknown/gap，不得因此崩、不得自己生成清单。
+7. **skill 不提供任何锁或事务**：`re/team/lock` 由本插件提供。
+8. **`re/team/**` 对 `index` 不可见**：只有 INDEX 的手写区能链接它，插件只能在那里追加指针。
+9. **`check` fail-fast，一次只报第一条违规**：诊断里要保留原文，不要假装有聚合报告。
+
+`compatibility` 里的 `ruleDigest/scriptDigest/catalogDigest` 是绑定用的内容摘要，**不是**独立可信签名。
+
+## 5. 测试替身（T4 提供，T5/T6/T7 使用）
+
+- `test/helpers/fake-team.mjs` —— **契约级**替身，实现第 3 节全部方法，并**真实复刻状态机**：create→`pending` 且无 owner；`updateTask(action=reassign, owner)` → `in_progress`；`complete` 只在 `in_progress` 且调用者为 owner 或 Lead 时成功；`blockedBy` 未完成不可 claim → `TEAM_TASK_BLOCKED`；重复认领 → `TEAM_TASK_ALREADY_CLAIMED`；`expectedRevision` CAS 不匹配 → `REVISION_CONFLICT`；席位上限 → `CAPACITY_EXHAUSTED`；成员失败后其任务仍被占用。另支持注入故障点（每次宿主调用前/后可抛）。
+- `test/helpers/fake-project.mjs` —— 项目管理替身，实现第 4 节；可注入每个子命令的退出码/输出/延迟。
+- `test/helpers/host.mjs` —— 装配假 `ctx`（假 exec/agent/agentTeams/deps），让 handler 单测一行起。
+
+## 6. 错误映射
+
+内部分支优先用 `errors.mjs` 的稳定码。适配器把宿主/脚本错误映射到稳定码；无法映射时用 `RECOVERY_REQUIRED` 并保留原始信息在 `diagnostics`。**不允许**把宿主异常字符串直接当 `code` 返回。
+
+## 7. 状态归属
+
+| 状态 | 唯一权威 |
+|---|---|
+| 成员/任务/名册 | 宿主（`teamAdapter`）；本地只做恢复关联 |
+| `re/team/binding.json`、`roster.json`、`dispatches/`、`receipts/`、`audit.jsonl`、`capabilities.json`、`resources.json`、`lock` | 本插件（`atomic` + `lock`） |
+| `re/team/operations/<operation_id>.json` | 本插件（T1 的 `operation` 台账落盘位置；`$defs.id` 保证文件名安全） |
+| `re/targets.json`、`re/routes/`、`re/runs/`、`re/conditions/`、`re/project.json`、`re/env/`、`re/seals/`、`INDEX.md` | 项目 skill（本插件只经 `projectAdapter` 调用，不自己重写算法） |
+
+> **没有容量声明这一行**：T23 删除了 `re/team/capacity.json` 与 `profile config.capacity` 的读取
+> （DECISIONS D41）—— 宿主的上限不可读，本插件也不再从任何文件推断它。
+>
+> **`re/team/roster.json` 不是成员表。** 它在 `rt_roster(bind)` 时写一次，内容是**当时的绑定计划快照**
+> （`template`、`posts`），其中 `members` 与 `tasks` **按构造恒为 `[]`**
+> （`src/roster.ts` 的 `writeRoster` 调用点），之后**永不更新**。要看真实成员与任务，读宿主
+> （`rt_roster` 的 `data`），**不要读这个文件**——按上表第一行，名册的权威从来不在本地。
+> 另外 `rosterData` 自 T25 起**没有** `capacity` 与 `recommended_members` 这两个键
+> （规格已删，D41 的落地面表相应作废）：本地快照与 `rt_roster` 返回都不再带它们。
+> 实测依证：7 名成员之后它仍是 `members: []`
+> （[第三轮记录 §4 N3](../verify/records/20261030-session-c7189ebb.md)）。

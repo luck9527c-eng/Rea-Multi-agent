@@ -1,0 +1,368 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "defaults": {
+    "max_posts": 6,
+    "timebox_ms": 1800000,
+    "delivery_timeout_ms": 60000,
+    "wait_timeout_ms": 30000
+  },
+  "capabilities": {
+    "shell": {
+      "any_tool": [
+        "pwsh",
+        "bash"
+      ],
+      "binding_required": false
+    },
+    "fs": {
+      "all_capabilities": [
+        "file-read",
+        "file-write"
+      ],
+      "binding_required": false
+    },
+    "search": {
+      "all_capabilities": [
+        "path-search",
+        "text-search"
+      ],
+      "binding_required": false
+    },
+    "jobs": {
+      "all_capabilities": [
+        "job-list",
+        "job-output",
+        "job-kill"
+      ],
+      "binding_required": false
+    },
+    "web": {
+      "all_capabilities": [
+        "web-fetch",
+        "web-search"
+      ],
+      "binding_required": false
+    },
+    "skill": {
+      "any_tool": [
+        "skill"
+      ],
+      "binding_required": false
+    },
+    "binary-static": {
+      "any_tool": [],
+      "binding_required": true
+    },
+    "binary-dynamic": {
+      "any_tool": [],
+      "binding_required": true
+    },
+    "browser": {
+      "any_tool": [],
+      "binding_required": true
+    },
+    "db": {
+      "any_tool": [],
+      "binding_required": true
+    },
+    "web-recon": {
+      "all_capabilities": [
+        "web",
+        "fs",
+        "search"
+      ],
+      "binding_required": false
+    },
+    "file-read": {
+      "any_tool": [
+        "read"
+      ],
+      "binding_required": false
+    },
+    "file-write": {
+      "any_tool": [
+        "write"
+      ],
+      "binding_required": false
+    },
+    "path-search": {
+      "any_tool": [
+        "glob"
+      ],
+      "binding_required": false
+    },
+    "text-search": {
+      "any_tool": [
+        "grep"
+      ],
+      "binding_required": false
+    },
+    "job-list": {
+      "any_tool": [
+        "job_list"
+      ],
+      "binding_required": false
+    },
+    "job-output": {
+      "any_tool": [
+        "job_output"
+      ],
+      "binding_required": false
+    },
+    "job-kill": {
+      "any_tool": [
+        "job_kill"
+      ],
+      "binding_required": false
+    },
+    "web-fetch": {
+      "any_tool": [
+        "web_fetch"
+      ],
+      "binding_required": false
+    },
+    "web-search": {
+      "any_tool": [
+        "web_search"
+      ],
+      "binding_required": false
+    }
+  },
+  "posts": [
+    {
+      "id": "triage",
+      "display_name": "目标分流",
+      "priority": 20,
+      "focus": "核对目标身份、结构与可执行的下一轮问题",
+      "required": [
+        "shell",
+        "fs",
+        "search"
+      ],
+      "optional": [
+        "binary-static"
+      ],
+      "anchors_required": [
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "以工具失败或空搜索直接宣告证死"
+      ]
+    },
+    {
+      "id": "binary-static",
+      "display_name": "二进制静态",
+      "priority": 30,
+      "focus": "围绕具体问题定位模块、函数、数据和交叉引用",
+      "required": [
+        "shell",
+        "fs",
+        "binary-static"
+      ],
+      "optional": [
+        "search"
+      ],
+      "anchors_required": [
+        "binary_location",
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "把反编译推断直接登记为观察事实"
+      ]
+    },
+    {
+      "id": "binary-dynamic",
+      "display_name": "运行时验证",
+      "priority": 40,
+      "focus": "验证触发、观测链、运行时状态及对照",
+      "required": [
+        "shell",
+        "fs",
+        "jobs",
+        "binary-dynamic"
+      ],
+      "optional": [],
+      "anchors_required": [
+        "runtime_event",
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "未经资源分配附加共享目标",
+        "把中断 agent 当成目标已恢复"
+      ]
+    },
+    {
+      "id": "protocol",
+      "display_name": "协议与 IPC",
+      "priority": 50,
+      "focus": "对已授权采集的通信记录定位字段、时序与边界",
+      "required": [
+        "shell",
+        "fs",
+        "search"
+      ],
+      "optional": [
+        "binary-dynamic"
+      ],
+      "anchors_required": [
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "从岗位名称推定已经具备抓包或重放能力"
+      ]
+    },
+    {
+      "id": "web-recon",
+      "display_name": "Web 侦察",
+      "priority": 20,
+      "focus": "保存页面、指纹与公开资源的可核验观察",
+      "required": [
+        "web-recon"
+      ],
+      "optional": [
+        "browser"
+      ],
+      "anchors_required": [
+        "web_capture",
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "执行 Web 攻击动作",
+        "只以临时 URL 作为长期证据"
+      ]
+    },
+    {
+      "id": "web-bundle",
+      "display_name": "前端 bundle",
+      "priority": 30,
+      "focus": "在保留字节身份的 bundle 中定位模块、函数和调用关系",
+      "required": [
+        "shell",
+        "fs",
+        "search"
+      ],
+      "optional": [
+        "web"
+      ],
+      "anchors_required": [
+        "source_location",
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "不保存生成物就引用会变化的线上行号"
+      ]
+    },
+    {
+      "id": "web-api",
+      "display_name": "接口发现",
+      "priority": 40,
+      "focus": "从已保存资源与观察记录提取接口线索并区分已观察和待验证",
+      "required": [
+        "fs",
+        "search",
+        "web"
+      ],
+      "optional": [
+        "browser"
+      ],
+      "anchors_required": [
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "执行重放、注入、越权或凭据管理",
+        "把字符串命中当成接口可用证明"
+      ]
+    },
+    {
+      "id": "cross-check",
+      "display_name": "证据交叉核查",
+      "priority": 10,
+      "focus": "检查已有证据的目标、来源、独立性和替代解释，交回核查建议",
+      "required": [
+        "fs",
+        "search"
+      ],
+      "optional": [
+        "shell"
+      ],
+      "anchors_required": [
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "替 Lead 验收或修改正式路线",
+        "把同源导出累计为独立验证"
+      ]
+    },
+    {
+      "id": "environment",
+      "display_name": "环境诊断",
+      "priority": 5,
+      "focus": "诊断下一条路线的具体工具或连接缺口",
+      "required": [
+        "shell",
+        "fs"
+      ],
+      "optional": [
+        "web"
+      ],
+      "anchors_required": [
+        "artifact_locator"
+      ],
+      "prohibited": [
+        "为齐全批量安装无关工具",
+        "从诊断任务推定额外系统变更已获授权"
+      ]
+    },
+    {
+      "id": "web-attack",
+      "display_name": "Web 攻击预留",
+      "priority": 100,
+      "focus": "仅作未实现能力的显式占位",
+      "enabled": false,
+      "disabled_reason": "v0 不实现 Web 攻击动作",
+      "required": [],
+      "optional": [],
+      "anchors_required": [],
+      "prohibited": []
+    }
+  ],
+  "templates": {
+    "binary": [
+      "triage",
+      "binary-static",
+      "binary-dynamic",
+      "cross-check"
+    ],
+    "game": [
+      "triage",
+      "binary-static",
+      "binary-dynamic",
+      "protocol",
+      "cross-check"
+    ],
+    "webapp": [
+      "web-recon",
+      "web-bundle",
+      "web-api",
+      "cross-check"
+    ],
+    "mixed": {
+      "composition": "union_by_post_id",
+      "min_target_kinds": 2
+    }
+  },
+  "on_demand_posts": [
+    "environment"
+  ],
+  "reserved_posts": [
+    "web-attack"
+  ],
+  "capability_defaults_source": {
+    "dsh_version": "0.2.1-rc.3",
+    "reference": "docs/reviews/2026-10-29-dsh-interface-check.md",
+    "note": "Exact default names verified in docs/tool-catalog.md at the target Desktop release tag; actual Agent registrations and project overrides remain authoritative.",
+    "tag": "dsh-v0.2.1-rc.3",
+    "commit": "1f81c047fc48fa190a683e469daa699857e9afe8"
+  }
+}

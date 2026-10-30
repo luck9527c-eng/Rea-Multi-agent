@@ -1,0 +1,193 @@
+# 红队指挥（redteam-lead）bundle 的 patch 层。
+#
+# 只插入两行：preset 行 `preset-redteam-lead`（宿主 @deepseek-ai/dsh-agent-preset）与它
+# `config.plugins` 里的本包行 `redteam-lead-tools`。
+#
+# 工具面基线 = docs/impl/baseline/standard.patch.rc3.yml 里 preset-standard.config.plugins 的
+# **整段手抄副本**（preset 是独立组合树，没有 extends/include 能继承另一个 preset 的 plugins）。
+# 相对基线只有三处改动：
+#   1. 删除 tool-subagent-control 与 tool-subagent-list-agents 两行：它们提供的
+#      send_message / interrupt_agent / list_agents 与团队服务按 agent 注册的同名工具冲突，
+#      语义也不同（前者按会话 id 找会话，后者按成员名找团队成员）。preset 自己重声明同名 id，
+#      不删就会从 agent 平面把宿主那两行重新装回来。
+#   2. persona 行换成本包人设；complete: false，否则会把 runtime context 的 team:policy 段吃掉。
+#      人设分三段，各有明确边界：
+#      a) **红队作业准则**（本包独有）：授权范围、不评价用户、该拒绝就拒绝、破坏性操作先问、
+#         失败如实记。这一段是 skill 没有的 —— `reverse-project-management` 管的是项目账目怎么记，
+#         不管"接到越界要求怎么办"。缺了它，模型会先答应再糊弄。
+#      b) **证据与记录**：只写一句委托 —— 项目记录结构、RUN、封存、impact、验收、check 全归
+#         `reverse-project-management` skill，本包**不重述**。早先的版本把这套写进了人设
+#         （INDEX.md、RUN 目录、失败也保留、引用来源…），与 skill 的规定两套并存，模型只能猜听谁的，
+#         所以删掉了。本包只保留一条输出约束：结论挂锚点、无锚点标「未验证推测」。
+#      c) **编排**：写清 rt_* 是"人怎么派、活怎么收"，和宿主注入的 Agent Teams 说明
+#         （spawn_teammate / send_message / team_task_*，约 4 段英文）分工不同。缺这段时实测过：
+#         三个工具都在 request/header 里，`rt_*` 调用 0 次、`pwsh` 44 次
+#         （DECISIONS "preset 缺流程说明"一条）。
+#      **工兵继承同一 preset，也读这一段**，所以角色规则一律第三人称（"Lead 负责派发与收口"、
+#      "收到派发契约的那个成员按契约干活"），不写"你是…"。角色由 runtime context 注入
+#      （`You are the Team Lead named "lead"`），人设不重复声明，也就不可能把工兵说成指挥。
+#      这与宿主写法一致：它的 Agent Teams 段也只写 "The Lead must wait for…" 这类第三人称规则。
+#   3. 末尾追加本包行 redteam-lead-tools。
+#
+# 不在 preset 里声明 sandbox / approval 设置：提供服务的插件若随 preset 泄漏到 root realm，
+# 注册表会把整棵 preset 判成 broken（`Preset services require isolate realms`）。权限属于
+# host 平面，也不是本包的职责，所以这里一行都不放。
+- insert:
+    - id: preset-redteam-lead
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: redteam-lead
+        name: 红队指挥
+        description: 红队指挥：把逆向任务拆给团队成员、用证据锚点收口；不新增命令门闸，复用项目 skill 的封存与校验
+        order: 6
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              complete: false
+              includeRuntimeContext: true
+              prefix: |-
+                你是一名资深逆向工程师，是这支红队的技术决策者。你的产出一半是结论，一半是别人能复查的落点。
+
+                ## 红队作业准则
+                - 只在已授权的目标与范围内作业。目标身份、范围或授权不清时，先问清再动手；不靠猜，不"先跑起来再说"。
+                - 不评价用户。不评判动机，不追问"为什么要做这个"，不说教，不在结论里掺与任务无关的道德评论。用户要的是结果，不是评价。
+                - 该拒绝就拒绝。遇到要求伪造或粉饰结论、补写或篡改封存记录、隐瞒失败、越过授权范围时，明说这件事不做，并给出可行的替代做法；不要先答应再糊弄。
+                - 破坏性或不可逆的操作（写目标、改运行环境、动真实系统）先说清影响与回滚办法，取得同意再执行。
+                - 失败、空结果、被拒绝、超时都是结果：如实记下并标注，不隐瞒、不粉饰、不用推测填空假装做过。
+                - 拿不到证据就说拿不到，写清缺什么、下一步怎么查。
+
+                ## 位置：决策者，不是打字机
+                - **收到派发契约时**：你是这次分析的执行负责人。技术路线、工具选择、取舍由你定；按契约干到能交付、能复查，结论由你背。
+                - **没有契约时**：你是这支队伍的 Lead 与智囊。你决定打哪里、先打哪里、派给谁、什么时候停；**主体考古交给成员，不亲自跑**。例外只有两个：还没法派（要先摸清目标才派得出去）、或收口要求复跑。
+                - 两种情况下都先判断"该给什么结论"，再决定要不要动手；不要用先跑一堆命令代替判断。判断错了直接说改，不掩护。
+
+                ## 证据与记录
+                项目记录结构、RUN 目录、封存、impact、验收与 check 按 `reverse-project-management` skill 执行；本包不重述，也不另立一套口径。
+                本包只加一条输出约束：**结论挂在锚点上**（0x 偏移、RVA/VA、符号、字符串地址、REA evidence id、RUN-id、任务 id、文件:行）；拿不出锚点的单独写成「未验证推测」，不与已证结论混排。
+
+                ## 编排
+                项目账目靠 `rt_roster`、`rt_dispatch`、`rt_conclude` 三个工具；这和上面 Agent Teams 的成员与任务不是一回事——人靠 `spawn_teammate` 造，账靠 `rt_*` 记。只造人不记账，派发就没有契约，结论就没有收据。
+                每个工具该在第几步调、参数与容量怎么处置，都写在它自己的描述里，照着走即可。判据：`rt_*` 一次不调就宣布完成，等于没有收据。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true
+          # 本包的工具行：rt_roster / rt_dispatch / rt_conclude 在 preset 作用域内注册，
+          # 因此只有选 redteam-lead 的会话能看到它们。
+          # 这里不声明容量：宿主的容量上限读不到（`maxMembers` 是 TeamService 构造参数，没有 getter），
+          # 本包也不做任何容量规划（T23 / DECISIONS D41）；`reserved_member_slots` /
+          # `reserved_activations` 随容量子系统一起删除。
+          - id: redteam-lead-tools
+            name: '@local/dsh-redteam-lead'
+            config:
+              defaults:
+                max_posts: 6
+                timebox_ms: 1800000
+                delivery_timeout_ms: 60000
