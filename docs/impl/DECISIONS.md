@@ -466,7 +466,7 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 | 观测值文件 | `re/team/capacity-observed.json`：`{schema_version:1, session_id, observed_at, max_members, max_active_subagents, basis:{host_code, parsed_limit, used_at_observation, message}}`（`basis` 是四字段并集，T18b） |
 | 写入时机 | **只在**宿主因容量拒绝了一次**真实需要**的 spawn 之后（`CAPACITY_EXHAUSTED`）；绝不为了探测而派发 |
 | 观测中标记 | `re/team/capacity-observing.json`（spawn 前写、spawn 结束删；只在容量未知时写） |
-| 回执 | `status=partial`、`code=CAPACITY_EXHAUSTED`、`data.member` 点名被烧的成员；`hostCode` 与观测值落点写进诊断（D21：`failureData` 是封闭对象，细节只能进文本） |
+| 回执 | `status=partial`、`code=CAPACITY_EXHAUSTED`、`data.member` **只在焚烧类**点名被烧的成员（非焚烧类**不带该键**，不得写 `null`——见下方「裁决（Lead）：接受 T19 的 `member` 偏差」）；`hostCode` 与观测值落点写进诊断（D21：`failureData` 是封闭对象，细节只能进文本） |
 | 同名重试 | 写成员行**之后**才失败的（`ACTIVATION_LIMIT_REACHED` 与运行期故障）**禁止**（D12），失败分支不重试，下一次派发自然用 `-2`；`TEAM_MEMBER_LIMIT` 在写成员行**之前**就拒绝，名字仍空闲，容量解决后可用同名（T18c，见补记） |
 | 免拒绝范围 | 只有 `capacity_source === 'unknown'`；**已声明**容量（项目/调用/观测）仍按原预算裁剪，行为不变 |
 
@@ -609,4 +609,17 @@ T18b-5 的 `used_at_observation` 如实改为 `1`）。
    `capacityMarkerGuard()` 的「现在再派发可能再撞一次、再烧一个成员名与席位」与
    `capacitySourceGap('unknown')` 的「最多烧一个成员名与席位」—— 席位满一样烧不着。
    另外非焚烧类拒绝的回执仍带 `phase: 'member_ready'`（成员行其实没写），改它等于改阶段机语义。
+
+### 裁决（Lead，2026-10-30）：接受 T19 的 `member` 偏差，不放宽规格
+
+ticket 写的是「非焚烧类给 `member: null`」，**这条 ticket 要求本身是错的**：`$defs.failureData.member`
+为 `$defs/text`，而入口按 `$defs.result` 校验整封回执，字面 `null` 会把回执整体降级成 `RECOVERY_REQUIRED`
+（`data: null`）—— 比原来那句虚报更糟。验收口径取「**不带 `member` 键**」为「不点名」的唯一合法形式。
+
+- **不放宽 `docs/specs/**`。** 为一个字段的写法去动 wire 契约，成本远大于收益；后续票不得以「规格允许 null」为由改动。
+- T19-1 用入口同一条 `validateInput(schemaDefs,'result',…)` 钉住该形状，谁改回 `null` 即红。
+- 记录人：T19；裁决人：Lead。本裁决**终结**该偏差，不再讨论。
+
+> 顺带记一条方法教训：ticket 里只要出现「给某个字段填 `null`」，必须先用**入口的校验器**跑一遍形状再写进票里。
+> 这次是子代理实测发现的，不是设计时发现的。
 
