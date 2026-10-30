@@ -7,7 +7,7 @@
  * 覆盖 T5 验收清单：
  * 1. inspect 三类身份分支 + 拒绝时零副作用（`spawnTeammate`/`createTask` 零调用、`re/team/` 无新文件
  *    —— 含审计：契约「roster inspect 不落盘」）；
- * 2. 未传 target_kinds 不猜类别、recommended_members=0；
+ * 2. 未传 target_kinds 不猜类别、posts/gaps 为空（T25：不再有 recommended_members）；
  * 3. gaps 区分缺工具（vacant）/未知能力/预算延后（deferred）/disabled；
  * 4. 工具可见性取自实际执行者（Lead 与 teammate 看到不同工具集 → vacant 不同）；
  * 5. bind 前必须 inspect 且 proposal_hash 匹配；过期/篡改被拒且不写盘；
@@ -148,15 +148,9 @@ test('inspect 作为 Lead：给出可核对提议，且不创建成员/任务、
     ])
   }
 
-  assert.equal(envelope.data.recommended_members, 2)
-  // T23：容量四字段是 wire 必备键，但本插件不再做容量规划 —— 一律「未知 / 不预留」。
-  assert.deepEqual(envelope.data.capacity, {
-    remaining_member_slots: null,
-    remaining_activations: null,
-    reserved_member_slots: 0,
-    reserved_activations: 0,
-  })
-  assert.equal(JSON.stringify(envelope.data).includes('"known"'), false, 'D19：known 不得上线')
+  assert.equal(Object.hasOwn(envelope.data, 'recommended_members'), false, 'T25：建议人数键已删除')
+  // T25：容量四字段已从 wire schema 删除，不再有「未知 / 不预留」的占位对象。
+  assert.equal(Object.hasOwn(envelope.data, 'capacity'), false, 'T25：capacity 已从 rosterData 删除')
   // 已用席位改成一条普通诊断（不参与判定）。
   const seats = envelope.diagnostics.find((entry) => entry.code === 'TEAM_SEATS_USED')
   assert.ok(seats, '名册必须报出「现在用了几个席位」')
@@ -247,12 +241,10 @@ test('inspect 未传 target_kinds：只做环境检查，不猜类别、不提�
   assert.equal(envelope.data.action, 'inspect')
   assert.equal(envelope.data.compatibility, 'compatible')
   assert.deepEqual(envelope.data.posts, [])
-  assert.equal(envelope.data.recommended_members, 0)
   assert.equal(envelope.data.proposal_hash, null)
   assert.equal(envelope.data.binding_ref, null)
-  assert.deepEqual(Object.keys(envelope.data.capacity).sort(), [
-    'remaining_activations', 'remaining_member_slots', 'reserved_activations', 'reserved_member_slots',
-  ])
+  assert.equal(Object.hasOwn(envelope.data, 'capacity'), false)
+  assert.equal(Object.hasOwn(envelope.data, 'recommended_members'), false)
   assert.deepEqual(changedKeys(before, await teamState(project.root)), [], 'inspect 不落盘')
 })
 
@@ -285,7 +277,11 @@ test('inspect 的 gaps 区分：缺工具、未就绪 provider、max_posts 延�
   assert.equal(posts.get('binary-static').state, 'vacant')
   assert.equal(posts.get('web-attack').state, 'disabled')
   assert.ok([...posts.values()].some((post) => post.state === 'deferred'), '超出 max_posts 的岗位应被延后')
-  assert.equal(envelope.data.recommended_members, 1)
+  assert.equal(
+    envelope.data.posts.filter((post) => post.state === 'assigned' && post.member === null).length,
+    1,
+    'max_posts=1 时只有一个岗位能新建成员',
+  )
 })
 
 test('执行者注册表是数组形状（宿主真实形状）时 shell/fs/search 三项全部匹配', async (t) => {
@@ -308,7 +304,7 @@ test('执行者注册表是数组形状（宿主真实形状）时 shell/fs/sear
   // triage 要求 shell+fs+search，cross-check 要求 fs+search：三项都匹配才可能 assigned。
   assert.equal(posts.get('triage').state, 'assigned', `triage 应当是 assigned：${posts.get('triage').reason}`)
   assert.equal(posts.get('cross-check').state, 'assigned', `cross-check 应当是 assigned：${posts.get('cross-check').reason}`)
-  assert.equal(envelope.data.recommended_members, 2)
+  assert.equal(envelope.data.posts.filter((post) => post.state === 'assigned' && post.member === null).length, 2)
 
   // 不得再把「注册表」判成不可用，也不得再报 shell/fs/search 缺工具。
   assert.equal(
@@ -384,7 +380,7 @@ test('mixed 模板按并集出岗（game+webapp）', async (t) => {
   assert.equal(new Set(envelope.data.posts.map((post) => post.post_id)).size, envelope.data.posts.length)
 })
 
-test('inspect 复用已有成员时不计入 recommended_members', async (t) => {
+test('inspect 复用已有成员：复用的岗位不再算「需要新建」', async (t) => {
   const project = makeTempProject({ t })
   // 宿主里已有一个空闲成员 rt-triage，且 roster 把它挂在 triage 岗位上。
   const ctx = makeCtx({
@@ -410,34 +406,11 @@ test('inspect 复用已有成员时不计入 recommended_members', async (t) => 
   const posts = new Map(envelope.data.posts.map((post) => [post.post_id, post]))
   assert.equal(posts.get('triage').state, 'assigned')
   assert.equal(posts.get('triage').member, 'rt-triage')
-  // 只有 cross-check 需要新建成员；triage 是复用。
-  assert.equal(envelope.data.recommended_members, 1)
-  // T23：不再有「剩余余额」；已用席位只作一条诊断，不参与判定。
-  assert.equal(envelope.data.capacity.remaining_member_slots, null, '余额不可读，不假装知道')
+  // triage 是复用；cross-check 仍是一个需要新建成员的岗位（member=null）。
+  assert.equal(posts.get('cross-check').state, 'assigned')
+  assert.equal(posts.get('cross-check').member, null)
+  assert.equal(Object.hasOwn(envelope.data, 'capacity'), false)
   assert.ok(envelope.diagnostics.some((entry) => entry.code === 'TEAM_SEATS_USED' && /已用 1 席/u.test(entry.reason)))
-})
-
-test('传了已废止的容量参数 → 明说「收到但没用」，不静默忽略（T23）', async (t) => {
-  const project = makeTempProject({ t })
-  const ctx = leadCtx(t, project)
-  // wire schema 仍是 docs/specs 的副本，所以这几个键仍能通过校验；实现必须明说它们已废止。
-  const { envelope } = await handleRoster(ctx, input(project.root, {
-    target_kinds: ['binary'],
-    capacity: { max_members: 2, max_active_subagents: 2 },
-    reserved_member_slots: 0,
-    reserved_activations: 0,
-  }))
-  assert.equal(envelope.status, 'ok')
-  const note = envelope.diagnostics.find((entry) => entry.code === 'CAPACITY_ARGUMENT_OBSOLETE')
-  assert.ok(note, '必须有一条「已废止」诊断')
-  assert.match(note.reason, /capacity/u)
-  assert.match(note.reason, /reserved_member_slots/u)
-  assert.match(note.reason, /reserved_activations/u)
-
-  // 不参与任何判定：岗位与提议哈希都得和「不传」完全一致。
-  const plain = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
-  assert.deepEqual(envelope.data.posts, plain.envelope.data.posts)
-  assert.equal(envelope.data.proposal_hash, plain.envelope.data.proposal_hash, '废止参数不得进提议指纹')
 })
 
 // ---------------------------------------------------------------------------
@@ -607,7 +580,10 @@ test('proposal_hash 绑定 max_posts：上限一变就必须换提议', async (t
 
   const six = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
   assert.equal(six.envelope.status, 'ok')
-  assert.equal(six.envelope.data.recommended_members, 2)
+  // T25：wire data 不再有 recommended_members；等价判据是「assigned 且 member=null」的岗位数。
+  const newMemberPosts = (envelope) => envelope.data.posts
+    .filter((post) => post.state === 'assigned' && post.member === null).length
+  assert.equal(newMemberPosts(six.envelope), 2)
 
   const one = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'], max_posts: 1 }))
   assert.equal(one.envelope.status, 'ok')
@@ -616,7 +592,7 @@ test('proposal_hash 绑定 max_posts：上限一变就必须换提议', async (t
     six.envelope.data.proposal_hash,
     'max_posts 6→1 之后同一份提议不得还是同一个 hash',
   )
-  assert.equal(one.envelope.data.recommended_members, 1, 'max_posts 收到 1，只有一岗能新建成员')
+  assert.equal(newMemberPosts(one.envelope), 1, 'max_posts 收到 1，只有一岗能新建成员')
 
   const again = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'], max_posts: 6 }))
   assert.equal(
@@ -804,7 +780,7 @@ test('项目副本缺团队规则 → SKILL_INCOMPATIBLE，给出具体缺口且
   assert.equal(envelope.code, 'SKILL_INCOMPATIBLE')
   assert.equal(envelope.data.compatibility, 'blocked')
   assert.deepEqual(envelope.data.posts, [])
-  assert.equal(envelope.data.recommended_members, 0)
+  assert.equal(Object.hasOwn(envelope.data, 'recommended_members'), false)
   const gap = envelope.data.gaps.find((item) => item.code === 'TEAM_RULES_MISSING')
   assert.ok(gap, '必须点名具体缺口')
   assert.match(gap.reason, /team-coordination/u)
@@ -1173,7 +1149,7 @@ test('缺 Python / 非默认布局 → SKILL_INCOMPATIBLE，并点名具体缺�
   assert.match(layoutGap.reason, /legacy-flat/u)
 })
 
-test('适配器没绑 projectRoot 也照样工作：容量不再从项目文件读（T23）', async (t) => {
+test('适配器没绑 projectRoot 也照样工作：不再从项目文件读任何容量声明（T23/T25）', async (t) => {
   const project = makeTempProject({ t })
   const ctx = leadCtx(t, project)
   // 旧实现会在「项目里声明了容量、但适配器没绑根」时报 CAPACITY_DECLARATION_UNREAD。
@@ -1186,9 +1162,8 @@ test('适配器没绑 projectRoot 也照样工作：容量不再从项目文件�
 
   const { envelope } = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
   assert.equal(envelope.status, 'ok')
-  assert.equal(envelope.data.capacity.remaining_member_slots, null)
-  assert.equal(envelope.data.capacity.remaining_activations, null)
-  assert.equal(envelope.data.recommended_members, 2)
+  assert.equal(Object.hasOwn(envelope.data, 'capacity'), false)
+  assert.equal(envelope.data.posts.filter((post) => post.state === 'assigned' && post.member === null).length, 2)
   assert.equal(
     envelope.data.gaps.some((gap) => gap.code === 'CAPACITY_DECLARATION_UNREAD'),
     false,
@@ -1202,7 +1177,7 @@ test('适配器没绑 projectRoot 也照样工作：容量不再从项目文件�
 })
 
 // ---------------------------------------------------------------------------
-// 结构：所有信封都必须过 $defs.result（含 blocked/error，D19 的 capacity 封闭字段）
+// 结构：所有信封都必须过 $defs.result（rosterData 已不再声明容量字段）
 // ---------------------------------------------------------------------------
 
 const SCHEMA = JSON.parse(readFileSync(new URL('../../../docs/specs/rt-tools.schema.json', import.meta.url), 'utf8'))

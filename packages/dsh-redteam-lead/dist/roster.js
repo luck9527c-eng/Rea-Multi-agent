@@ -8,11 +8,10 @@
  *    本包必须自己做）。
  * 2. **inspect 零副作用**：不建成员、不建任务、不写 binding/roster，**也不写审计**
  *    （编排契约「roster inspect 不落盘」；审计只属于 bind/takeover 这类有后果的操作）。
- * 3. **不做容量规划**（T23 / D41）：宿主不提供上限读数，所以本模块只把**能力**与操作者的
- *    `max_posts` 投影成岗位状态；已用席位数作为一条普通诊断如实报出（来自 `listMembers`），
- *    **不**据此裁剪、不猜上限、不声称「还能开几个」。`rosterData.capacity` 的四个字段是 wire
- *    schema 的必备键（`docs/specs` 由 Lead 维护），这里一律填「未知」：`remaining_*` 为 `null`、
- *    `reserved_*` 为 0（本插件不再预留任何席位）。
+ * 3. **不做容量规划**（T23 / D41，T25 收尾）：宿主不提供上限读数，所以本模块只把**能力**与
+ *    操作者的 `max_posts` 投影成岗位状态；已用席位数作为一条普通诊断如实报出（来自
+ *    `listMembers`），**不**据此裁剪、不猜上限、不声称「还能开几个」。wire data 里也**没有**
+ *    `capacity` / `recommended_members` 了（T25 已从 schema 删除）。
  *
  * 提议哈希（`proposal_hash`）绑定：提议内容（岗位需求 + 目标类别 + `max_posts`）、岗位目录版本、
  * 能力映射版本、规则/脚本/目录摘要、以及**当前绑定**（epoch/session/team/摘要）。宿主**占用计数**
@@ -29,13 +28,6 @@ const OPERATION_ID = /^[a-z0-9][a-z0-9_-]{0,95}$/u;
 const LEAD_ONLY = new Set(['bind', 'takeover']);
 /** 只剩 `max_posts` 这一种「提议放不下」：宿主容量不在这里判（T23）。 */
 const POST_LIMIT_CODE = 'CAPACITY_EXHAUSTED';
-/**
- * 已随 T23 废止、但 wire schema 仍接受的入参名。
- *
- * `docs/specs/rt-tools.schema.json` 由 Lead 维护，本包不改；`$defs.rosterInput` 里这四个键还在，
- * 所以校验会放行。既然放行，就必须说清「收到了但没用」——静默丢掉等于让调用方以为上限生效了。
- */
-const OBSOLETE_CAPACITY_ARGS = ['capacity', 'reserved_member_slots', 'reserved_activations'];
 const ADAPTER_CONTRACT_VERSION = 1;
 /** `probe().gaps` 里「项目未按 skill 默认布局建好」的那一类 → PROJECT_NOT_CONFIGURED。 */
 const NOT_CONFIGURED_GAP_CODES = new Set([
@@ -395,7 +387,7 @@ function proposalHashOf(deps, fingerprint) {
         : (value) => JSON.stringify(value);
     return sha256Text(canonical(fingerprint));
 }
-/** `rosterData`（`$defs.rosterData` 的 12 个必备字段，多一个都不行）。 */
+/** `rosterData`（`$defs.rosterData` 的 10 个必备字段，多一个都不行）。 */
 function rosterDataOf(input) {
     return {
         action: input.action,
@@ -406,26 +398,10 @@ function rosterDataOf(input) {
         compatibility: input.compatibility,
         posts: input.posts,
         gaps: input.gaps,
-        capacity: input.capacity,
-        recommended_members: input.recommendedMembers,
         proposal_hash: input.proposalHash,
         binding_ref: input.bindingRef,
     };
 }
-/**
- * `rosterData.capacity`（D19：恰好 4 个字段，没有 `known`）。
- *
- * 这四个键是 wire schema 的必备字段（`docs/specs` 由 Lead 维护，本包不改），但本插件**不再做
- * 任何容量规划**：`remaining_*` 是「不知道」（宿主的 `maxMembers` 没有 getter），`reserved_*`
- * 是 0（不再预留席位）。填 `null` / `0` 而不是删字段 —— 既过得了 `$defs.rosterData`，
- * 也不假装知道余额。
- */
-const NO_CAPACITY_PLAN = Object.freeze({
-    remaining_member_slots: null,
-    remaining_activations: null,
-    reserved_member_slots: 0,
-    reserved_activations: 0,
-});
 /** 按目录优先级（priority 升序、同值 post_id 升序）输出岗位，便于人读与 diff。 */
 function orderPosts(entries, priorityOf) {
     const list = Array.isArray(entries) ? entries : [];
@@ -478,21 +454,6 @@ function seatsDiagnostic(env, used) {
     }
     return env.diagnostic('TEAM_SEATS_USED', `宿主成员名册当前已用 ${used} 席（role=teammate 的成员数，含失败成员；来自 listMembers）。`
         + '宿主不提供上限读数，也不告诉你还能开几个：能不能建由宿主自己决定', '按岗位能力与实际需要派人；宿主拒绝时 rt_dispatch 会报 CAPACITY_EXHAUSTED 并逐字带回宿主原话');
-}
-/** 传了已废止的容量参数时的一条诊断（没有就返回 `null`）。 */
-function obsoleteCapacityDiagnostic(env, names) {
-    if (names.length === 0)
-        return null;
-    return env.diagnostic('CAPACITY_ARGUMENT_OBSOLETE', `容量子系统已删除（T23/D41）：本次传入的 ${names.join('、')} 不参与任何判定，也不会被记住。`
-        + '宿主的席位/activation 上限没有读法：派发直接调 spawnTeammate，被拒时按宿主原话报 CAPACITY_EXHAUSTED', '去掉这些参数即可；岗位能不能派只看能力是否满足（与 max_posts 的岗位数上限）');
-}
-/** 成功信封上那两条「只陈述事实」的诊断：已用席位 + 废止参数。 */
-function rosterNotes(env, usedSeats, obsolete) {
-    const out = [seatsDiagnostic(env, usedSeats)];
-    const stale = obsoleteCapacityDiagnostic(env, obsolete);
-    if (stale !== null)
-        out.push(stale);
-    return out;
 }
 /**
  * 调 `capacity.planPosts`。
@@ -606,8 +567,6 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
         gaps,
         plan,
         usedSeats,
-        // 需要新建成员的岗位数（不含复用已运行成员的岗位）。它不再表示「预算内还能开几个」。
-        recommendedMembers: plan.assigned.filter((entry) => entry.member === null).length,
         capabilityVersion,
         budget,
         digests,
@@ -636,7 +595,6 @@ async function assembleEnvironmentOnly(ctx, deps, { root, session, request, comp
         gaps: dedupeDiagnostics([...gaps, ...plan.gaps]),
         plan,
         usedSeats: await usedSeatsFor(deps),
-        recommendedMembers: 0,
         proposalHash: null,
     };
 }
@@ -759,9 +717,6 @@ async function appendRosterAudit(deps, outcome) {
 async function runRoster(ctx, deps, input, env, action) {
     const operationId = sanitizeOperationId(input.operation_id);
     const kinds = stringList(input.target_kinds);
-    // T23：容量子系统已删除，但 wire schema 仍声明 `capacity` / `reserved_*`（`docs/specs` 由
-    // Lead 维护）。传了就如实说「收到但不参与决策」，不静默忽略 —— 否则「我声明了上限」是一句谎话。
-    const obsolete = OBSOLETE_CAPACITY_ARGS.filter((name) => input[name] !== undefined);
     const request = {
         action,
         kinds,
@@ -770,7 +725,6 @@ async function runRoster(ctx, deps, input, env, action) {
         recoveryRef: input.recovery_ref ?? null,
         // `Number.isInteger()` 对非数字恒为 false，补的类型判断不改变取默认值的边界。
         maxPosts: typeof input.max_posts === 'number' && Number.isInteger(input.max_posts) ? input.max_posts : 6,
-        obsolete,
         raw: input,
     };
     // 1. 身份（唯一来源；入参自报角色被忽略）。
@@ -831,8 +785,6 @@ async function runRoster(ctx, deps, input, env, action) {
             compatibility: 'blocked',
             posts: [],
             gaps,
-            capacity: NO_CAPACITY_PLAN,
-            recommendedMembers: 0,
             proposalHash: null,
             bindingRef: null,
         });
@@ -923,13 +875,11 @@ async function runRoster(ctx, deps, input, env, action) {
         compatibility: compatibility.status,
         posts: proposal.posts,
         gaps: proposal.gaps,
-        capacity: NO_CAPACITY_PLAN,
-        recommendedMembers: proposal.recommendedMembers,
         proposalHash: proposal.proposalHash,
         bindingRef: action === 'inspect' ? null : deps.binding.BINDING_PATH,
     });
-    // 「已用席位」与「废止参数」都只陈述事实：放在诊断里（不是 gaps），不参与任何判定。
-    const notes = rosterNotes(env, proposal.usedSeats, request.obsolete);
+    // 「已用席位」只陈述事实：放在诊断里（不是 gaps），不参与任何判定。
+    const notes = [seatsDiagnostic(env, proposal.usedSeats)];
     if (action === 'inspect') {
         audit.verdict = 'inspected';
         return { envelope: env.ok({ operationId: null, data, diagnostics: notes, retryable: false }), root, audit };
@@ -1106,8 +1056,6 @@ async function bindProject(ctx, shared) {
                             ...data,
                             posts: freshProposal.posts,
                             gaps: freshProposal.gaps,
-                            capacity: NO_CAPACITY_PLAN,
-                            recommended_members: freshProposal.recommendedMembers,
                         },
                         diagnostics: freshProposal.gaps.filter((gap) => gap.code === POST_LIMIT_CODE),
                     }),
@@ -1167,8 +1115,6 @@ async function bindProject(ctx, shared) {
                 posts: freshProposal.posts,
                 members: [],
                 tasks: [],
-                capacity: NO_CAPACITY_PLAN,
-                recommended_members: freshProposal.recommendedMembers,
                 created_at: now,
                 updated_at: now,
             };
@@ -1187,12 +1133,10 @@ async function bindProject(ctx, shared) {
                     ...data,
                     posts: freshProposal.posts,
                     gaps: diagnostics,
-                    capacity: NO_CAPACITY_PLAN,
-                    recommended_members: freshProposal.recommendedMembers,
                     binding_ref: deps.binding.BINDING_PATH,
                 },
-                // 已用席位 + 废止参数：bind 成功也照样交回（它们只陈述事实，不是缺口）。
-                diagnostics: rosterNotes(env, freshProposal.usedSeats, request.obsolete),
+                // 已用席位只陈述事实：bind 成功也照样交回（它不是缺口）。
+                diagnostics: [seatsDiagnostic(env, freshProposal.usedSeats)],
             });
             if (ledger !== null) {
                 await ledger.advance(operationId, 'completed', {
@@ -1403,8 +1347,6 @@ async function takeoverProject(ctx, shared) {
                 posts: proposal.posts,
                 members: [],
                 tasks: [],
-                capacity: NO_CAPACITY_PLAN,
-                recommended_members: proposal.recommendedMembers,
                 recovered_from: { epoch: oldEpoch, recovery_ref: request.recoveryRef },
                 created_at: now,
                 updated_at: now,
@@ -1421,7 +1363,7 @@ async function takeoverProject(ctx, shared) {
             const envelope = env.ok({
                 operationId,
                 data: { ...data, gaps: diagnostics, binding_ref: deps.binding.BINDING_PATH },
-                diagnostics: rosterNotes(env, proposal.usedSeats, request.obsolete),
+                diagnostics: [seatsDiagnostic(env, proposal.usedSeats)],
             });
             if (ledger !== null) {
                 await ledger.advance(operationId, 'completed', {

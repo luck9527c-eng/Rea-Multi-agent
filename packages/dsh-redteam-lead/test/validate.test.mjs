@@ -94,6 +94,30 @@ test('rosterInput：未知字段被拒（additionalProperties=false）', async (
   assert.equal(result.issues[0].path, '/role')
 })
 
+test('T25：capacity / reserved_* 不再是规格字段，传了就是未知字段', async () => {
+  const s = await schema()
+  for (const extra of [
+    { capacity: { max_members: 2, max_active_subagents: 2 } },
+    { reserved_member_slots: 0 },
+    { reserved_activations: 0 },
+  ]) {
+    const [name] = Object.keys(extra)
+    const result = validateInput(s, 'rosterInput', { ...rosterValid(), ...extra })
+    assert.equal(result.ok, false, `${name} 必须被拒`)
+    assert.deepEqual(keywords(result), ['additionalProperties'], `${name} 应因未知字段被拒：${JSON.stringify(result.issues)}`)
+    assert.equal(result.issues[0].path, `/${name}`)
+  }
+
+  // dispatch 侧同样只剩 additionalProperties 一条：没有为已废除的参数写专用诊断。
+  const dispatch = validateInput(s, 'dispatchInput', {
+    ...dispatchValid(),
+    capacity: { max_members: 2, max_active_subagents: 2 },
+  })
+  assert.equal(dispatch.ok, false)
+  assert.deepEqual(keywords(dispatch), ['additionalProperties'])
+  assert.equal(dispatch.issues[0].path, '/capacity')
+})
+
 test('rosterInput：action=bind 缺 operation_id 被拒（if/then 条件约束）', async () => {
   const result = validateInput(await schema(), 'rosterInput', {
     project_root: 'D:\\workSpace\\case01',
@@ -297,8 +321,9 @@ test('规范化填默认值且不改写显式值', async () => {
   const defaults = applyDefaults(s, 'rosterInput', { project_root: 'D:\\p' })
   assert.equal(defaults.action, 'inspect')
   assert.equal(defaults.max_posts, 6)
-  assert.equal(defaults.reserved_member_slots, 1)
-  assert.equal(defaults.reserved_activations, 2)
+  // T25：reserved_* 已随容量子系统从规格删除，不再有默认值。
+  assert.equal(Object.hasOwn(defaults, 'reserved_member_slots'), false)
+  assert.equal(Object.hasOwn(defaults, 'reserved_activations'), false)
   assert.deepEqual(defaults.target_kinds, [])
 
   const dispatch = applyDefaults(s, 'dispatchInput', dispatchValid())

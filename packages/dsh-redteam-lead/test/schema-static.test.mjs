@@ -250,10 +250,10 @@ test('岗位目录不变量：required 族可解析、enabled 缺省 true、预�
     assert.ok(templateIds.has(post.id), `已启用岗位 ${post.id} 不属于任何模板`);
   }
 
-  // 默认预算与契约「最多六岗、一席失败替换预留、两个 activation」一致。
+  // T25：容量预算（reserved_member_slots / reserved_activations）已随容量子系统废止，
+  // 不再是契约默认值。catalog.defaults 里的这两个数据键不在本票授权的规格改动范围内
+  // （见 T25 交接说明），所以这里只断言仍在生效的 max_posts。
   assert.equal(catalog.defaults.max_posts, 6);
-  assert.equal(catalog.defaults.reserved_member_slots, 1);
-  assert.equal(catalog.defaults.reserved_activations, 2);
 });
 
 test('包内目录副本与 docs/specs/roster-catalog.json 字节一致（漂移即失败）', () => {

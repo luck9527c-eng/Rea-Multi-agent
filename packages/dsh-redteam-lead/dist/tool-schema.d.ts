@@ -137,31 +137,6 @@ export declare const schemaDefs: {
                 minimum: number;
                 default: number;
             };
-            reserved_member_slots: {
-                type: string;
-                minimum: number;
-                default: number;
-            };
-            reserved_activations: {
-                type: string;
-                minimum: number;
-                default: number;
-            };
-            capacity: {
-                type: string;
-                additionalProperties: boolean;
-                required: string[];
-                properties: {
-                    max_members: {
-                        type: string;
-                        minimum: number;
-                    };
-                    max_active_subagents: {
-                        type: string;
-                        minimum: number;
-                    };
-                };
-            };
             operation_id: {
                 $ref: string;
             };
@@ -275,21 +250,6 @@ export declare const schemaDefs: {
             };
             prohibited: {
                 $ref: string;
-            };
-            capacity: {
-                type: string;
-                additionalProperties: boolean;
-                required: string[];
-                properties: {
-                    max_members: {
-                        type: string;
-                        minimum: number;
-                    };
-                    max_active_subagents: {
-                        type: string;
-                        minimum: number;
-                    };
-                };
             };
             capability_needs: {
                 $ref: string;
@@ -731,33 +691,6 @@ export declare const schemaDefs: {
                     $ref: string;
                 };
             };
-            capacity: {
-                type: string;
-                additionalProperties: boolean;
-                required: string[];
-                properties: {
-                    remaining_member_slots: {
-                        type: string[];
-                        minimum: number;
-                    };
-                    remaining_activations: {
-                        type: string[];
-                        minimum: number;
-                    };
-                    reserved_member_slots: {
-                        type: string;
-                        minimum: number;
-                    };
-                    reserved_activations: {
-                        type: string;
-                        minimum: number;
-                    };
-                };
-            };
-            recommended_members: {
-                type: string;
-                minimum: number;
-            };
             proposal_hash: {
                 anyOf: ({
                     $ref: string;
@@ -939,31 +872,6 @@ export declare const rosterInput: {
             minimum: number;
             default: number;
         };
-        reserved_member_slots: {
-            type: string;
-            minimum: number;
-            default: number;
-        };
-        reserved_activations: {
-            type: string;
-            minimum: number;
-            default: number;
-        };
-        capacity: {
-            type: string;
-            additionalProperties: boolean;
-            required: string[];
-            properties: {
-                max_members: {
-                    type: string;
-                    minimum: number;
-                };
-                max_active_subagents: {
-                    type: string;
-                    minimum: number;
-                };
-            };
-        };
         operation_id: {
             $ref: string;
         };
@@ -1062,21 +970,6 @@ export declare const dispatchInput: {
         };
         prohibited: {
             $ref: string;
-        };
-        capacity: {
-            type: string;
-            additionalProperties: boolean;
-            required: string[];
-            properties: {
-                max_members: {
-                    type: string;
-                    minimum: number;
-                };
-                max_active_subagents: {
-                    type: string;
-                    minimum: number;
-                };
-            };
         };
         capability_needs: {
             $ref: string;
@@ -1259,33 +1152,6 @@ export declare const rosterData: {
             items: {
                 $ref: string;
             };
-        };
-        capacity: {
-            type: string;
-            additionalProperties: boolean;
-            required: string[];
-            properties: {
-                remaining_member_slots: {
-                    type: string[];
-                    minimum: number;
-                };
-                remaining_activations: {
-                    type: string[];
-                    minimum: number;
-                };
-                reserved_member_slots: {
-                    type: string;
-                    minimum: number;
-                };
-                reserved_activations: {
-                    type: string;
-                    minimum: number;
-                };
-            };
-        };
-        recommended_members: {
-            type: string;
-            minimum: number;
         };
         proposal_hash: {
             anyOf: ({

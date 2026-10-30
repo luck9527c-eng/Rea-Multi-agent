@@ -45,14 +45,13 @@ const MAX_DEPTH = 16
  * 收集目标表。
  *
  * `expectation: 'required'` = 出现在 T9 ticket 列出的证据清单里；缺了要在 `gaps` 里点名。
- * `expectation: 'optional'` = 说话才算数的声明类文件（容量/能力/工具清单/锁）。它们缺失本身
- * 就是一条有意义的证据（例如没有 `re/team/capacity.json` 就该看到 `CAPACITY_UNKNOWN`），
- * 所以只记 `absent`，不算缺口。
+ * `expectation: 'optional'` = 说话才算数的声明类文件（能力/工具清单/锁）。它们缺失本身
+ * 就是一条有意义的证据，所以只记 `absent`，不算缺口。
  *
  * 路径常量与实现保持一致：`src/binding.ts`（binding/roster/resources/history）、
  * `src/contract.ts`（dispatches/attempts/work）、`src/conclude.ts`（receipts）、
  * `src/audit.ts`（audit.jsonl）、`src/operation.ts`（operations）、`src/baseline.ts`（baselines）、
- * `src/team-adapter.ts`（capacity）、`src/roster.ts`（capabilities）、`src/lock.ts`（lock）、
+ * `src/team-adapter.ts`（usedSeats）、`src/roster.ts`（capabilities）、`src/lock.ts`（lock）、
  * `src/project-adapter.ts`（routes/seals）。
  */
 const TARGETS = [
@@ -64,7 +63,6 @@ const TARGETS = [
   { id: 'receipts', kind: 'tree', path: 're/team/receipts', expectation: 'required', label: '收口回执' },
   { id: 'routes', kind: 'glob', path: 're/routes', expectation: 'required', label: '路线记录（skill 写）' },
   { id: 'seals', kind: 'tree', path: 're/seals', expectation: 'required', label: '封存记录' },
-  { id: 'capacity', kind: 'file', path: 're/team/capacity.json', expectation: 'optional', label: '容量声明（D1）' },
   { id: 'capabilities', kind: 'file', path: 're/team/capabilities.json', expectation: 'optional', label: '能力绑定声明' },
   { id: 'lock', kind: 'file', path: 're/team/lock', expectation: 'optional', label: '项目锁（残留即证据）' },
   { id: 'attempts', kind: 'glob', path: 're/team/attempts', expectation: 'optional', label: '尝试关联记录' },
@@ -681,47 +679,44 @@ const STEPS = [
   },
   {
     n: 2,
-    title: '`rt_roster`：兼容性、岗位需求、缺口、预算',
+    title: '`rt_roster`：兼容性、岗位需求、缺口、max_posts 裁剪',
     goal:
       '证明名册是**按当前项目副本和当前能力**算出来的：兼容性有明确判定、可用岗位需求非空、缺口能对上实际缺的东西、' +
-      '岗位数随目标与预算变化，且容量未知时不盲目派发。',
-    a: ['A09', 'A40'],
+      '岗位数随目标与 `max_posts` 变化；并证明容量键已从 wire schema 删除（传了就是未知字段）。',
+    a: ['A40'],
     setup: [
       '在会话里对临时项目跑 `rt_roster`（`action=inspect`，默认只读）。跑之前先 `collect --out <证据目录>\\s2-before.json`。',
       '再跑一次，只改 `target_kinds`（例如 `["webapp"]` → `["game","webapp"]`）或 `max_posts`，记录 `posts` 数量与 `gaps` 的变化。',
-      '若项目里没有 `re/team/capacity.json`：先看 `CAPACITY_UNKNOWN`；再按 D1 的格式写上 `schema_version/declared_at/declared_by/maxMembers/maxActiveSubagents` 后重跑，看 `capacity` 字段与 `gaps` 怎么变。',
+      '对照检查 wire data：`data` 里**没有** `capacity` / `recommended_members` 键；再传一次已删除的 `capacity`，入口应按未知字段拒绝（`INVALID_ARGUMENT`），不是 `CAPACITY_ARGUMENT_OBSOLETE`。',
       '全部 inspect 跑完后 `collect --out <证据目录>\\s2-after.json`，`diff` 必须为空（inspect 不写项目）。',
     ],
     observe: [
       '`data.compatibility`（`status`/`gaps`/`versions` 或 `rule_digest` 一类字段）与 `data.posts[]`（每个岗位的 `id`/`required`/`optional`/`priority`）。',
-      '`data.gaps[].code` 与 `reason`/`next_step`；`data.capacity` 只有四个字段（`remaining_member_slots`/`remaining_activations`/`reserved_member_slots`/`reserved_activations`），未知用 `null`（D19：**没有** `known`）。',
+      '`data.gaps[].code` 与 `reason`/`next_step`；已用席位在诊断里（`TEAM_SEATS_USED` / `TEAM_SEATS_UNKNOWN`），不参与岗位裁剪。',
       '`data.proposal_hash` 与 `data.binding_ref`：inspect 不得写 `binding_ref`（必须是 `null`）。',
     ],
     asserts: [
       { tag: 'direct', text: '项目副本兼容性有明确判定，不是"读到了就算过"：缺团队规则段 → `SKILL_INCOMPATIBLE` 且 `next_step` 要求按 skill 合并项目副本（**不得**用全局副本覆盖，也不得自动 `init`）。' },
       { tag: 'direct', text: '每个可用岗位的 `required`（与 `optional`）都非空；`disabled` 的预留岗不出现在可派岗位里（不得被当成可用岗）。' },
       { tag: 'direct', text: '缺口与当前能力相符：把一个确实缺的能力（例如未安装的 IDA / 未绑定的 provider）留在需求里 → `gaps` 出现 `CAPABILITY_MISSING` 或 `CAPABILITY_NOT_READY`，并且点名缺的能力族，而不是笼统"资源不足"。' },
-      { tag: 'direct', text: '岗位数随目标与预算变化：改 `target_kinds`（webapp → game+webapp）后 `posts` 集合变化且并集去重；调小 `max_posts` 或 `reserved_member_slots` 后岗位被裁剪，裁剪结果稳定（同样入参两次结果一致）。' },
-      { tag: 'direct', text: 'A09：没有容量声明时 `capacity.remaining_member_slots`/`remaining_activations` 为 `null`，`rt_roster`/`rt_dispatch` 报 `CAPACITY_UNKNOWN`，**不得**用常数 8 兜底、也不得靠 spawn 试探。' },
-      { tag: 'direct', text: 'A09：声明容量后 `remaining_*` 变成可读数值（= 声明上限扣掉预留），并且 `gaps` 里出现 `ACTIVATION_USAGE_UNOBSERVED` 一类非阻塞诊断——「上限已声明、占用不可观测」必须是一条可读的 gap（D25），不是静默超配。' },
+      { tag: 'direct', text: '岗位数随目标与 `max_posts` 变化：改 `target_kinds`（webapp → game+webapp）后 `posts` 集合变化且并集去重；调小 `max_posts` 后岗位被标 `deferred`（`CAPACITY_EXHAUSTED`），裁剪结果稳定（同样入参两次结果一致）。' },
+      { tag: 'direct', text: 'T25：wire data 里**没有** `capacity` / `recommended_members`；再传 `capacity` 时入口按未知字段返回 `INVALID_ARGUMENT`，**不是** `CAPACITY_ARGUMENT_OBSOLETE`，且没有发生任何宿主调用。' },
       { tag: 'direct', text: '`action=inspect` 零副作用：跑完后 `collect` 的 `digest` 与 `s2-before.json` 相同，且没有新增 `re/team/binding.json`。' },
       { tag: 'direct', text: 'A40：`data.project_id` 由项目根本身决定（同一根两次一致），`data.session_id`/`team_id` 是本会话的值；**不要**把上一次记录里的 pass 迁移过来。' },
       { tag: 'construct', text: 'A40：换执行者/换入口（例如同一项目在另一个 profile 或另一台机器上打开）后，`compatibility` 必须重算而不是沿用旧判定；构造方式是改 `re/team/binding.json` 里的 `rule_digest`/`session` 再 inspect，期望 `RECOVERY_REQUIRED` 或明确的"需要重新兼容检查"。' },
     ],
     codes: [
       ['缺团队规则段/布局不支持', '`SKILL_INCOMPATIBLE` / `PROJECT_NOT_CONFIGURED`', '不得覆盖副本、不得自动 init'],
-      ['没有容量声明就派发', '`CAPACITY_UNKNOWN`', '先声明或改 profile config'],
-      ['容量文件坏了/读不了', '`CAPACITY_DECLARATION_UNREAD`', '读失败不得当成没有声明'],
+      ['传已删除的 capacity（T25）', '`INVALID_ARGUMENT`（未知字段）', '不是 `CAPACITY_ARGUMENT_OBSOLETE`'],
       ['缺能力', '`CAPABILITY_MISSING`', '点名能力族与下一步'],
       ['同一个根换了会话又来改', '`PROJECT_SESSION_MISMATCH`', '先接管/解绑'],
     ],
     evidence: [
-      '两次（或多组入参）`rt_roster` 的**完整**返回。',
-      '改容量声明前后的 `re/team/capacity.json` 内容 + `collect` 两次（`s2-capacity-before/after.json`）。',
+      '两次（或多组入参）`rt_roster` 的**完整**返回（含传 `capacity` 被拒的原文）。',
       '`re/project.json` 与项目 skill 副本路径（用于证明兼容性读的是项目副本）。',
     ],
     gaps: [
-      '`remaining_activations` 的真实占用**不可观测**（宿主没有任何 activation 占用查询），只能看到"D25 组装后的声明值 + 一条 gap"。因此"岗位数随预算变化"只能通过改声明或 `reserved_*` 入参构造，不能靠真实占用触发。',
+      '本插件**不读**任何容量声明（`re/team/capacity.json` 已删除，DECISIONS D41/T23）：`max_posts` 是操作者给的岗位数上限，不是宿主能创建多少成员的预测；宿主的真实上限只在它拒绝 spawn 时可见。',
       '`rt_roster` 无法回答"还剩几个席位上限"；`used` 只能从 `list_agents` 数 `role=teammate` 得到。',
     ],
   },
@@ -756,7 +751,6 @@ const STEPS = [
       ['路线不存在/状态不可派', '`PROJECT_NOT_CONFIGURED` / `RECOVERY_REQUIRED`', '先按 skill 建路线'],
       ['岗位被别人占着', '`MEMBER_BUSY`', '先收口再派，不排队'],
       ['前置任务未完', '`DEPENDENCY_BLOCKED`', 'blocked 且零副作用'],
-      ['容量未知', '`CAPACITY_UNKNOWN`', '声明容量'],
       ['消息层失败', '`DELIVERY_FAILED` / `partial`', '保留已有身份'],
     ],
     evidence: [
@@ -930,7 +924,7 @@ const STEPS = [
       { tag: 'direct', text: '成员仍留在名册：`list_agents` 仍有该 `name`，`role=teammate` 计数不变（席位不因中断释放）。' },
       { tag: 'direct', text: '中断不释放任务：`team_task_list` 里该任务仍是原 `task_id`、`in_progress`、`ownerName` 不变；没有新的 attempt 被自动创建。' },
       { tag: 'direct', text: '带 nonce 的 `send_message` 投递成功，且**成员回报里出现该 nonce 原文**——这是"真的醒了"的唯一可观察判据（投递确认不等于它处理了）。' },
-      { tag: 'direct', text: 'A34：收尾停止条件可读——所有任务 `completed` 或已显式交接，`rt_roster` 的 `capacity` 余额不再变化，Lead 不再新开路线；每轮先 `list_agents` + `team_task_list` 再决定动作（30 秒控制点回读），空闲等待是有界 `wait_agent` 而不是无限轮询。' },
+      { tag: 'direct', text: 'A34：收尾停止条件可读——所有任务 `completed` 或已显式交接，Lead 不再新开路线；每轮先 `list_agents` + `team_task_list` 再决定动作（30 秒控制点回读），空闲等待是有界 `wait_agent` 而不是无限轮询。' },
       { tag: 'unobservable', text: 'A34 的"不承诺自动唤醒"是行为约束，不是单次调用能观察到的字段；只能以记录里"没有无限轮询/没有新开路线"的旁证支撑。' },
     ],
     codes: [
@@ -1058,7 +1052,6 @@ function renderChecklist() {
     ['A02', 1, '部分：只能证明留下的是团队版，另一半已被 patch 删除'],
     ['A03', 5, '可观察（真实 teammate 的原始返回 + 空 diff）'],
     ['A08', 5, '可观察（裸子代理与成员两种错误形状分开记）'],
-    ['A09', 2, '可观察（`CAPACITY_UNKNOWN` + 声明后的余额）'],
     ['A10', 3, '可观察（契约 SHA-256 == `contract_sha256`；`started_at` 为 null）'],
     ['A11', 4, '可观察（成员数不变、`task_id` 变、`MEMBER_BUSY` + 空 diff）'],
     ['A12', 3, '需构造（撑爆消息 / 极小超时），否则 not-run'],

@@ -213,34 +213,6 @@ const SPEC = {
                     "minimum": 1,
                     "default": 6
                 },
-                "reserved_member_slots": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "default": 1
-                },
-                "reserved_activations": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "default": 2
-                },
-                "capacity": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "max_members",
-                        "max_active_subagents"
-                    ],
-                    "properties": {
-                        "max_members": {
-                            "type": "integer",
-                            "minimum": 1
-                        },
-                        "max_active_subagents": {
-                            "type": "integer",
-                            "minimum": 1
-                        }
-                    }
-                },
                 "operation_id": {
                     "$ref": "#/$defs/id"
                 },
@@ -392,24 +364,6 @@ const SPEC = {
                 },
                 "prohibited": {
                     "$ref": "#/$defs/strings"
-                },
-                "capacity": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "max_members",
-                        "max_active_subagents"
-                    ],
-                    "properties": {
-                        "max_members": {
-                            "type": "integer",
-                            "minimum": 1
-                        },
-                        "max_active_subagents": {
-                            "type": "integer",
-                            "minimum": 1
-                        }
-                    }
                 },
                 "capability_needs": {
                     "$ref": "#/$defs/strings",
@@ -1008,8 +962,6 @@ const SPEC = {
                 "compatibility",
                 "posts",
                 "gaps",
-                "capacity",
-                "recommended_members",
                 "proposal_hash",
                 "binding_ref"
             ],
@@ -1060,44 +1012,6 @@ const SPEC = {
                     "items": {
                         "$ref": "#/$defs/diagnostic"
                     }
-                },
-                "capacity": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "remaining_member_slots",
-                        "remaining_activations",
-                        "reserved_member_slots",
-                        "reserved_activations"
-                    ],
-                    "properties": {
-                        "remaining_member_slots": {
-                            "type": [
-                                "integer",
-                                "null"
-                            ],
-                            "minimum": 0
-                        },
-                        "remaining_activations": {
-                            "type": [
-                                "integer",
-                                "null"
-                            ],
-                            "minimum": 0
-                        },
-                        "reserved_member_slots": {
-                            "type": "integer",
-                            "minimum": 0
-                        },
-                        "reserved_activations": {
-                            "type": "integer",
-                            "minimum": 0
-                        }
-                    }
-                },
-                "recommended_members": {
-                    "type": "integer",
-                    "minimum": 0
                 },
                 "proposal_hash": {
                     "anyOf": [

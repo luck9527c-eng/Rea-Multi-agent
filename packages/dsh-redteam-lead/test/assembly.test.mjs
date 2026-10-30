@@ -300,6 +300,47 @@ test('project_root 非法时不绑定适配器，但 handler 仍能返回可读�
   assert.equal(value.code, 'PROJECT_NOT_CONFIGURED')
 })
 
+test('T25：capacity / reserved_* 在入口就是未知字段，不再有 CAPACITY_ARGUMENT_OBSOLETE 特判', async (t) => {
+  // 规格已删除这些键，`additionalProperties:false` 在校验阶段直接拒绝；不再进入 handler。
+  const host = makeHost(t)
+  const rosterArgs = {
+    project_root: host.project.root,
+    target_kinds: ['binary'],
+    capacity: { max_members: 2, max_active_subagents: 2 },
+  }
+  const dispatchArgs = {
+    project_root: host.project.root,
+    operation_id: 'op-t25',
+    post_id: 'cross-check',
+    route_id: 'R-001',
+    target_ids: ['T-001'],
+    objective: 'T25：capacity 未知字段拒绝',
+    evidence_required: ['artifact_locator'],
+    prohibited: [],
+    capacity: { max_members: 2, max_active_subagents: 2 },
+  }
+
+  for (const [tool, args] of [['rt_roster', rosterArgs], ['rt_dispatch', dispatchArgs]]) {
+    const envelope = await invokeTool({
+      tool,
+      args,
+      exec: host.exec,
+      ctx: { get: (service) => host.services[service] },
+      config: host.config,
+    })
+    assert.equal(envelope.status, 'error', `${tool}: ${JSON.stringify(envelope)}`)
+    assert.equal(envelope.code, 'INVALID_ARGUMENT')
+    assert.ok(
+      !envelope.diagnostics.some((entry) => entry.code === 'CAPACITY_ARGUMENT_OBSOLETE'),
+      `${tool} 不得再回 CAPACITY_ARGUMENT_OBSOLETE`,
+    )
+    assert.match(envelope.diagnostics[0].reason, /不允许的字段 capacity/u, `${tool} 应报未知字段 capacity`)
+    // 校验阶段就拒绝：没有任何宿主调用。
+    assert.equal(host.team.callsFor('spawnTeammate').length, 0)
+    assert.equal(host.team.callsFor('createTask').length, 0)
+  }
+})
+
 // ---------------------------------------------------------------------------
 // 3. 派发 ↔ 收口：同一份派发记录的两个方向
 //
@@ -317,9 +358,8 @@ test('rt_dispatch → rt_conclude：同一份派发记录能被收口按原样�
   const seats = await deps.teamAdapter.usedSeats()
   assert.equal(seats.ok, true);
   assert.equal(seats.used, 0, '装配出来的 teamAdapter 仍然能从 listMembers 数已用席位')
-  // wire 里那 4 个字段仍在（schema 必备），但一律「未知 / 不预留」。
-  assert.equal(roster.envelope.data.capacity.remaining_member_slots, null)
-  assert.equal(roster.envelope.data.capacity.remaining_activations, null)
+  // T25：容量字段已从 wire schema 与 rosterData 删除（T23 只是不再读它）。
+  assert.equal(Object.hasOwn(roster.envelope.data, 'capacity'), false)
   const gapCodes = (roster.envelope.data.gaps ?? []).map((gap) => gap.code)
   assert.ok(!gapCodes.includes('CAPACITY_UNKNOWN'), `T23：容量未知不再是缺口：${gapCodes.join(',')}`)
   assert.ok(
