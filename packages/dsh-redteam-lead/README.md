@@ -133,12 +133,18 @@ cd $env:USERPROFILE\.dsh\profiles\desktop
 3. **locale 只影响显示名**：宿主只消费 `locale/*.json` 的 `meta.title` / `meta.description`；
    **工具描述不做本地化**（`description` 是裸字符串，直接进模型上下文），所以工具文案只有英文一份。
 4. **doctor 只报配置**：它看不到团队服务、也看不到会话状态；`runtime_ready` 永远是 `unknown`。
-5. **容量必须显式声明**（DECISIONS D1）：宿主没有受支持的只读余额查询。没有 `re/team/capacity.json`
-   或 profile `config.capacity` 时，`rt_roster` / `rt_dispatch` 返回 `CAPACITY_UNKNOWN` 并写明下一步
-   ——不猜常数、不读私有字段、不靠 spawn 试探。activation 的**占用**不可观测（D25），只以
-   `ACTIVATION_USAGE_UNOBSERVED` gap 呈现。
+5. **容量最好显式声明**（DECISIONS D1/D40）：宿主没有受支持的只读余额查询。没有 `re/team/capacity.json`
+   或 profile `config.capacity` 时，`rt_dispatch` **照派**（不再前置拒绝，D40 的有意偏离），只在宿主
+   因上限拒绝时被动学一次上限；`rt_roster` 的预算裁剪仍按未知处理（unknown → defer + `CAPACITY_UNKNOWN`）。
+   不猜常数、不读私有字段、不靠 spawn 试探。学到的上限取自宿主自己的拒绝消息（`active child limit: N` /
+   `Team member limit N reached`，见 `docs/impl/UPSTREAM-API.md`），解析不到才回落为「已用席位数」。
+   activation 的**当前占用**仍不可观测（D25），但**池大小**在撞到一次之后可读 —— 这是 T18b 修掉的缺陷。
 6. **`re/env/tools.json` 目前没有生产者**（DECISIONS D11）：skill 侧没有生成命令，本机零个真实实例。
    插件只容忍缺失并报 unknown/gap，绝不自己扫描或生成清单。
+7. **一次观测中崩溃会留下 `re/team/capacity-observing.json`**（T18 的并发保护标记）：正常路径 spawn 结束就删，
+   进程被杀/崩溃则删不掉，下一次派发会被它挡住。诊断里给出标记内 `started_at` 与该文件的 **mtime**
+   （判断是不是很久以前的残骸）；确认那次派发已经死了之后，**先核对成员名册**里那个成员是否已存在/失败，
+   再**手工删除该文件**重试 —— 插件不会自动清理别人的标记。
 
 ## 开发
 

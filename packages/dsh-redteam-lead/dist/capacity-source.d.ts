@@ -11,8 +11,15 @@
  * 3. **「上限未知」与「占用不可观测」是两件事**（D25）：这里只回答“有没有上限”，
  *    activation 的占用仍然恒为 `null`，由派发/收口的 gap 如实报告。
  *
- * 观测值的语义在 ticket 里写死了：`max_members` 取**观测当时的已用席位数**（失败成员已计入），
- * 即“你已经到顶了”。因此它是真实上限的**保守下限**：宁可少开，也不靠猜多开。
+ * 观测值的语义（T18 → T18b）：
+ *
+ * - 宿主在两条容量拒绝消息里**写着真实数字**（`active child limit: N` / `Team member limit N reached`，
+ *   见 `docs/impl/UPSTREAM-API.md`）。解析到就用准确的 N 写对应维度（`parseHostCapacityLimit` +
+ *   `observeCapacity`，纯函数，不做 IO）。
+ * - 解析不到（宿主改措辞）才回落到 T18 的语义：取**观测当时的已用席位数**（失败成员已计入），
+ *   即“你已经到顶了”，是真实上限的**保守下限**。
+ * - 落下的是哪一路必须可查（`basis.parsed_limit` / `basis.message`），且**不得降级**：
+ *   已经解析到准确值之后，一次不可解析的碰撞不得把它改回推断值。
  */
 import type { ActivationSlots, CapacityGap, MemberSlots } from './team-adapter.js';
 /** 观测值文件（本插件唯一写它的地方：派发撞到宿主上限之后）。 */
@@ -28,6 +35,23 @@ export interface CallCapacity {
     max_members: number;
     max_active_subagents: number;
 }
+/**
+ * 观测值的来源（T18b 的并集，ticket 逐字规定）。
+ *
+ * 四个字段回答三件事：**谁拒的**（`host_code`）、**数字从哪来**（`parsed_limit` 为 `null`
+ * 就是回落，非 `null` 就是宿主消息里的准确值）、**当时的现场**（`used_at_observation` 与原文 `message`）。
+ * `parsed_limit` 作用在哪个维度由 `host_code` 决定：`TEAM_MEMBER_LIMIT` → `max_members`，
+ * `ACTIVATION_LIMIT_REACHED` → `max_active_subagents`（两条消息各只讲一件事）。
+ */
+export interface ObservedCapacityBasis {
+    host_code: string;
+    /** 从宿主消息里解析出的真实上限；`null` = 消息里没有可解析的数字，对应维度回落。 */
+    parsed_limit: number | null;
+    /** 观测当时的已用席位数（失败成员已计入）。 */
+    used_at_observation: number;
+    /** 宿主原始文案（解析依据；宿主没给文案时是空串）。 */
+    message: string;
+}
 /** `re/team/capacity-observed.json` 的形状（ticket 逐字规定）。 */
 export interface ObservedCapacityRecord {
     schema_version: number;
@@ -35,10 +59,7 @@ export interface ObservedCapacityRecord {
     observed_at: string;
     max_members: number;
     max_active_subagents: number;
-    basis: {
-        used_at_observation: number;
-        host_code: string;
-    };
+    basis: ObservedCapacityBasis;
 }
 /** 团队适配器 `capacity()` 里本模块真正读到的部分（其它键原样忽略）。 */
 export interface DeclaredCapacityView {
@@ -73,6 +94,13 @@ export interface ObservationMarker {
     session_id: string | null;
     member: string | null;
     started_at: string | null;
+    /**
+     * 标记文件自身的 mtime（带时区 ISO）。
+     *
+     * `started_at` 是写标记时进程自己的声明，可能缺失、也可能是崩溃前最后一刻写的；mtime 是文件系统的，
+     * 两者对上才说明那次观测确实刚刚开始。操作者判断「这是不是一次崩溃留下的残骸」靠这两个时间。
+     */
+    modified_at: string | null;
     operation_id: string | null;
     /** 文件在但不是合法 JSON 对象：按「无法证明它属于别的会话」保守处理。 */
     malformed: boolean;
@@ -90,11 +118,66 @@ export interface CallCapacityParse {
  * （测试、恢复路径），而且 `dispatch` 自己实现了 `normalizeDispatchInput`。
  */
 export declare function parseCallCapacity(raw: unknown): CallCapacityParse;
+/** 解析命中的消息格式：一条消息只说一件事。 */
+export type HostLimitPattern = 'active_child_limit' | 'team_member_limit';
+/** `parseHostCapacityLimit()` 的结果（`limit: null` = 不认识，走回落）。 */
+export interface HostLimitParse {
+    pattern: HostLimitPattern | null;
+    limit: number | null;
+}
+/**
+ * 从宿主**自己抛出的**容量拒绝消息里读出准确上限（纯函数，不做 IO）。
+ *
+ * 只认这两条稳定码 —— 不把任意宿主消息拿去正则（T18b 边界）：文案是宿主私有实现细节，
+ * 换个码就可能撞上同样的字样，届时语义并不相同。
+ *
+ * 读的是宿主抛给调用方的 `error.message`（被动观测），不碰任何私有字段（D1）。
+ */
+export declare function parseHostCapacityLimit(hostCode: string | null, message: string | null): HostLimitParse;
+/** 观测值是从哪儿来的（诊断必须说得清）。 */
+export type ObservationOrigin = 'parsed' | 'fallback' | 'retained';
+/** `observeCapacity()` 的入参：一次**真实**碰撞的现场。 */
+export interface CapacityObservationInput {
+    sessionId: string;
+    observedAt: string;
+    /** 观测当时的已用席位数（失败成员已计入）。 */
+    used: number;
+    hostCode: string;
+    /** 宿主原始文案；宿主没给文案时传 `null`。 */
+    message: string | null;
+    /** 同会话已有的观测值（别的会话的不要传进来：席位随会话重置）。 */
+    existing: ObservedCapacityRecord | null;
+}
+/** `observeCapacity()` 的结论：要落盘的记录 + 数字的来源。 */
+export interface CapacityObservation {
+    record: ObservedCapacityRecord;
+    origin: ObservationOrigin;
+    /** 本次消息里解析出的数字（`retained`/`fallback` 为 `null`）。 */
+    parsed_limit: number | null;
+}
+/**
+ * 把一次容量碰撞折算成观测值（纯函数，不做 IO）。
+ *
+ * 三条规则：
+ *
+ * 1. **解析到就写准确值**，只写消息讲到的那个维度；另一个维度取
+ *    `max(已有值, used)` —— 既保持 T18 的「used 是保守下限」，也不会因为一条只讲
+ *    activation 的消息把已经解析出的 `max_members` 降级回去。
+ * 2. **解析不到且已有解析值 → 原样沿用**（`origin: 'retained'`，连 `observed_at` 都不改）：
+ *    准确值仍然成立，只是这一次没重新读到；把它改回推断值就是降级。
+ * 3. **解析不到且没有解析值 → 回落**为 `used_at_observation`（T18 的语义，`parsed_limit: null`）。
+ */
+export declare function observeCapacity(input: CapacityObservationInput): CapacityObservation;
 /** 读观测值文件；缺失返回「没有」，坏形状/别的会话返回缺口（绝不抛）。 */
 export declare function readObservedCapacity(root: string, sessionId: string | null): Promise<ObservedRead>;
 /** 原子写观测值；返回项目内相对路径。 */
 export declare function writeObservedCapacity(root: string, record: ObservedCapacityRecord): Promise<string>;
-/** 读「观测中」标记（缺失/坏 JSON 都不抛）。 */
+/**
+ * 读「观测中」标记（缺失/坏 JSON 都不抛）。
+ *
+ * 同时取该文件自身的 mtime（`modified_at`）：`started_at` 缺失或不可信时，操作者仍要能判断
+ * 「这是不是上一次派发崩溃留下的残骸」——一个几小时前的 mtime 与一个刚写下的 mtime，处置完全不同。
+ */
 export declare function readObservationMarker(root: string): Promise<ObservationMarker>;
 /** 写「观测中」标记（spawn 之前；结束/失败后由调用方删除）。 */
 export declare function writeObservationMarker(root: string, marker: {
