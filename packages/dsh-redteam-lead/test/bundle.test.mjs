@@ -382,12 +382,30 @@ test('persona 行：complete=false（否则吃掉 team:policy 段）、带 runti
   assert.ok(!persona.config.prefix.includes('指挥'), 'persona 不得写死「指挥」口吻')
   assert.ok(!persona.config.prefix.includes('你是'), 'persona 不得用第二人称写死角色')
 
-  // 共同准则必须真的在：证据驱动 / 锚点 / 未验证推测 / 卡住说清缺什么
+  // 证据纪律必须真的在：锚点 / 未验证推测 / 缺什么
   for (const phrase of ['锚点', '未验证推测', '缺']) {
-    assert.ok(persona.config.prefix.includes(phrase), `人设必须包含共同准则关键词：${phrase}`)
+    assert.ok(persona.config.prefix.includes(phrase), `人设必须包含证据纪律关键词：${phrase}`)
   }
   // 块标量里的标题行不能被当成 YAML 注释吃掉（解析器的回归点）
-  assert.ok(persona.config.prefix.includes('## 共同准则'), 'persona 的块标量内容必须完整解析')
+  assert.ok(persona.config.prefix.includes('## 红队作业准则'), 'persona 的块标量内容必须完整解析')
+
+  // 红队作业准则（本包独有，skill 不管这一段）：不评价用户、越界要拒绝、破坏性操作先问、失败如实记。
+  for (const phrase of ['不评价用户', '拒绝', '授权', '回滚', '失败']) {
+    assert.ok(persona.config.prefix.includes(phrase), `红队作业准则必须包含：${phrase}`)
+  }
+
+  // 项目记录规则**委托给 skill**，本包不得重述。委托句里点话题名是对的（"封存、验收归 skill"），
+  // 所以这里只盯 skill 的**命令原文**：出现就说明又把操作步骤抄了一遍。
+  assert.ok(
+    persona.config.prefix.includes('reverse-project-management'),
+    '人设必须把项目记录规则指向 reverse-project-management skill'
+  )
+  for (const dup of ['INDEX.md', 'check --hashes', 'project.py']) {
+    assert.ok(
+      !persona.config.prefix.includes(dup),
+      `人设不得重述 skill 的操作原文（出现 "${dup}" 说明又抄了一遍）`
+    )
+  }
 
   // 回归：人设必须写清 rt_* 的流程。实测过没有这段的版本 —— 三个工具都在 request/header 里，
   // 模型却一次都没调用（pwsh 44 次），因为宿主注入的 Agent Teams 说明覆盖了"怎么协作"，
@@ -395,7 +413,7 @@ test('persona 行：complete=false（否则吃掉 team:policy 段）、带 runti
   for (const tool of ['rt_roster', 'rt_dispatch', 'rt_conclude']) {
     assert.ok(persona.config.prefix.includes(tool), `persona 必须写明 ${tool} 的用途，否则模型知道有却不用`)
   }
-  for (const phrase of ['项目账目', 'submission.json', '收据']) {
+  for (const phrase of ['编排', 'submission.json', '收据']) {
     assert.ok(persona.config.prefix.includes(phrase), `persona 的 rt_* 段必须包含：${phrase}`)
   }
 })
