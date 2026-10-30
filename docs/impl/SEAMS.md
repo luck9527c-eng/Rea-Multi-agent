@@ -161,3 +161,10 @@ readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
 | `re/team/operations/<operation_id>.json` | 本插件（T1 的 `operation` 台账落盘位置；`$defs.id` 保证文件名安全） |
 | `re/team/capacity.json` | **项目/操作者显式声明**，插件只读（T4 `readDeclaredCapacity`）；插件**不写**它 |
 | `re/targets.json`、`re/routes/`、`re/runs/`、`re/conditions/`、`re/project.json`、`re/env/`、`re/seals/`、`INDEX.md` | 项目 skill（本插件只经 `projectAdapter` 调用，不自己重写算法） |
+
+> **`re/team/roster.json` 不是成员表。** 它在 `rt_roster(bind)` 时写一次，内容是**当时的绑定计划快照**
+> （`template`、`posts`、`capacity`、`recommended_members`），其中 `members` 与 `tasks` **按构造恒为 `[]`**
+> （`src/roster.ts:1726-1727`、`:1999`），之后**永不更新**。要看真实成员与任务，读宿主
+> （`rt_roster` 的 `data`），**不要读这个文件**——按上表第一行，名册的权威从来不在本地。
+> 实测依证：7 名成员之后它仍是 `members: []`
+> （[第三轮记录 §4 N3](../verify/records/20261030-session-c7189ebb.md)）。

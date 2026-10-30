@@ -623,3 +623,18 @@ ticket 写的是「非焚烧类给 `member: null`」，**这条 ticket 要求本
 > 顺带记一条方法教训：ticket 里只要出现「给某个字段填 `null`」，必须先用**入口的校验器**跑一遍形状再写进票里。
 > 这次是子代理实测发现的，不是设计时发现的。
 
+### 裁决（Lead，2026-10-30）：第三轮 L3 的 N1–N4 **决定不修**
+
+出处：[第三轮记录 §4](../verify/records/20261030-session-c7189ebb.md)。记在这里是为了**不让下一个 agent 把它们当新 bug 重新提一遍**。
+
+| 发现 | 结论 | 理由 |
+|---|---|---|
+| N1 `rt_roster(bind)` 对 `CAPACITY_UNKNOWN` 整体 `blocked` | **不修** | 拒绝**自解释**：`next_step` 指向「把容量声明放进 profile 的 `config.capacity`」；且传 call `capacity` 即可 bind（第三轮步 C 实测 `{2,2}` 成功）。与 D40 的差别只在**表述**——D40 讲的是 dispatch 侧，bind 侧仍按「不懂就别动」。已由 SEAMS §7 记清 `roster.json` 语义，**不**改闸门 |
+| N2 `BASELINE_MISMATCH` 回执带 `phase: "integrating"` 但未写盘 | **不修** | 机读字段**无消费者**；改它要动 conclude 阶段机，风险大于收益 |
+| N3 `re/team/roster.json` 的 `members`/`tasks` 恒为 `[]` | **只改文档** | 唯一有「被误当成员表」风险的项（它被 `linkIndexPointers` 链进 INDEX，算对外宣称）。但加写路径会新增并发与失败面，删字段要改 schema。已在 SEAMS §7 写明「这不是成员表」 |
+| N4 契约 `hypothesis` 不随 post 变 | **不修（不是 bug）** | 契约**忠实复制**路线原文；原文里写了「triage 岗位」属路线内容问题，插件改写路线语义才是越界 |
+
+T19 遗留的 5 处（非焚烧类仍带 `phase: 'member_ready'`、台账 `member_failed`、`capacityMarkerGuard` 措辞、unknown 的 next_step、`capacityFailureReason` 死路径）与 N2 同类——**无消费者的机读过度陈述**，一并**不修**。
+
+> 判据（以后照这个拒绝顺手改）：**只有当「读的人会因此做错事」时才算 bug**。没人读的机读字段措辞、以及自解释的拒绝，属于噪声，不算。
+
