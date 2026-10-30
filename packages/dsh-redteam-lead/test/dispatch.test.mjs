@@ -727,6 +727,11 @@ test('传了已废止的 capacity → 派发照旧成功，并明说它不参与
   assert.ok(note, '必须明说 capacity 已废止，不静默忽略')
   assert.match(note.reason, /capacity/u)
   assert.equal(team.callsFor('spawnTeammate').length, 1, '不因传了这个参数而少派或多派')
+
+  // 输入哈希兼容：`capacity` 键名与位置保持原样，同一 operation 才能重放（否则升级前登记的
+  // operation 恢复时会被判 OPERATION_CONFLICT）。
+  const replay = await handleDispatch(ctx, input({ capacity: { max_members: 2, max_active_subagents: 2 } }))
+  assert.equal(replay.envelope.replayed, true, '同一 operation_id 必须重放，不得判冲突')
 })
 
 // ---------------------------------------------------------------------------

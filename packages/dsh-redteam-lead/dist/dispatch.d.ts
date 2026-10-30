@@ -43,14 +43,16 @@ interface DispatchRequest {
     delivery_timeout_ms: number;
     retry_of: Record<string, unknown> | null;
     /**
-     * 已废止的容量入参（T23）：wire schema 仍声明 `capacity`（`docs/specs` 由 Lead 维护），
-     * 校验会放行。这里只记下「传了」，用于回一条 `CAPACITY_ARGUMENT_OBSOLETE`。
+     * 收到但**已废止**的 `capacity` 入参（T23）：`docs/specs` 仍声明它，校验会放行。
      *
-     * **可选**而不是 `null` 占位：`operationInputHash()` 会对整个请求对象求哈希，
-     * 未声明时也不能凭空多出一个键 —— 否则升级前登记的 operation 在恢复时会被判
-     * `OPERATION_CONFLICT`（输入哈希变了，但输入其实没变）。
+     * 值本身**一个字段都不读**（不解析、不落盘、不进任何判定），只用来回一条
+     * `CAPACITY_ARGUMENT_OBSOLETE`。键名与位置保持原样还有一个硬理由：
+     * `operationInputHash()` 对**规范化后的请求**求哈希，升级前登记过的 operation
+     * 里带着 `capacity`，改名/挪位置会让它们在恢复时被判 `OPERATION_CONFLICT`。
+     *
+     * **可选**而不是 `null` 占位：没声明时不能凭空多出一个键（同样的哈希兼容理由）。
      */
-    obsolete_capacity?: true;
+    capacity?: unknown;
 }
 /** `normalizeDispatchInput` 的结果：形状错误时 `value` 为空对象（调用方不会读它）。 */
 type NormalizedDispatch = {

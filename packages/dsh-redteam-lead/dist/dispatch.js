@@ -195,7 +195,7 @@ export function normalizeDispatchInput(raw) {
         }
     }
     // T23：容量子系统已删除，但 wire schema 仍声明 `capacity`（`docs/specs` 由 Lead 维护），
-    // 校验会放行。传了就记一笔并在信封里说清「收到了但没用」，不静默忽略。
+    // 校验会放行。原样留在请求里（哈希兼容 + 回一条「已废止」诊断），值一律不读。
     const capacityGiven = raw.capacity !== undefined;
     if (issues.length > 0)
         return { ok: false, value: {}, issues, operationId };
@@ -221,7 +221,7 @@ export function normalizeDispatchInput(raw) {
             delivery_timeout_ms: typeof raw.delivery_timeout_ms === 'number' ? raw.delivery_timeout_ms : 60000,
             retry_of: retryOf === null ? null : { ...recordOf(retryOf) },
             // 没声明就不写这个键：输入哈希与升级前逐字一致（恢复旧 operation 不会被判冲突）。
-            ...(capacityGiven ? { obsolete_capacity: true } : {}),
+            ...(capacityGiven ? { capacity: raw.capacity } : {}),
         },
     };
 }
@@ -2126,7 +2126,7 @@ async function runLocked(params) {
     // 成功回执的诊断只剩「事实类」的补充（审计写失败）；T23 起容量不再产生任何诊断，
     // 也没有「当时以为的上限」要交回 —— 上限是宿主的事。
     const diagnostics = [];
-    if (request.obsolete_capacity === true) {
+    if (request.capacity !== undefined) {
         // wire schema 仍声明 `capacity`（docs/specs 由 Lead 维护），收到就明说没用，不静默忽略。
         diagnostics.push(envelope.diagnostic('CAPACITY_ARGUMENT_OBSOLETE', '容量子系统已删除（T23/D41）：本次传入的 capacity 不参与任何判定，也不会被记住。'
             + '宿主的席位/activation 上限没有读法：能不能建由宿主决定，被拒时按宿主原话报 CAPACITY_EXHAUSTED', '去掉 capacity 即可；岗位能不能派只看能力是否满足'));
