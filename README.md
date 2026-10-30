@@ -176,10 +176,10 @@ npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"
    depth 策略挡住，但 `workflow` 传了 `parent` 而没传 `maxDepth`，**不会**被挡。本包不声称"平台挡住一切下一层
    创建"；补偿控制是派发契约里明写「你没有派发权，缺人就报回来」+ 团队服务自身的 `TEAM_LEAD_REQUIRED`。
    这一条同时列为 L3 待实测项，且**不要在验收里跑 `workflow`**（会烧 activation 名额并污染后续步骤）。
-2. **容量必须显式声明（DECISIONS D1）**：宿主没有受支持的只读余额查询。`re/team/capacity.json` 或 profile
-   `config.capacity` 必须有一处声明 `maxMembers`/`maxActiveSubagents`；都没有时 `rt_roster` / `rt_dispatch`
-   返回 `CAPACITY_UNKNOWN` 并写明下一步，**不猜 8/16、不读私有字段、不靠 spawn 试探**。另外 activation
-   **占用**不可观测（D25）：上限已声明时按上限扣预留，并附一条 `ACTIVATION_USAGE_UNOBSERVED` 非阻塞 gap。
+2. **容量不由插件规划（DECISIONS D41）**：宿主不提供上限的只读查询，插件也不读任何容量声明、不预留席位、
+   不为"学一次上限"而试探。`rt_roster` 只把宿主名册里的已用席位（含失败成员）作为一条诊断报出；`rt_dispatch`
+   直接调 `spawnTeammate`，宿主拒绝时按**宿主原话**返回 `CAPACITY_EXHAUSTED`，不猜上限。`CAPACITY_UNKNOWN`
+   仍是稳定码表里的保留码，但本插件不再产生它。
 3. **`re/env/tools.json` 没有生产者（DECISIONS D11）**：skill 侧没有生成命令，本机也没有真实实例，唯一具体
    样例是 [docs/examples/tools.json](docs/examples/tools.json)。插件必须**容忍缺失**，按
    [tool-discovery](docs/specs/tool-discovery.md) 报 unknown/gap；绝不自己生成清单、绝不因缺失而崩。

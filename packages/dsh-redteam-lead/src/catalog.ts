@@ -257,8 +257,6 @@ export function validateCatalog(catalog: unknown): CatalogValidation {
     fail('catalog.defaults', 'defaults 必须存在');
   } else {
     const defaults = recordOf(defaultsWire);
-    // T23：`reserved_member_slots` / `reserved_activations` 随容量子系统一起废止，这里不再校验
-    // （目录数据本身是 `docs/specs/roster-catalog.json` 的副本，仍带着这两个键，由 Lead 决定何时删）。
     for (const key of [
       'max_posts',
       'timebox_ms',

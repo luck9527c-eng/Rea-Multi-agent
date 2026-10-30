@@ -1,6 +1,6 @@
 // 验收总表的**文档契约**：`docs/verify/acceptance-status.md` 是 T10 的交付物，状态词表与覆盖范围
-// 都是硬要求（`docs/specs/acceptance-matrix.md`：A01–A44 全表、状态只用 pass/fail/not-run/out-of-scope、
-// 每条 pass 必须点到用例或记录、未实现的 case 标待验收而不是占位"通过"）。
+// 都是硬要求（`docs/specs/acceptance-matrix.md`：A01–A44 全表、状态只用
+// pass/fail/not-run/out-of-scope/已废止、每条 pass 必须点到用例或记录、未实现的 case 标待验收而不是占位"通过"）。
 //
 // 这里只解析文档，不启动任何宿主；断言的是"表本身没撒谎"，不是验收结果。
 import test from 'node:test'
@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs'
 const statusUrl = new URL('../../../docs/verify/acceptance-status.md', import.meta.url)
 const markdown = readFileSync(statusUrl, 'utf8')
 
-const ALLOWED = new Set(['pass', 'fail', 'not-run', 'out-of-scope'])
+const ALLOWED = new Set(['pass', 'fail', 'not-run', 'out-of-scope', '已废止'])
 const ROWS = Array.from({ length: 44 }, (_, index) => `A${String(index + 1).padStart(2, '0')}`)
 
 /** 取两个 `## ` 标题之间的正文。 */
@@ -40,7 +40,7 @@ function matrixRows() {
   return rows.map((row) => [row[0], row[1], row[2].replaceAll('`', '').trim(), row[3], row[4]])
 }
 
-test('A01–A44 全部 44 行各出现一次，状态只取四个允许值', () => {
+test('A01–A44 全部 44 行各出现一次，状态只取允许值（含已废止）', () => {
   const rows = matrixRows()
   assert.equal(rows.length, 44, `主表必须有 44 行，实际 ${rows.length}`)
   const ids = rows.map((row) => row[0])
@@ -74,7 +74,7 @@ test('没有占位"通过"：not-run/fail 行必须写清缺什么，状态列�
   assert.doesNotMatch(markdown, /\|\s*通过\s*\|/u, '表格里不得出现"通过"作为状态值')
 })
 
-test('分布表与实际判定一致（pass/not-run/out-of-scope/fail 的行数）', () => {
+test('分布表与实际判定一致（pass/not-run/out-of-scope/已废止/fail 的行数）', () => {
   const rows = matrixRows()
   const counts = new Map([...ALLOWED].map((status) => [status, 0]))
   for (const row of rows) counts.set(row[2], counts.get(row[2]) + 1)
