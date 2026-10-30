@@ -388,6 +388,16 @@ test('persona 行：complete=false（否则吃掉 team:policy 段）、带 runti
   }
   // 块标量里的标题行不能被当成 YAML 注释吃掉（解析器的回归点）
   assert.ok(persona.config.prefix.includes('## 共同准则'), 'persona 的块标量内容必须完整解析')
+
+  // 回归：人设必须写清 rt_* 的流程。实测过没有这段的版本 —— 三个工具都在 request/header 里，
+  // 模型却一次都没调用（pwsh 44 次），因为宿主注入的 Agent Teams 说明覆盖了"怎么协作"，
+  // 而人设只写了"怎么说话"。删掉这段就会静默退回到那个状态，所以要钉住。
+  for (const tool of ['rt_roster', 'rt_dispatch', 'rt_conclude']) {
+    assert.ok(persona.config.prefix.includes(tool), `persona 必须写明 ${tool} 的用途，否则模型知道有却不用`)
+  }
+  for (const phrase of ['项目账目', 'submission.json', '收据']) {
+    assert.ok(persona.config.prefix.includes(phrase), `persona 的 rt_* 段必须包含：${phrase}`)
+  }
 })
 
 test('patch 里没有 sandbox / approval 声明（服务泄漏会让整棵 preset broken）', () => {

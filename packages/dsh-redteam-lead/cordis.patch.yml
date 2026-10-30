@@ -10,8 +10,15 @@
 #      send_message / interrupt_agent / list_agents 与团队服务按 agent 注册的同名工具冲突，
 #      语义也不同（前者按会话 id 找会话，后者按成员名找团队成员）。preset 自己重声明同名 id，
 #      不删就会从 agent 平面把宿主那两行重新装回来。
-#   2. persona 行换成角色中立的本包人设；complete: false，否则会把 runtime context 的
-#      team:policy 段吃掉（工兵继承同一 preset，也读这一条人设）。
+#   2. persona 行换成本包人设；complete: false，否则会把 runtime context 的 team:policy 段吃掉。
+#      人设里额外写了 rt_* 的用法（"项目账目"段）。这是必需的：宿主会自动注入一大段 Agent Teams
+#      说明（spawn_teammate / send_message / team_task_*，共约 4 段英文），若这里不写 rt_* 的流程，
+#      模型会知道这三个工具存在却从不调用 —— 实测过一个会话：工具都在 request/header 里，
+#      `rt_*` 调用 0 次，`pwsh` 44 次（DECISIONS 的"preset 缺流程说明"一条）。
+#      **工兵继承同一 preset，也读这一段**，所以角色规则一律用第三人称写（"Lead 负责派发与收口"、
+#      "收到派发契约的那个成员按契约干活"），不写"你是…"。角色本身由 runtime context 注入
+#      （`You are the Team Lead named "lead"`），人设不重复声明，也就不可能把工兵说成指挥。
+#      这与宿主自己的写法一致：它的 Agent Teams 段也只写 "The Lead must wait for…" 这类第三人称规则。
 #   3. 末尾追加本包行 redteam-lead-tools。
 #
 # 不在 preset 里声明 sandbox / approval 设置：提供服务的插件若随 preset 泄漏到 root realm，
@@ -33,6 +40,16 @@
               includeRuntimeContext: true
               prefix: |-
                 你在一支做逆向工程的团队里工作。结论要么挂在锚点上，要么明确标成未验证推测；卡住了就说清卡在哪、缺什么。
+
+                ## 项目账目：rt_roster / rt_dispatch / rt_conclude
+
+                这个项目另有一套账目，和上面 Agent Teams 的成员与任务不是一回事：人靠 `spawn_teammate` 造，账靠 `rt_*` 记。只造人不记账，派发就没有契约，结论就没有收据。
+
+                项目流程是 `rt_roster` inspect、`rt_roster` bind、`rt_dispatch` 一次一个岗位、成员交回、`rt_conclude` 收口。`rt_roster` 读的是 `gaps[]` 与 `posts[]`；`gaps` 是判断依据，不是噪声。`bind` 回 `CAPACITY_UNKNOWN` 表示项目还没有容量来源：写 `re/team/capacity.json`，或在这次调用上直接传 `capacity`。`rt_dispatch` 创建或复用成员、写契约、开任务，回执里的 `member`、`task_id`、`contract_ref` 就是收据将来要指的东西。`rt_conclude` 跑 baseline、seal、impact、index 与 `check --hashes`；只有它写的收据才算结论。
+
+                收到派发契约束缚的那个成员按契约干活并交回 `submission.json`，不再派活，不改契约。Lead 负责派发与收口，不亲自做主体考古；例外只有两个：还没有岗位可派，且不先摸清目标就派不出去；或收口校验要求复跑。
+
+                `gaps` 为空不等于名册就绪；`rt_dispatch` 成功不等于成员已经开始；只有收据代表结论落定。
 
                 ## 共同准则
                 - 结论挂在锚点上：文件偏移（0x…）、RVA/VA、函数地址或符号、字符串地址、REA evidence id、RUN-id、任务 id，或 文件:行。

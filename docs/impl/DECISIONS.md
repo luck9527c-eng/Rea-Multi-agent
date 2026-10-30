@@ -638,3 +638,29 @@ T19 遗留的 5 处（非焚烧类仍带 `phase: 'member_ready'`、台账 `membe
 
 > 判据（以后照这个拒绝顺手改）：**只有当「读的人会因此做错事」时才算 bug**。没人读的机读字段措辞、以及自解释的拒绝，属于噪声，不算。
 
+### 裁决（Lead，2026-10-30）：preset 缺 `rt_*` 流程说明 —— 模型知道有工具却不用
+
+**现象**（会话 `session-8e17d6d0`，preset 选的确实是 `redteam-lead`）：`rt_*` 调用 **0 次**，`pwsh` **44 次**，
+`list_agents` 2 次，`spawn_teammate` 0 次。模型甚至在自述里写了「`rt_roster`/`rt_dispatch`/`rt_conclude` … I have them」，
+知道自己有这三个工具，然后一次都没调。
+
+**根因不是接线**，接线全对：`request/header` 里 263 个工具名含全部三个 `rt_*`；persona 前缀也确实注入了系统提示
+（实测正文第 2 段就是它）。缺的是**流程**——宿主会自动注入约四段英文 Agent Teams 说明
+（`spawn_teammate` / `send_message` / `team_task_*` / `wait_agent`，含「Shared-task workflow is …」这类分步指令），
+而人设只写了「怎么说话」（挂锚点、别用推测填空），一个字没写「进项目先调 `rt_roster`」。**模型照有说明书的那套做事。**
+
+**改法**：persona 前缀加「## 项目账目：rt_roster / rt_dispatch / rt_conclude」一段，写法对齐宿主的三个特征：
+1. 角色规则一律**第三人称**（「Lead 负责派发与收口」「收到派发契约的那个成员按契约干活」）——因为工兵继承同一 persona，
+   写「你是…」会把工兵说成 Lead；
+2. 流程压成一句话，不展开成手册；
+3. 只写规则与陷阱，不写理由（「`gaps` 为空不等于名册就绪；只有收据代表结论落定」）。
+
+**为什么不写第二人称**：宿主自己的 Agent Teams 段也只写 "The Lead must wait for …"。
+角色由 runtime context 注入（`You are the Team Lead named "lead"`），人设不重复声明，也就不可能把工兵说成指挥。
+
+**回归保护**：`test/bundle.test.mjs` 的 persona 用例新增断言，要求前缀含三个工具名与「项目账目 / submission.json / 收据」。
+原有两条中立性断言（不含「指挥」、不含「你是」）**未放宽**——是改措辞去满足它，不是改测试。
+
+**未验证（重要）**：这条修复**没有**被任何正式用例证明有效，用例只查形状。要重启 DSH 后开新会话实测，
+判据：`rt_*` 调用次数 > 0，且首个动作是 `rt_roster`。
+
