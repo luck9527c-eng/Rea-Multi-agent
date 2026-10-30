@@ -5,8 +5,9 @@
  * `gaps[].code` 与 `session_id`/`team_id`，但 `output.render` 只投影计数，于是：
  *
  * - 模型看不到「每个岗位缺什么能力」，只能去翻 `re/team/operations/*.json`；
- * - A09（真实余额 vs 未知）、A38（只报 unknown 要看 `gaps[].code`）、A40（`session_id` 是本会话）
+ * - A38（只报 unknown 要看 `gaps[].code`）、A40（`session_id` 是本会话）
  *   在工具面上不可观察，只能一直 `not-run`。
+ *   （A09 那类「真实余额 vs 未知」的判据随 T23 一起删除：本插件不再做容量规划。）
  *
  * 这里断言的是**宿主能看到的接缝**：注册进 `ctx.tools.register` 的 `output.render`（宿主的真实调用点），
  * 以及它吃真实 handler 产出的信封。不断言内部函数名，也不改 `output.schema` / wire data。
@@ -76,7 +77,7 @@ function renderText(tool, value) {
   return blocks.map((block) => block.text).join('\n')
 }
 
-/** 真 handler 产出的 `rosterData`（有 5 个岗位、5 条 gaps、4 项已知容量）。 */
+/** 真 handler 产出的 `rosterData`（有 5 个岗位、5 条 gaps、4 个恒为「未知/不预留」的容量键）。 */
 async function realisticEnvelope(t) {
   const project = makeTempProject({ t })
   const ctx = makeCtx({
@@ -101,7 +102,6 @@ function dataWithout(envelope, keys) {
   return { ...envelope, data }
 }
 
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // 1. capacity：T23 起 render **不再**打印这一行（数据里仍是 wire 必备的 4 个键）
 // ---------------------------------------------------------------------------
