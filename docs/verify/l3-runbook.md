@@ -10,11 +10,10 @@
 | bundle 已装进 profile | `dependencies` 与 `dsh.profile.bundles` 都含 `@local/dsh-redteam-lead`；`node_modules/@local/dsh-redteam-lead` 是指向仓库的 junction |
 | 团队 profile bundle | 已在 `bundles` 里（前置条件，无需改动） |
 | 临时分析项目 | `D:\workSpace\_l3-verify\proj`（`project.py init` + 真实 skill **项目副本**，含 `references/team-coordination.md`） |
-| 容量声明 | `proj\re\team\capacity.json`（`maxMembers: 8` / `maxActiveSubagents: 8`）。**不声明就会一直 `CAPACITY_UNKNOWN`**（DECISIONS D1） |
 | 证据目录 | `D:\workSpace\_l3-verify\evidence\` |
 | doctor 基线 | `configuration_ready: true`、`runtime_ready: "unknown"`、退出码 0 —— 三项 bundle 检查全 `true` |
 
-**换机器必须重做**：装包（`link:` + `bundles` 两处都要）、临时项目、`capacity.json`。装完先跑 doctor，`configuration_ready` 必须是 `true` 再往下。
+**换机器必须重做**：装包（`link:` + `bundles` 两处都要）、临时项目。装完先跑 doctor，`configuration_ready` 必须是 `true` 再往下。
 
 ## 1. 执行顺序：**不是 1→2→3→4→5→6→7**
 
@@ -63,10 +62,10 @@
 【执行顺序】严格按 1 → 2 → 3 → 6 → 4 → 5 → 7，不是按编号顺序。
 （原因：第 4 步要求"先完成同岗首个任务的验收"，而验收是第 6 步的内容，所以第 4 步依赖第 6 步。）
 
-- 步 1：先调 rt_roster 但不传 target_kinds，贴完整返回（应只做环境检查、recommended_members = 0）。再跑
+- 步 1：先调 rt_roster 但不传 target_kinds，贴完整返回（应只做环境检查、不提议班底）。再跑
   node D:\workSpace\Rea-Multi-agent\packages\dsh-redteam-lead\bin\doctor.mjs --profile C:\Users\Administrator\.dsh\profiles\desktop --project D:\workSpace\_l3-verify\proj
   贴 stdout 与退出码。用 list_agents 与 team_task_list 的原始输出证明九个团队工具在位；同名工具用入参形状区分（团队版 send_message 收 {target}，另一版收 {agent_id}）。
-- 步 2：rt_roster（action="inspect"，target_kinds=["binary"]），把 compatibility、每个岗位的 required、gaps、recommended_members 原样贴出。然后把 re/team/capacity.json 的 maxMembers 从 8 改成 2 再 inspect 一次，对比岗位数变化，再改回 8。两次的 proposal_hash 都要贴。
+- 步 2：rt_roster（action="inspect"，target_kinds=["binary"]），把 compatibility、每个岗位的 required、gaps、proposal_hash 原样贴出。
 - 步 3：先按项目 skill 在临时项目里建一条可执行路线：re/targets.json 加一个目标（用非可执行测试文件即可），re/routes/R-001.json 用 status: "active" 并声明该目标。然后 rt_dispatch（post_id="triage"、route_id="R-001"、target_ids=[该目标]、objective、evidence_required=["artifact_locator"]、prohibited=[]）。断言：phase="delivered"、task 为 in_progress、owner 正确、started_at=null、re/team/dispatches/*.json 存在且含真实目标哈希与 rule_digest。同时确认工兵没有在收到信封之前就开始跑实验。
 - 步 6（先做 #1 的收口）：等工兵交回 re/team/work/<dispatch>/<attempt>/submission.json，用 outcome="blocked"、run_ids: [] 调 rt_conclude。贴完整返回（含 checks[]、audit_written）、re/routes/R-001.json、re/team/audit.jsonl 末尾两行、以及 task 是否变成 completed。
 - 步 4：对同一岗位再 rt_dispatch 一次（新的 operation_id）。断言：list_agents 里成员数不变（不应出现 rt-triage-2）、task_id 变了、工兵收到的是新契约（新 dispatch/attempt、新 contract_sha256）。然后趁 #2 还在执行时再派第三次，记录被拒的错误码（应为 MEMBER_BUSY）。

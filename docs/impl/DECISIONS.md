@@ -736,7 +736,14 @@ T19 遗留的 5 处（非焚烧类仍带 `phase: 'member_ready'`、台账 `membe
 | bind 闸门 | 只在 `max_posts` 放不下时拒绝（`CAPACITY_EXHAUSTED`）；容量不再参与 |
 | 台账 | `capacity_source` / `capacity_max_*` / `capacity_diagnostics` 删；只留 `used_seats` 存证 |
 
+> **2026-10-30 追加（T26）**：T25 已从 wire schema 删除 `rosterData.capacity` 与 `recommended_members`；
+> 上表这两行**作废**，`roster.json` 与 `rt_roster` 返回都不再带它们，以
+> [规格](../specs/rt-tools.schema.json) 与实现为准（本条不改写上表原文）。
+
 ### 与 specs 的冲突（**未**改 `docs/specs/**`，由 Lead 处置）
+
+> **2026-10-30 追加（T26）**：本节记录 T23 当时的状态；T25 已删除下面 1、2 两条里的规格键并修改
+> `docs/specs/**`，A09 也已由 `acceptance-matrix.md` 标为废止。以下仅作历史记录，不再是现行口径。
 
 1. `docs/specs/rt-tools.schema.json` 仍声明 `rosterInput.capacity`、`dispatchInput.capacity`、
    `rosterData.capacity`（4 个必备整数/null 字段）、`rosterData.recommended_members`。

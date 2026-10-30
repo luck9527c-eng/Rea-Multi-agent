@@ -250,9 +250,8 @@ test('岗位目录不变量：required 族可解析、enabled 缺省 true、预�
     assert.ok(templateIds.has(post.id), `已启用岗位 ${post.id} 不属于任何模板`);
   }
 
-  // T25：容量预算（reserved_member_slots / reserved_activations）已随容量子系统废止，
-  // 不再是契约默认值。catalog.defaults 里的这两个数据键不在本票授权的规格改动范围内
-  // （见 T25 交接说明），所以这里只断言仍在生效的 max_posts。
+  // T26：容量预算（reserved_member_slots / reserved_activations）已随容量子系统废止，并已从
+  // catalog.defaults 删除（T23 废止语义，T26 清数据）。这里只断言仍在生效的 max_posts。
   assert.equal(catalog.defaults.max_posts, 6);
 });
 

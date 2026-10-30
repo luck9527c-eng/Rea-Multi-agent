@@ -163,10 +163,10 @@ readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
 > （DECISIONS D41）—— 宿主的上限不可读，本插件也不再从任何文件推断它。
 >
 > **`re/team/roster.json` 不是成员表。** 它在 `rt_roster(bind)` 时写一次，内容是**当时的绑定计划快照**
-> （`template`、`posts`、`capacity`、`recommended_members`），其中 `members` 与 `tasks` **按构造恒为 `[]`**
+> （`template`、`posts`），其中 `members` 与 `tasks` **按构造恒为 `[]`**
 > （`src/roster.ts` 的 `writeRoster` 调用点），之后**永不更新**。要看真实成员与任务，读宿主
 > （`rt_roster` 的 `data`），**不要读这个文件**——按上表第一行，名册的权威从来不在本地。
-> 另外 `capacity` 那四个字段自 T23 起恒为「未知 / 不预留」（`remaining_*: null`、`reserved_*: 0`），
-> 它们只是 wire schema 的必备键，不表示任何余额。
+> 另外 `rosterData` 自 T25 起**没有** `capacity` 与 `recommended_members` 这两个键
+> （规格已删，D41 的落地面表相应作废）：本地快照与 `rt_roster` 返回都不再带它们。
 > 实测依证：7 名成员之后它仍是 `members: []`
 > （[第三轮记录 §4 N3](../verify/records/20261030-session-c7189ebb.md)）。

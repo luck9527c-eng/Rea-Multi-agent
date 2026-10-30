@@ -3,7 +3,7 @@
 > 覆盖 [`docs/specs/acceptance-matrix.md`](../specs/acceptance-matrix.md) 的 **A01–A44 全部 44 行**，
 > 以及该文件「## 规格静态验证」列出的每一类静态检查。
 >
-> 状态只允许四个值：`pass` / `fail` / `not-run` / `out-of-scope`。**没有占位"通过"**：
+> 状态只允许 `pass` / `fail` / `not-run` / `out-of-scope` / `已废止`。**没有占位"通过"**：
 > 每条 `pass` 都能点到一个 `node --test` 用例名（门禁里就在跑），或 `docs/verify/` 下的一份记录。
 >
 > 本表由 T10 汇总；T9 建的空壳（只列 18 条 L3 行）已被本表取代。
@@ -15,9 +15,10 @@
 > **第三轮**（2026-10-30，`session-c7189ebb`）按 [l3-round3-prompt.md](l3-round3-prompt.md) 只打 T15–T20
 > 改动的路径，记录在 [records/20261030-session-c7189ebb.md](records/20261030-session-c7189ebb.md)。
 > 结果：证成 T15/T16/T17/T18/T20 五处运行时行为，**G3 由 `not-run` 抬到 `pass`**；
-> A09/A38/A40 的 **render 阻塞已清除**（`capacity`、`gaps[].code`、`project_id`/`session_id`/`team_id`
-> 在真会话渲染里可读），但三条各还有第二个要求未被打到，**仍 `not-run`**；
-> **T18b 与 T18c+T19 本轮未验证**（可派岗位 7 < 宿主上限 8，撞不到容量闸门）。
+> A38/A40 的 **render 阻塞已清除**（`gaps[].code`、`project_id`/`session_id`/`team_id`
+> 在真会话渲染里可读），但两条各还有第二个要求未被打到，**仍 `not-run`**；
+> **A09 已于 2026-10-30 废止**（T23/D41 删除容量规划、T25 删除规格键），不再列入待执行行。
+> **T18b 与 T18c+T19 本轮未验证**（相关容量机制已随 T23 删除，不再有容量闸门）。
 
 ## 判定规则（先读）
 
@@ -26,13 +27,14 @@
 | `pass` | 该行要求的观察有**可复跑的自动用例**证明，且用例所在的层**就是矩阵该行要求的最高层**（`L1/L2` 的行必须点到 `test/l2/*.test.mjs`，只有 L1 证据的行按 `not-run`）。`层`列给出规格要求的层；`证据`列注明证据来自哪一层。 |
 | `not-run` | 需要真实 DSH 团队会话（L3）、真实项目 CLI（L2）或故障注入才能判定，且**尚未执行**。`备注`写清缺什么。 |
 | `out-of-scope` | 该行要求的观察**全部**落在规格明确划给 skill 工作流/平台的部分，插件侧没有可执行实现；`备注`附出处。 |
+| `已废止` | 规格已明确废止、不再作为验收项的旧条目（当前仅 A09）；保留历史说明与原判据，便于对照旧记录。 |
 | `fail` | 实现或证据明确不成立。**当前没有 `fail` 行。** |
 
 - **L3 行只按记录里的逐条断言判，不按"整层跑过"判。** 一轮真会话（
   [20261029-session-040cb6df](records/20261029-session-040cb6df.md)）之后，把 L3 行抬到 `pass` 的条件是：
   该行"必须观察到的结果"的**每个分句**都能在记录里点到一段原文证据，且 L1/L2 半也仍然成立。
   按这条口径抬了四行：**A02、A03、A10、A11**。其余 L3 行仍 `not-run`——缺的东西分三类：渲染层读不到
-  （A09/A40）、需要构造（A12/A13/A15/A26/A31/A44）、不可观察（A25）。**没有一条 L3 行是因为"同一次会话里
+  （A40）、需要构造（A12/A13/A15/A26/A31/A44）、不可观察（A25）。**没有一条 L3 行是因为"同一次会话里
   别的行过了"而跟着过的。**
   **唯一例外是 A39**：规格把它的四条观察全部放在 L1（能力匹配不需要会话），T9 的 18 行待执行清单也没把它
   算进去，所以判 `pass`，L3 半未执行写在备注里。
@@ -53,12 +55,13 @@
 | 状态 | 行数 | 编号 |
 |---|---|---|
 | `pass` | **25** | A02、A03、A04、A05、A06、A07、A10、A11、A14、A16、A18、A19、A20、A21、A23、A24、A28、A29、A30、A32、A35、A36、A39、A41、A42 |
-| `not-run` | **18** | A01、A08、A09、A12、A13、A15、A17、A22、A25、A26、A27、A31、A33、A34、A38、A40、A43、A44 |
+| `not-run` | **17** | A01、A08、A12、A13、A15、A17、A22、A25、A26、A27、A31、A33、A34、A38、A40、A43、A44 |
 | `out-of-scope` | **1** | A37 |
+| `已废止` | **1** | A09 |
 | `fail` | **0** | — |
 | 合计 | **44** | A01–A44 |
 
-- `not-run` 的 18 行按缺口分类：**14 行是 L3 会话项**（A01、A08、A09、A12、A13、A15、A22、A25、A26、A31、
+- `not-run` 的 17 行按缺口分类：**13 行是 L3 会话项**（A01、A08、A12、A13、A15、A22、A25、A26、A31、
   A34、A38、A40、A44，缺的是什么逐行写在备注里）；**3 行 L1 已通过但 L2 没构造**（A17、A27、A33，原先误判为
   `pass`，已按"`L1/L2` 的行必须有 L2 证据"的口径降级）；**1 行 L1/L2 都缺**（A43）。
 - 本轮（[20261029-session-040cb6df](records/20261029-session-040cb6df.md)）从 `not-run` 抬到 `pass` 的**四行**：
@@ -78,7 +81,7 @@
 | A06 | L1 | `pass` | [capacity.test.mjs](../../packages/dsh-redteam-lead/test/capacity.test.mjs)「A06 场景：mixed 并集、缺工具、预算只够两岗时稳定裁剪且保留专岗缺口」「vacant / deferred / disabled 三类分开返回，缺口码可区分」；[catalog.test.mjs](../../packages/dsh-redteam-lead/test/catalog.test.mjs)「mixed 给 game+webapp 得到按 post_id 去重的并集，各自专岗都在」 | 并集去重 + 稳定裁剪 + 三类分开 + 不强凑四岗，L1 断言齐全。 |
 | A07 | L1 | `pass` | [capability.test.mjs](../../packages/dsh-redteam-lead/test/capability.test.mjs)「族名本身、插件 ID、子串与前缀都不算命中」「web-recon 组合必须 web、fs、search 全部满足」「binary-static 没有任何默认工具名：存在 REA/MCP 名也不放行」「mcp:<server> 未绑定即缺口，不能凭工具名猜归属」；[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 的 gaps 区分：缺工具、未就绪 provider、预算延后、disabled」；[catalog.test.mjs](../../packages/dsh-redteam-lead/test/catalog.test.mjs)「模板不含 disabled 岗位，web-attack 只出现在 reserved_posts」 | 不凭 REA 名字推定能力、模板需求不可删（[contract.test.mjs](../../packages/dsh-redteam-lead/test/contract.test.mjs)「prohibited / evidence_required 只追加：传空数组不会删掉岗位默认要求」）、disabled 岗不派。 |
 | A08 | L1/L3 | `not-run` | L1 半：[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 工具可见性取自实际执行者：Lead 与 teammate 的 vacant 不同」「执行者注册表是数组形状（宿主真实形状）时 shell/fs/search 三项全部匹配」「按名字为键的旧形状（老宿主/旧替身）仍然被解析」；[host.test.mjs](../../packages/dsh-redteam-lead/test/host.test.mjs)「工具可见性按 agent 名字区分」；[schemas-shape.test.mjs](../../packages/dsh-redteam-lead/test/schemas-shape.test.mjs)（`schemas()` → 工具名集合的取值契约，含「数组形状：绝不把数组下标当工具名」）；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「缺必需能力 → CAPABILITY_MISSING，且不建成员/任务」「执行者注册表是数组形状（宿主真实形状）时派发不再被 CAPABILITY_MISSING 拦下」 | 缺 L3：其他作用域可见/已卸载/后端 fail、bootstrap 失败保留席位返回 partial——需要真实成员与真实工具注册表。L1 半已用宿主真实形状（schema 对象数组）钉住：T15 之前替身按「名字为键的对象」建模，把错的契约保持成了绿色。 |
-| A09 | L1/L3 | `not-run` | L1 半：[capacity.test.mjs](../../packages/dsh-redteam-lead/test/capacity.test.mjs)（16 例）；[team-adapter.test.mjs](../../packages/dsh-redteam-lead/test/team-adapter.test.mjs)「capacity()：有项目声明时 known:true，used 计入失败成员」「capacity()：没有显式声明时 known:false，但 used 仍然可数并给出下一步」；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「未声明容量 → CAPACITY_UNKNOWN；席位不足 → CAPACITY_EXHAUSTED（都不动成员/任务）」；L3 半（只能旁证）：[records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §4.2 | （**render 阻塞已由 T20 清除**：[records/20261030-session-c7189ebb.md](records/20261030-session-c7189ebb.md) §5 —— `capacity` 四字段与 `gaps[].code` 在真会话 render 里可读，三态各异 `null/null`→`1/1`→`2/2`）。仍不能判 `pass`：①席位与 activation 余额**从未分歧**（三次观测都相等）；②**失败成员占位后的实际剩余**从未出现（7 名成员全部成功，无失败占位）。
+| A09 | — | 已废止 | [acceptance-matrix.md](../specs/acceptance-matrix.md) 第 19 行（原文保留） | **2026-10-30 废止**：宿主不公开上限，插件自 T23/D41 起不再做容量规划，T25 又从规格删除 `capacity` / `reserved_*` / `recommended_members`。现行行为是照派、宿主拒绝即按原话返回 `CAPACITY_EXHAUSTED`；原判据「按各余额和预留限制，不以常数 8 替代；未知时不盲目 spawn」不再适用。本行保留废止前记录：曾为 L1/L3 `not-run`，L1 半由容量/适配器/派发用例覆盖，L3 只有两轮旁证。 |
 | A10 | L1/L3 | `pass` | L1 半：[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「契约 >64 KiB 仍能派发：消息 <65536 字节、契约完整、哈希与文件字节一致」「started_at 只认成员写下的 start.json，不从 delivered 推断」；[contract.test.mjs](../../packages/dsh-redteam-lead/test/contract.test.mjs)「成员 bootstrap prompt 只含角色、规则入口与「等待任务」，不含契约正文」；L3 半：[records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §4.3 | 真会话：`rt-triage` 是 `role=teammate`，`task-1` 是 `in_progress` 且 owner 正确；契约文件字节哈希 == `operation.data.contract_sha256` == 任务摘要里的值，身份四元组一致；`started_at` 为 `null`，该 attempt **零 RUN**，成员先核对契约 SHA 再写 `start.json`。**本轮契约是 5644 字节，不是 >64 KiB 场景**——那一半只由 L1 用例覆盖。 |
 | A11 | L1/L3 | `pass` | L1 半：[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「同岗成员忙碌 → MEMBER_BUSY，且零副作用」「同岗已有空闲成员时复用，不新建成员，交付同一份契约引用」；L3 半：[records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §4.4 | 真会话：两次 `list_agents` **字节相同**（teammate 只有 `rt-triage`）；`task-1`→`task-2`，旧的 `completed` 且 owner 保留；新契约 5679 字节、sha `02bb9343…`（≠ 首份 `78fe3662…`）、`work_dir` 换新；忙碌重派 `MEMBER_BUSY` 且 `r2-s4-busy-diff.json` 0/0/0。 |
 | A12 | L1/L3 | `not-run` | L1 半：[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「消息发送失败 → partial + DELIVERY_FAILED + 保留身份；重投只发同一份信封」 | 缺 L3：真实消息上限拒绝与同信封重投。 |
@@ -151,7 +154,6 @@
 |---|---|
 | A01 | 真实会话里确认"未注册工具不是唯一入口"（doctor 与 `rt_roster` 都在会话外可用）——两轮 doctor 已覆盖前两条分句，缺这一条构造 |
 | A08 | 其他作用域可见的工具、已卸载/后端 fail 的 provider；以及 bootstrap 失败后席位仍被占用 |
-| A09 | 真实席位/activation 余额与失败成员占位（render 前提已由 T20 满足）；需构造：①让席位与 activation 余额**分歧**（例：成员 seats 已满但 activation 未满）②造一次**失败成员**占位后再读剩余
 | A12 | 真实消息长度上限/发送失败（需构造） |
 | A13 | **需故障注入**：成员不写 `start.json`；两个时间盒要真等到超时 |
 | A15 | 成员先自行 `complete`（需构造） |
@@ -166,7 +168,7 @@
 | A44 | 连续多轮相同缺口的去重/恢复提示（需连跑两次以上） |
 
 （A02 / A03 / A10 / A11 已由 [20261029-session-040cb6df](records/20261029-session-040cb6df.md) 覆盖，
-不在上面这张表里。）
+不在上面这张表里。A09 已于 2026-10-30 废止，不再需要构造，也不在上表。）
 
 ## 与 `docs/specs/` 的差异（实现以 DECISIONS 为准）
 
@@ -175,8 +177,8 @@
 | 差异 | 裁决 | 影响的行 |
 |---|---|---|
 | 平台"挡住一切下一层创建"不成立：`workflow` 传 `parent` 但不传 `maxDepth`（D5） | 不声称平台挡住；以契约「你没有派发权」+ `TEAM_LEAD_REQUIRED` 补偿，并记为已知限制 | A03（L3 已实测：成员拿不到 Lead 授权、`subagent`/`subagent_fork` 被 depth 挡）/ A34（L3 未覆盖） |
-| 宿主没有受支持的容量余额只读查询（D1/D25） | 允许 `re/team/capacity.json` 或 profile `config.capacity` **显式声明**；都没有 → `CAPACITY_UNKNOWN`；activation 占用不可观测只作 gap | A09（L1 已改判据；L3 只观测到"声明变化改变 `proposal_hash`/岗位数"，余额本身读不到） |
-| `$defs.rosterData.capacity` 只有 4 个字段、没有 `known`（D19） | `known` 只在内部推导，不进 wire shape | 静态验证（`$defs` 用例） |
+| 宿主没有受支持的容量余额只读查询（D1/D41） | 插件不做容量规划、不读任何容量声明、不预留席位；上限由宿主强制，被拒按原话返回 `CAPACITY_EXHAUSTED` | A09（2026-10-30 已废止） |
+| `$defs.rosterData.capacity` / `recommended_members`（D19/D41） | T25 已从规格删除这两个键；D19 与 D41 落地面表仅存历史 | 无（规格已无此形状） |
 | 两套阶段枚举不得混用（D24） | `FAILURE_PHASES` / `OPERATION_PHASES` 各自逐字 | A24 / A32 |
 | `re/env/tools.json` 没有生产者（D11） | 插件容忍缺失、报 unknown/gap，绝不自己生成 | A41 / A42 / A43 |
 | 版本漂移：安装目标 rc.3、checkout 0.2.2-alpha.2（D6/D13） | 基线取 rc.3；删两行同名冲突插件 | A02（L3 已实测：留下的是团队版参数面） |
