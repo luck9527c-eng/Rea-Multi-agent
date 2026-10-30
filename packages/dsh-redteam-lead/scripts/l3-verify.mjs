@@ -682,12 +682,14 @@ const STEPS = [
     title: '`rt_roster`：兼容性、岗位需求、缺口、max_posts 裁剪',
     goal:
       '证明名册是**按当前项目副本和当前能力**算出来的：兼容性有明确判定、可用岗位需求非空、缺口能对上实际缺的东西、' +
-      '岗位数随目标与 `max_posts` 变化；并证明容量键已从 wire schema 删除（传了就是未知字段）。',
+      '岗位数随目标与 `max_posts` 变化；并证明容量键已从 wire schema 删除（传了就是未知字段），' +
+      '`re/team/` 下没有容量声明/观测文件。原 A09 的两条容量余额断言已废止，按 T23 起的现行行为改写为下方 (T23 起) 判据，保留以便对照旧记录。',
     a: ['A40'],
     setup: [
       '在会话里对临时项目跑 `rt_roster`（`action=inspect`，默认只读）。跑之前先 `collect --out <证据目录>\\s2-before.json`。',
       '再跑一次，只改 `target_kinds`（例如 `["webapp"]` → `["game","webapp"]`）或 `max_posts`，记录 `posts` 数量与 `gaps` 的变化。',
-      '对照检查 wire data：`data` 里**没有** `capacity` / `recommended_members` 键；再传一次已删除的 `capacity`，入口应按未知字段拒绝（`INVALID_ARGUMENT`），不是 `CAPACITY_ARGUMENT_OBSOLETE`。',
+      '对照检查 wire data：`data` 里没有容量键（`capacity` / `reserved_*` / 建议成员数）；再传一次已删除的 `capacity`，入口应按未知字段拒绝（`INVALID_ARGUMENT`），不是 `CAPACITY_ARGUMENT_OBSOLETE`。',
+      '核对 `re/team/`：没有任何文件名含 `capacity` 的声明/观测文件；`list_agents` 的 `role=teammate` 计数只作已用席位诊断。',
       '全部 inspect 跑完后 `collect --out <证据目录>\\s2-after.json`，`diff` 必须为空（inspect 不写项目）。',
     ],
     observe: [
@@ -700,23 +702,25 @@ const STEPS = [
       { tag: 'direct', text: '每个可用岗位的 `required`（与 `optional`）都非空；`disabled` 的预留岗不出现在可派岗位里（不得被当成可用岗）。' },
       { tag: 'direct', text: '缺口与当前能力相符：把一个确实缺的能力（例如未安装的 IDA / 未绑定的 provider）留在需求里 → `gaps` 出现 `CAPABILITY_MISSING` 或 `CAPABILITY_NOT_READY`，并且点名缺的能力族，而不是笼统"资源不足"。' },
       { tag: 'direct', text: '岗位数随目标与 `max_posts` 变化：改 `target_kinds`（webapp → game+webapp）后 `posts` 集合变化且并集去重；调小 `max_posts` 后岗位被标 `deferred`（`CAPACITY_EXHAUSTED`），裁剪结果稳定（同样入参两次结果一致）。' },
-      { tag: 'direct', text: 'T25：wire data 里**没有** `capacity` / `recommended_members`；再传 `capacity` 时入口按未知字段返回 `INVALID_ARGUMENT`，**不是** `CAPACITY_ARGUMENT_OBSOLETE`，且没有发生任何宿主调用。' },
+      { tag: 'direct', text: '(T23 起，原 A09) wire data 里没有容量键（`capacity` / `reserved_*` / 建议成员数）；再传 `capacity` 时入口按未知字段返回 `INVALID_ARGUMENT`，**不是** `CAPACITY_ARGUMENT_OBSOLETE`，且没有发生任何宿主调用。' },
+      { tag: 'direct', text: '(T23 起，原 A09) `re/team/` 下不出现任何容量声明/观测文件（文件名含 `capacity` 的文件为零；inspect 前后 `collect` 的路径清单一致）。已用席位只以 `TEAM_SEATS_USED` / `TEAM_SEATS_UNKNOWN` 诊断出现，不参与裁剪。' },
       { tag: 'direct', text: '`action=inspect` 零副作用：跑完后 `collect` 的 `digest` 与 `s2-before.json` 相同，且没有新增 `re/team/binding.json`。' },
       { tag: 'direct', text: 'A40：`data.project_id` 由项目根本身决定（同一根两次一致），`data.session_id`/`team_id` 是本会话的值；**不要**把上一次记录里的 pass 迁移过来。' },
       { tag: 'construct', text: 'A40：换执行者/换入口（例如同一项目在另一个 profile 或另一台机器上打开）后，`compatibility` 必须重算而不是沿用旧判定；构造方式是改 `re/team/binding.json` 里的 `rule_digest`/`session` 再 inspect，期望 `RECOVERY_REQUIRED` 或明确的"需要重新兼容检查"。' },
     ],
     codes: [
       ['缺团队规则段/布局不支持', '`SKILL_INCOMPATIBLE` / `PROJECT_NOT_CONFIGURED`', '不得覆盖副本、不得自动 init'],
-      ['传已删除的 capacity（T25）', '`INVALID_ARGUMENT`（未知字段）', '不是 `CAPACITY_ARGUMENT_OBSOLETE`'],
+      ['传已删除的 capacity（T23 起）', '`INVALID_ARGUMENT`（未知字段）', '不是 `CAPACITY_ARGUMENT_OBSOLETE`'],
       ['缺能力', '`CAPABILITY_MISSING`', '点名能力族与下一步'],
       ['同一个根换了会话又来改', '`PROJECT_SESSION_MISMATCH`', '先接管/解绑'],
     ],
     evidence: [
       '两次（或多组入参）`rt_roster` 的**完整**返回（含传 `capacity` 被拒的原文）。',
+      '`list_agents` 的原始返回（`role=teammate` 计数；证明已用席位来自宿主名册）。',
       '`re/project.json` 与项目 skill 副本路径（用于证明兼容性读的是项目副本）。',
     ],
     gaps: [
-      '本插件**不读**任何容量声明（`re/team/capacity.json` 已删除，DECISIONS D41/T23）：`max_posts` 是操作者给的岗位数上限，不是宿主能创建多少成员的预测；宿主的真实上限只在它拒绝 spawn 时可见。',
+      '本插件**不读**任何容量声明（容量声明/观测文件已随 T23/D41 删除）：`max_posts` 是操作者给的岗位数上限，不是宿主能创建多少成员的预测；宿主的真实上限只在它拒绝 spawn 时可见。',
       '`rt_roster` 无法回答"还剩几个席位上限"；`used` 只能从 `list_agents` 数 `role=teammate` 得到。',
     ],
   },
@@ -746,11 +750,13 @@ const STEPS = [
       { tag: 'construct', text: 'A12：消息层失败要带已有身份返回 `partial`，且**同信封重投不重复启动**。构造方式：把 `delivery_timeout_ms` 调到极小值或临时把契约文件改成不可读，再观察 `status=partial` 且 `data` 里保留 `dispatch_id`/`attempt_id`；重投同一 `operation_id` 返回原结果（`replayed=true`）。' },
       { tag: 'construct', text: 'A12：超长消息必须被拒（`DELIVERY_FAILED`，`bytes`/`limit` 可读），不得截断后假报成功。构造方式：把 `objective` 撑到超过 65536 字节（注意 `send_message` 按含信封前缀的 JSON 字节计量，CJK 3 字节/字）。' },
       { tag: 'unobservable', text: 'A13：无 `start.json` 超 `delivery_timeout_ms` 必须报"未确认开始"而不是"已开始"。这一次性会话里成员会自动起跑，无法可靠制造"不写 start.json"，只能记 not-run。' },
+      { tag: 'construct', text: '(T23 起) 宿主真的拒绝 spawn（席位/activation 满）时：回执 `status=partial`、`code=CAPACITY_EXHAUSTED`，`diagnostics[]` 逐字含宿主原话与 `hostCode`，**不出现**"烧掉/损失一个席位"一类措辞。只在本会话自然撞到上限时记录；**不得**为触发它故意烧名字/席位。' },
     ],
     codes: [
       ['路线不存在/状态不可派', '`PROJECT_NOT_CONFIGURED` / `RECOVERY_REQUIRED`', '先按 skill 建路线'],
       ['岗位被别人占着', '`MEMBER_BUSY`', '先收口再派，不排队'],
       ['前置任务未完', '`DEPENDENCY_BLOCKED`', 'blocked 且零副作用'],
+      ['宿主拒绝 spawn（席位/activation 满）', '`CAPACITY_EXHAUSTED` / `partial`', '逐字含宿主原话；不声称"烧掉/损失"'],
       ['消息层失败', '`DELIVERY_FAILED` / `partial`', '保留已有身份'],
     ],
     evidence: [
@@ -758,6 +764,7 @@ const STEPS = [
       '`team_task_list` 与 `list_agents` 的原始输出（派发后立刻取）。',
       '`re/team/dispatches/<D>.json` 的前 40 行（证明正文完整而不是引用摘要）+ 它的 SHA-256。',
       '`s3-before.json` / `s3-after.json` / `diff` 输出。',
+      '宿主拒绝时的原始回执与 `diagnostics[]`（仅在本会话自然撞到上限时）。',
       '成员第一份回报的原文（证明它是照契约做的、没有提前实验）。',
     ],
     gaps: [

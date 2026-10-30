@@ -6,8 +6,19 @@
 > **状态：未执行。** 截至本文件生成时，第三层一次都没有跑过。本文件是待办与判定标准，**不是通过结论**；
 > 通过与否只由 `docs/verify/` 下填好的记录文件决定（见 `l3-record-template.md`）。
 
-七步共 54 条断言，其中 39 条可直接观察；其余标了「需构造」或「不可观察」——
+七步共 55 条断言，其中 39 条可直接观察；其余标了「需构造」或「不可观察」——
 **不要**用"看起来对"去填这三类里的后两类。
+
+## 执行顺序：**不是** 1→2→3→4→5→6→7
+
+第 4 步要求"先完成同岗首个任务的验收，再派下一任务"，而"完成验收"正是第 6 步的内容
+（`rt_conclude` 走完归档/seal/index/check 才能 `complete`）。所以第 4 步**依赖**第 6 步。
+
+**按 `1 → 2 → 3 → 6 → 4 → 5 → 7` 执行。**
+
+省力技巧：第 6 步的第一次收口用 `outcome="blocked"` + `run_ids: []`（工兵报"缺某项能力"），
+收口路径照样完整走一遍但不需要真跑实验、不需要封存；第 4 步要验的是**席位复用**，不是分析质量。
+真实 `seal` + `check --hashes` 留给第 6 步的第二轮（交 `finding`，带真 RUN 与 `artifact_locator` 锚点）。
 
 ## 标记约定
 
@@ -87,23 +98,24 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 - 「同名工具」在本 preset 下的另一半（`tool-subagent-control` 的 `send_message/list_agents/interrupt_agent`）**已被 patch 行删除**，所以会话里不存在两个活着的同名工具可供对比。能观察的只有「留下的这个的参数面/行为属于团队版」+「被删的那行确实不在 patch 里」。这是本步的如实边界，不是失败。
 - `list_agents` 的确切字段名以实际返回为准；若与 `name/role/status` 不同，照抄原始输出，不要按预期改写。
 
-## 第 2 步 — `rt_roster`：兼容性、岗位需求、缺口、预算
+## 第 2 步 — `rt_roster`：兼容性、岗位需求、缺口、max_posts 裁剪
 
-**目标**：证明名册是**按当前项目副本和当前能力**算出来的：兼容性有明确判定、可用岗位需求非空、缺口能对上实际缺的东西、岗位数随目标与预算变化，且容量未知时不盲目派发。
+**目标**：证明名册是**按当前项目副本和当前能力**算出来的：兼容性有明确判定、可用岗位需求非空、缺口能对上实际缺的东西、岗位数随目标与 `max_posts` 变化；并证明容量键已从 wire schema 删除（传了就是未知字段），`re/team/` 下没有容量声明/观测文件。原 A09 的两条容量余额断言已废止，按 T23 起的现行行为改写为下方 (T23 起) 判据，保留以便对照旧记录。
 
-**本步覆盖的 A 编号**：`A09`、`A40`
+**本步覆盖的 A 编号**：`A40`
 
 ### 怎么做
 
 1. 在会话里对临时项目跑 `rt_roster`（`action=inspect`，默认只读）。跑之前先 `collect --out <证据目录>\s2-before.json`。
 2. 再跑一次，只改 `target_kinds`（例如 `["webapp"]` → `["game","webapp"]`）或 `max_posts`，记录 `posts` 数量与 `gaps` 的变化。
-3. 若项目里没有 `re/team/capacity.json`：先看 `CAPACITY_UNKNOWN`；再按 D1 的格式写上 `schema_version/declared_at/declared_by/maxMembers/maxActiveSubagents` 后重跑，看 `capacity` 字段与 `gaps` 怎么变。
-4. 全部 inspect 跑完后 `collect --out <证据目录>\s2-after.json`，`diff` 必须为空（inspect 不写项目）。
+3. 对照检查 wire data：`data` 里没有容量键（`capacity` / `reserved_*` / 建议成员数）；再传一次已删除的 `capacity`，入口应按未知字段拒绝（`INVALID_ARGUMENT`），不是 `CAPACITY_ARGUMENT_OBSOLETE`。
+4. 核对 `re/team/`：没有任何文件名含 `capacity` 的声明/观测文件；`list_agents` 的 `role=teammate` 计数只作已用席位诊断。
+5. 全部 inspect 跑完后 `collect --out <证据目录>\s2-after.json`，`diff` 必须为空（inspect 不写项目）。
 
 ### 看哪里
 
 - `data.compatibility`（`status`/`gaps`/`versions` 或 `rule_digest` 一类字段）与 `data.posts[]`（每个岗位的 `id`/`required`/`optional`/`priority`）。
-- `data.gaps[].code` 与 `reason`/`next_step`；`data.capacity` 只有四个字段（`remaining_member_slots`/`remaining_activations`/`reserved_member_slots`/`reserved_activations`），未知用 `null`（D19：**没有** `known`）。
+- `data.gaps[].code` 与 `reason`/`next_step`；已用席位在诊断里（`TEAM_SEATS_USED` / `TEAM_SEATS_UNKNOWN`），不参与岗位裁剪。
 - `data.proposal_hash` 与 `data.binding_ref`：inspect 不得写 `binding_ref`（必须是 `null`）。
 
 ### 可观察断言
@@ -111,9 +123,9 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 - [ ] 〔可观察〕项目副本兼容性有明确判定，不是"读到了就算过"：缺团队规则段 → `SKILL_INCOMPATIBLE` 且 `next_step` 要求按 skill 合并项目副本（**不得**用全局副本覆盖，也不得自动 `init`）。
 - [ ] 〔可观察〕每个可用岗位的 `required`（与 `optional`）都非空；`disabled` 的预留岗不出现在可派岗位里（不得被当成可用岗）。
 - [ ] 〔可观察〕缺口与当前能力相符：把一个确实缺的能力（例如未安装的 IDA / 未绑定的 provider）留在需求里 → `gaps` 出现 `CAPABILITY_MISSING` 或 `CAPABILITY_NOT_READY`，并且点名缺的能力族，而不是笼统"资源不足"。
-- [ ] 〔可观察〕岗位数随目标与预算变化：改 `target_kinds`（webapp → game+webapp）后 `posts` 集合变化且并集去重；调小 `max_posts` 或 `reserved_member_slots` 后岗位被裁剪，裁剪结果稳定（同样入参两次结果一致）。
-- [ ] 〔可观察〕A09：没有容量声明时 `capacity.remaining_member_slots`/`remaining_activations` 为 `null`，`rt_roster`/`rt_dispatch` 报 `CAPACITY_UNKNOWN`，**不得**用常数 8 兜底、也不得靠 spawn 试探。
-- [ ] 〔可观察〕A09：声明容量后 `remaining_*` 变成可读数值（= 声明上限扣掉预留），并且 `gaps` 里出现 `ACTIVATION_USAGE_UNOBSERVED` 一类非阻塞诊断——「上限已声明、占用不可观测」必须是一条可读的 gap（D25），不是静默超配。
+- [ ] 〔可观察〕岗位数随目标与 `max_posts` 变化：改 `target_kinds`（webapp → game+webapp）后 `posts` 集合变化且并集去重；调小 `max_posts` 后岗位被标 `deferred`（`CAPACITY_EXHAUSTED`），裁剪结果稳定（同样入参两次结果一致）。
+- [ ] 〔可观察〕(T23 起，原 A09) wire data 里没有容量键（`capacity` / `reserved_*` / 建议成员数）；再传 `capacity` 时入口按未知字段返回 `INVALID_ARGUMENT`，**不是** `CAPACITY_ARGUMENT_OBSOLETE`，且没有发生任何宿主调用。
+- [ ] 〔可观察〕(T23 起，原 A09) `re/team/` 下不出现任何容量声明/观测文件（文件名含 `capacity` 的文件为零；inspect 前后 `collect` 的路径清单一致）。已用席位只以 `TEAM_SEATS_USED` / `TEAM_SEATS_UNKNOWN` 诊断出现，不参与裁剪。
 - [ ] 〔可观察〕`action=inspect` 零副作用：跑完后 `collect` 的 `digest` 与 `s2-before.json` 相同，且没有新增 `re/team/binding.json`。
 - [ ] 〔可观察〕A40：`data.project_id` 由项目根本身决定（同一根两次一致），`data.session_id`/`team_id` 是本会话的值；**不要**把上一次记录里的 pass 迁移过来。
 - [ ] 〔需构造〕A40：换执行者/换入口（例如同一项目在另一个 profile 或另一台机器上打开）后，`compatibility` 必须重算而不是沿用旧判定；构造方式是改 `re/team/binding.json` 里的 `rule_digest`/`session` 再 inspect，期望 `RECOVERY_REQUIRED` 或明确的"需要重新兼容检查"。
@@ -123,20 +135,19 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 | 触发 | 期望 `code` / 状态 | 备注 |
 |---|---|---|
 | 缺团队规则段/布局不支持 | `SKILL_INCOMPATIBLE` / `PROJECT_NOT_CONFIGURED` | 不得覆盖副本、不得自动 init |
-| 没有容量声明就派发 | `CAPACITY_UNKNOWN` | 先声明或改 profile config |
-| 容量文件坏了/读不了 | `CAPACITY_DECLARATION_UNREAD` | 读失败不得当成没有声明 |
+| 传已删除的 capacity（T23 起） | `INVALID_ARGUMENT`（未知字段） | 不是 `CAPACITY_ARGUMENT_OBSOLETE` |
 | 缺能力 | `CAPABILITY_MISSING` | 点名能力族与下一步 |
 | 同一个根换了会话又来改 | `PROJECT_SESSION_MISMATCH` | 先接管/解绑 |
 
 ### 本步要贴的证据
 
-- 两次（或多组入参）`rt_roster` 的**完整**返回。
-- 改容量声明前后的 `re/team/capacity.json` 内容 + `collect` 两次（`s2-capacity-before/after.json`）。
+- 两次（或多组入参）`rt_roster` 的**完整**返回（含传 `capacity` 被拒的原文）。
+- `list_agents` 的原始返回（`role=teammate` 计数；证明已用席位来自宿主名册）。
 - `re/project.json` 与项目 skill 副本路径（用于证明兼容性读的是项目副本）。
 
 ### 本步不可观察 / 有边界的项（记 `not-run`，不要编）
 
-- `remaining_activations` 的真实占用**不可观测**（宿主没有任何 activation 占用查询），只能看到"D25 组装后的声明值 + 一条 gap"。因此"岗位数随预算变化"只能通过改声明或 `reserved_*` 入参构造，不能靠真实占用触发。
+- 本插件**不读**任何容量声明（容量声明/观测文件已随 T23/D41 删除）：`max_posts` 是操作者给的岗位数上限，不是宿主能创建多少成员的预测；宿主的真实上限只在它拒绝 spawn 时可见。
 - `rt_roster` 无法回答"还剩几个席位上限"；`used` 只能从 `list_agents` 数 `role=teammate` 得到。
 
 ## 第 3 步 — 首次 `rt_dispatch`：身份、状态、契约落盘、不提前实验
@@ -167,6 +178,7 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 - [ ] 〔需构造〕A12：消息层失败要带已有身份返回 `partial`，且**同信封重投不重复启动**。构造方式：把 `delivery_timeout_ms` 调到极小值或临时把契约文件改成不可读，再观察 `status=partial` 且 `data` 里保留 `dispatch_id`/`attempt_id`；重投同一 `operation_id` 返回原结果（`replayed=true`）。
 - [ ] 〔需构造〕A12：超长消息必须被拒（`DELIVERY_FAILED`，`bytes`/`limit` 可读），不得截断后假报成功。构造方式：把 `objective` 撑到超过 65536 字节（注意 `send_message` 按含信封前缀的 JSON 字节计量，CJK 3 字节/字）。
 - [ ] 〔不可观察〕A13：无 `start.json` 超 `delivery_timeout_ms` 必须报"未确认开始"而不是"已开始"。这一次性会话里成员会自动起跑，无法可靠制造"不写 start.json"，只能记 not-run。
+- [ ] 〔需构造〕(T23 起) 宿主真的拒绝 spawn（席位/activation 满）时：回执 `status=partial`、`code=CAPACITY_EXHAUSTED`，`diagnostics[]` 逐字含宿主原话与 `hostCode`，**不出现**"烧掉/损失一个席位"一类措辞。只在本会话自然撞到上限时记录；**不得**为触发它故意烧名字/席位。
 
 ### 期望错误码
 
@@ -175,7 +187,7 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 | 路线不存在/状态不可派 | `PROJECT_NOT_CONFIGURED` / `RECOVERY_REQUIRED` | 先按 skill 建路线 |
 | 岗位被别人占着 | `MEMBER_BUSY` | 先收口再派，不排队 |
 | 前置任务未完 | `DEPENDENCY_BLOCKED` | blocked 且零副作用 |
-| 容量未知 | `CAPACITY_UNKNOWN` | 声明容量 |
+| 宿主拒绝 spawn（席位/activation 满） | `CAPACITY_EXHAUSTED` / `partial` | 逐字含宿主原话；不声称"烧掉/损失" |
 | 消息层失败 | `DELIVERY_FAILED` / `partial` | 保留已有身份 |
 
 ### 本步要贴的证据
@@ -184,6 +196,7 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 - `team_task_list` 与 `list_agents` 的原始输出（派发后立刻取）。
 - `re/team/dispatches/<D>.json` 的前 40 行（证明正文完整而不是引用摘要）+ 它的 SHA-256。
 - `s3-before.json` / `s3-after.json` / `diff` 输出。
+- 宿主拒绝时的原始回执与 `diagnostics[]`（仅在本会话自然撞到上限时）。
 - 成员第一份回报的原文（证明它是照契约做的、没有提前实验）。
 
 ### 本步不可观察 / 有边界的项（记 `not-run`，不要编）
@@ -373,7 +386,7 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 - [ ] 〔可观察〕成员仍留在名册：`list_agents` 仍有该 `name`，`role=teammate` 计数不变（席位不因中断释放）。
 - [ ] 〔可观察〕中断不释放任务：`team_task_list` 里该任务仍是原 `task_id`、`in_progress`、`ownerName` 不变；没有新的 attempt 被自动创建。
 - [ ] 〔可观察〕带 nonce 的 `send_message` 投递成功，且**成员回报里出现该 nonce 原文**——这是"真的醒了"的唯一可观察判据（投递确认不等于它处理了）。
-- [ ] 〔可观察〕A34：收尾停止条件可读——所有任务 `completed` 或已显式交接，`rt_roster` 的 `capacity` 余额不再变化，Lead 不再新开路线；每轮先 `list_agents` + `team_task_list` 再决定动作（30 秒控制点回读），空闲等待是有界 `wait_agent` 而不是无限轮询。
+- [ ] 〔可观察〕A34：收尾停止条件可读——所有任务 `completed` 或已显式交接，Lead 不再新开路线；每轮先 `list_agents` + `team_task_list` 再决定动作（30 秒控制点回读），空闲等待是有界 `wait_agent` 而不是无限轮询。
 - [ ] 〔不可观察〕A34 的"不承诺自动唤醒"是行为约束，不是单次调用能观察到的字段；只能以记录里"没有无限轮询/没有新开路线"的旁证支撑。
 
 ### 期望错误码
@@ -404,7 +417,6 @@ node <仓库根>/packages/dsh-redteam-lead/scripts/l3-verify.mjs diff --before <
 | `A02` | 第 1 步 | 部分：只能证明留下的是团队版，另一半已被 patch 删除 |
 | `A03` | 第 5 步 | 可观察（真实 teammate 的原始返回 + 空 diff） |
 | `A08` | 第 5 步 | 可观察（裸子代理与成员两种错误形状分开记） |
-| `A09` | 第 2 步 | 可观察（`CAPACITY_UNKNOWN` + 声明后的余额） |
 | `A10` | 第 3 步 | 可观察（契约 SHA-256 == `contract_sha256`；`started_at` 为 null） |
 | `A11` | 第 4 步 | 可观察（成员数不变、`task_id` 变、`MEMBER_BUSY` + 空 diff） |
 | `A12` | 第 3 步 | 需构造（撑爆消息 / 极小超时），否则 not-run |

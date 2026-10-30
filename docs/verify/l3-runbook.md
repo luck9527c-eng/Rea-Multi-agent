@@ -1,6 +1,6 @@
 # L3 执行 runbook（一次性会话，复制粘贴即可）
 
-> 配套文件：`l3-checklist.md`（判据，54 条断言）、`l3-record-template.md`（记录模板）、`scripts/l3-verify.mjs`（取证）。
+> 配套文件：`l3-checklist.md`（判据，55 条断言）、`l3-record-template.md`（记录模板）、`scripts/l3-verify.mjs`（取证）。
 > 本文件解决两件事：**正确的执行顺序**，以及**怎样让会话里的 agent 自己跑完而不用自评通过**。
 
 ## 0. 已经准备好的东西（换机器要重做）
@@ -95,7 +95,7 @@
 ## 4. 已声明不可观察的（照实记 `not-run`，别硬造）
 
 1. `workflow` 不受 depth 限制（DECISIONS D5）—— 验证它要真开出孙代，会烧 activation；只作已知限制。
-2. activation 占用无宿主查询 —— `remaining_activations` 只能是声明值 + `ACTIVATION_USAGE_UNOBSERVED` gap。
+2. 席位/activation 上限无宿主查询 —— 只能从 `list_agents` 数已用席位（诊断 `TEAM_SEATS_USED`；数不到 `TEAM_SEATS_UNKNOWN`），不预测、不预留；宿主拒绝时按原话报 `CAPACITY_EXHAUSTED`。
 3. 同名工具无对照组 —— 本 preset 已删掉那两个冲突行，只能旁证"留下的那个是团队版"。
 4. 故障注入做不了 —— A25（响应丢失）、A13（不写 `start.json` 的超时）在一次性会话里不可靠复现。
 5. `send_message` 返回只是投递确认 —— nonce 必须从**后续**团队消息里读到。

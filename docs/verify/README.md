@@ -4,7 +4,7 @@
 >
 > 本目录里的东西是**待办与判定标准**，不是通过记录。截至本文件写下时：
 >
-> - `docs/verify/l3-checklist.md` 已生成（七步 × 54 条断言），**一条都没跑过**；
+> - `docs/verify/l3-checklist.md` 已生成（七步 × 55 条断言），**一条都没跑过**；
 > - `packages/dsh-redteam-lead/scripts/l3-verify.mjs` 的 `collect` / `diff` / `checklist` 只在**人造的
 >   `re/` 目录树**上验证过（见 T9 的报告），没有在真实会话里用过；
 > - `docs/verify/acceptance-status.md`（T10 已补全 A01–A44 全表）里所有 L3 行都是 `not-run`，
@@ -205,8 +205,10 @@ cd $env:USERPROFILE\.dsh\profiles\desktop
 1. **`workflow` 不受 depth 限制（DECISIONS D5）**：`subagent`/`subagent_fork` 会被 depth 挡住，但
    `workflow` 传 `parent` 而不传 `maxDepth`。真要验证就得让它开出孙代——**不要在验收里跑 `workflow`**，
    它会烧掉 activation 名额并污染后续步骤。这一条只作为已知限制记录。
-2. **activation 占用不可观测**：宿主没有任何查询 activation 占用的 API。所以 `remaining_activations`
-   只能来自项目/配置的**声明**，`ACTIVATION_USAGE_UNOBSERVED` 是一条 gap 而不是错误。
+2. **席位/activation 上限不可观测**：宿主没有任何查询上限的 API（`maxMembers` 没有 getter，
+   `maxActiveSubagents` 在团队服务里不存在）。插件只把已用席位数作为诊断如实报出
+   （`TEAM_SEATS_USED`；数不到则 `TEAM_SEATS_UNKNOWN`），不预测、不预留、也不为"学上限"而试探；
+   宿主真的拒绝时按原话返回 `CAPACITY_EXHAUSTED`。
 3. **同名工具的对照组不存在**：本 preset 已经删掉了 `tool-subagent-control` /
    `tool-subagent-list-agents` 两行，所以会话里没有两个活着的 `send_message` 可对比。能证明的是
    「留下的那个的参数面/行为属于团队版」+「被删的行确实不在 patch 里」。
@@ -225,5 +227,5 @@ cd $env:USERPROFILE\.dsh\profiles\desktop
 | 模式列表里没有「红队指挥」 | 旧会话沿用旧 preset，或 patch 行没生效 | **新开**会话；再看 doctor 三项是否为 `true` |
 | `rt_roster` 返回 `TEAM_SERVICE_UNAVAILABLE` | 团队 profile bundle 没启用 | 把团队 profile 列进 `bundles` |
 | `rt_roster` 返回 `SKILL_INCOMPATIBLE` | 项目副本缺团队规则段/`project.py` | 按 skill 合并项目副本，**不要**全局覆盖 |
-| `CAPACITY_UNKNOWN` | 没有容量声明（D1） | 写 `re/team/capacity.json` 或改 profile `config.capacity` |
+| `CAPACITY_UNKNOWN` | 保留码：T23 起本插件不再产生它（容量不可读不再是拒绝理由） | 无需处置；真被宿主拒绝时看 `CAPACITY_EXHAUSTED` 与宿主原话 |
 | `collect` 报 "--out 不能落在 --project 之内" | 证据目录放进了项目 | 换到项目外目录 |
