@@ -18,6 +18,7 @@
  * 每步「先存意图、后存实际 ID」；同 `operation_id` 重入从已存阶段续做
  * （不重复 spawn、不建第二个 task），响应丢失时按确定的成员名 / 任务摘要标记唯一关联。
  */
+import type { CallCapacity } from './capacity-source.js';
 import type { Diagnostic, HandlerCtx, HandlerResult } from './types.js';
 /** 项目规则入口（bootstrap prompt 与交付信封都指向它）。 */
 export declare const RULES_ENTRY = "docs/agents/reverse-project-management.md";
@@ -41,6 +42,14 @@ interface DispatchRequest {
     timebox_ms: number;
     delivery_timeout_ms: number;
     retry_of: Record<string, unknown> | null;
+    /**
+     * T18：本次调用声明的容量（优先级最高）。
+     *
+     * **可选**而不是 `null` 占位：`operationInputHash()` 会对整个请求对象求哈希，
+     * 未声明时也不能凭空多出一个键 —— 否则升级前登记的 operation 在恢复时会被判
+     * `OPERATION_CONFLICT`（输入哈希变了，但输入其实没变）。
+     */
+    capacity?: CallCapacity | null;
 }
 /** `normalizeDispatchInput` 的结果：形状错误时 `value` 为空对象（调用方不会读它）。 */
 type NormalizedDispatch = {

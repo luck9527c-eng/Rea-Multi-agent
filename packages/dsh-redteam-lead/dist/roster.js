@@ -21,6 +21,7 @@
 import { createHash } from 'node:crypto';
 import * as envelopeModule from './envelope.js';
 import * as bindingModule from './binding.js';
+import * as capacitySource from './capacity-source.js';
 import { toolNamesFromSchemas } from './capability.js';
 import { isRecord, recordOf, thrownMessage } from './guards.js';
 const TOOL = 'rt_roster';
@@ -514,6 +515,17 @@ function capacityGapsToDiagnostics(value) {
     });
 }
 /**
+ * 解析本次提议的**生效容量**（T18 优先级）：按调用 > 项目 > profile > 本会话观测 > unknown。
+ *
+ * 适配器（D1）已经把「项目 `re/team/capacity.json` > profile `config.capacity`」合过一次并给出
+ * `evidence.source`，这里只在其上叠加「本次调用声明」与「本会话观测值」。观测值按会话隔离：
+ * `session_id` 不匹配（或无法确定当前会话）就不套用，理由见 `capacity-source` 文件头。
+ */
+async function effectiveCapacityFor(root, sessionId, call, declared) {
+    const observed = await capacitySource.readObservedCapacity(root, sessionId);
+    return capacitySource.resolveCapacity({ call, declared, observed });
+}
+/**
  * 调 `capacity.planBudget`。
  *
  * 入参形状由本模块的 `PlanBudgetInput` 给出；`capacity.PlanBudgetInput` 把每个字段都声明成
@@ -583,15 +595,17 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
             member: reusable ? reusedName : null,
         }));
     }
-    const cap = await readCapacity(deps, root, env);
-    if (cap.ok === false) {
+    const declaredCap = await readCapacity(deps, root, env);
+    if (declaredCap.ok === false) {
         return {
             ok: false,
-            code: cap.code,
-            diagnostics: cap.diagnostics ?? [],
-            capacityGaps: capacityGapsToDiagnostics(cap.gaps),
+            code: declaredCap.code,
+            diagnostics: declaredCap.diagnostics ?? [],
+            capacityGaps: capacityGapsToDiagnostics(declaredCap.gaps),
         };
     }
+    // T18：叠加「按调用声明」与「本会话观测值」，得到本次提议真正使用的上限。
+    const cap = await effectiveCapacityFor(root, session.session_id, request.capacity, declaredCap);
     // D25：上限未声明 → null（defer + CAPACITY_UNKNOWN）；已声明 → 传声明上限，占用不可观测只作 gap。
     const remainingActivations = cap.activations.known === true ? cap.activations.total : null;
     const plan = planBudgetOf(deps, {
@@ -650,13 +664,15 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
         capabilityVersion,
         budget,
         declaredBudget,
+        capacitySource: cap.source,
+        capacityLimits: { max_members: cap.memberSlots.total, max_active_subagents: cap.activations.total },
         digests,
         bindingFile,
         proposalHash,
     };
 }
 /** target_kinds 为空时的「只查环境」提议：不猜类别、不给岗位、不给 proposal_hash。 */
-async function assembleEnvironmentOnly(ctx, deps, { root, request, compatibility, env }) {
+async function assembleEnvironmentOnly(ctx, deps, { root, session, request, compatibility, env }) {
     const tools = toolsFor(ctx);
     const inventory = await deps.binding.readJsonIfPresent(root, 're/env/tools.json', deps);
     const gaps = [...(compatibility?.gaps ?? [])];
@@ -666,9 +682,11 @@ async function assembleEnvironmentOnly(ctx, deps, { root, request, compatibility
     if (!inventory.present) {
         gaps.push(env.diagnostic('TOOL_INVENTORY_MISSING', `没有可用的工具清单快照：${inventory.reason ?? 're/env/tools.json 缺失'}`, '由 Lead 按 skill 的工具清单规则补齐；插件不生成清单、不隐式扫描'));
     }
-    const cap = await readCapacity(deps, root, env);
-    if (cap.ok === false)
-        return { ok: false, code: cap.code, diagnostics: cap.diagnostics ?? [] };
+    const declaredCap = await readCapacity(deps, root, env);
+    if (declaredCap.ok === false) {
+        return { ok: false, code: declaredCap.code, diagnostics: declaredCap.diagnostics ?? [] };
+    }
+    const cap = await effectiveCapacityFor(root, session.session_id, request.capacity, declaredCap);
     const remainingActivations = cap.activations.known === true ? cap.activations.total : null;
     const plan = planBudgetOf(deps, {
         candidates: [],
@@ -686,6 +704,8 @@ async function assembleEnvironmentOnly(ctx, deps, { root, request, compatibility
         gaps: dedupeDiagnostics([...gaps, ...plan.gaps, ...capacityGapsToDiagnostics(cap.gaps)]),
         capacity: projectCapacity(plan.capacity),
         recommendedMembers: 0,
+        capacitySource: cap.source,
+        capacityLimits: { max_members: cap.memberSlots.total, max_active_subagents: cap.activations.total },
         proposalHash: null,
     };
 }
@@ -808,6 +828,9 @@ async function appendRosterAudit(deps, outcome) {
 async function runRoster(ctx, deps, input, env, action) {
     const operationId = sanitizeOperationId(input.operation_id);
     const kinds = stringList(input.target_kinds);
+    // T18：按调用声明的容量。wire schema 已经校验过一次；handler 也会被直接调用（测试/恢复），
+    // 所以这里再判一次形状，非法就按 INVALID_ARGUMENT 拒（不静默丢掉用户声明的上限）。
+    const callCapacity = capacitySource.parseCallCapacity(input.capacity);
     const request = {
         action,
         kinds,
@@ -822,8 +845,20 @@ async function runRoster(ctx, deps, input, env, action) {
         reservedActivations: typeof input.reserved_activations === 'number' && Number.isInteger(input.reserved_activations)
             ? input.reserved_activations
             : 2,
+        capacity: callCapacity.value,
         raw: input,
     };
+    if (callCapacity.issue !== null) {
+        return {
+            envelope: env.error({
+                code: 'INVALID_ARGUMENT',
+                operationId,
+                diagnostics: [env.diagnostic('INVALID_ARGUMENT', callCapacity.issue, '按 $defs.rosterInput.capacity 传 {max_members, max_active_subagents}（都必须是 >=1 的整数）；不传则按项目/profile 声明')],
+            }),
+            root: null,
+            audit: { kind: `roster_${action}`, verdict: 'rejected' },
+        };
+    }
     // 1. 身份（唯一来源；入参自报角色被忽略）。
     const identity = await deps.identity.resolveCaller(ctx);
     if (!identity || identity.ok !== true) {
@@ -950,7 +985,7 @@ async function runRoster(ctx, deps, input, env, action) {
     // 5. 提议（inspect 与 bind/takeover 共用同一份计算）。
     const proposal = kinds.length > 0
         ? await assembleProposal(ctx, deps, { root, projectId, session, kinds, request, compatibility, env })
-        : await assembleEnvironmentOnly(ctx, deps, { root, request, compatibility, env });
+        : await assembleEnvironmentOnly(ctx, deps, { root, session, request, compatibility, env });
     if (proposal.ok !== true) {
         const known = typeof deps.errors?.isErrorCode === 'function' && deps.errors.isErrorCode(proposal.code);
         const code = known && typeof proposal.code === 'string' ? proposal.code : 'INVALID_ARGUMENT';
@@ -1171,6 +1206,10 @@ async function bindProject(ctx, shared) {
                     epoch: existing?.binding?.epoch ?? null,
                     input_epoch: existing?.binding?.epoch ?? null,
                     proposal_hash: proposal.proposalHash,
+                    // T18：出问题要能回答「当时它以为上限是多少」。
+                    capacity_source: proposal.capacitySource ?? null,
+                    capacity_max_members: proposal.capacityLimits?.max_members ?? null,
+                    capacity_max_active_subagents: proposal.capacityLimits?.max_active_subagents ?? null,
                 });
             }
             const existingEpoch = existingBinding?.epoch;
@@ -1397,6 +1436,10 @@ async function takeoverProject(ctx, shared) {
                     input_epoch: oldEpoch,
                     recovery_ref: request.recoveryRef,
                     proposal_hash: proposal.proposalHash,
+                    // T18：与 bind 同一口径。
+                    capacity_source: proposal.capacitySource ?? null,
+                    capacity_max_members: proposal.capacityLimits?.max_members ?? null,
+                    capacity_max_active_subagents: proposal.capacityLimits?.max_active_subagents ?? null,
                 });
             }
             // 先归档（不删原件），再建立新 epoch 的绑定。

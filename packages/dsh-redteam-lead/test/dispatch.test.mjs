@@ -314,16 +314,23 @@ test('同岗成员忙碌 → MEMBER_BUSY，且零副作用', async (t) => {
   assert.deepEqual(await teamFiles(project.root), before)
 })
 
-test('未声明容量 → CAPACITY_UNKNOWN；席位不足 → CAPACITY_EXHAUSTED（都不动成员/任务）', async (t) => {
+test('未声明容量 → 照派并警告（T18）；席位不足 → CAPACITY_EXHAUSTED（都不动成员/任务）', async (t) => {
+  // T18：未知容量**不再**前置拒绝（旧行为是 CAPACITY_UNKNOWN + 零副作用）。
+  // 现在照派，但必须把「不保证有位置、最多损失一个名字与席位」写进诊断。
   const unknown = setup(t, { capacity: { known: false } })
-  const beforeUnknown = await teamFiles(unknown.project.root)
   const first = await handleDispatch(unknown.ctx, unknown.input())
-  assertEnvelopeShape(first.envelope, { expectStatus: 'blocked' })
-  assert.equal(first.envelope.code, 'CAPACITY_UNKNOWN')
-  assert.equal(unknown.team.callsFor('spawnTeammate').length, 0)
-  assert.equal(unknown.team.callsFor('createTask').length, 0)
-  assert.deepEqual(await teamFiles(unknown.project.root), beforeUnknown)
+  assertEnvelopeShape(first.envelope, { expectStatus: 'ok' })
+  assert.equal(unknown.team.callsFor('spawnTeammate').length, 1, '未知容量照派：必须真的去创建')
+  assert.ok(
+    first.envelope.diagnostics.some((entry) => entry.code === 'CAPACITY_UNDECLARED'),
+    '风险必须写成诊断，而不是静默',
+  )
+  assert.match(
+    first.envelope.diagnostics.map((entry) => `${entry.reason}${entry.next_step}`).join('\n'),
+    /未声明[\s\S]*不保证[\s\S]*损失/u,
+  )
 
+  // 上限**已声明**时行为不变：席位不够就是前置拒绝，零副作用。
   const exhausted = setup(t, {
     capacity: { known: true, maxMembers: 1, maxActiveSubagents: 4, via: 'project' },
     members: [{ name: 'rt-other' }],

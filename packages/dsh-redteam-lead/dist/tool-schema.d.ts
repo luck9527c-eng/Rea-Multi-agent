@@ -147,6 +147,21 @@ export declare const schemaDefs: {
                 minimum: number;
                 default: number;
             };
+            capacity: {
+                type: string;
+                additionalProperties: boolean;
+                required: string[];
+                properties: {
+                    max_members: {
+                        type: string;
+                        minimum: number;
+                    };
+                    max_active_subagents: {
+                        type: string;
+                        minimum: number;
+                    };
+                };
+            };
             operation_id: {
                 $ref: string;
             };
@@ -260,6 +275,21 @@ export declare const schemaDefs: {
             };
             prohibited: {
                 $ref: string;
+            };
+            capacity: {
+                type: string;
+                additionalProperties: boolean;
+                required: string[];
+                properties: {
+                    max_members: {
+                        type: string;
+                        minimum: number;
+                    };
+                    max_active_subagents: {
+                        type: string;
+                        minimum: number;
+                    };
+                };
             };
             capability_needs: {
                 $ref: string;
@@ -919,6 +949,21 @@ export declare const rosterInput: {
             minimum: number;
             default: number;
         };
+        capacity: {
+            type: string;
+            additionalProperties: boolean;
+            required: string[];
+            properties: {
+                max_members: {
+                    type: string;
+                    minimum: number;
+                };
+                max_active_subagents: {
+                    type: string;
+                    minimum: number;
+                };
+            };
+        };
         operation_id: {
             $ref: string;
         };
@@ -1017,6 +1062,21 @@ export declare const dispatchInput: {
         };
         prohibited: {
             $ref: string;
+        };
+        capacity: {
+            type: string;
+            additionalProperties: boolean;
+            required: string[];
+            properties: {
+                max_members: {
+                    type: string;
+                    minimum: number;
+                };
+                max_active_subagents: {
+                    type: string;
+                    minimum: number;
+                };
+            };
         };
         capability_needs: {
             $ref: string;

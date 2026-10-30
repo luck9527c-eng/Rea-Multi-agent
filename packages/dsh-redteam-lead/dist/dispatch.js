@@ -22,6 +22,8 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ContractError, isErrorCode } from './errors.js';
 import { toolNamesFromSchemas } from './capability.js';
+import * as bindingModule from './binding.js';
+import * as capacitySource from './capacity-source.js';
 import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js';
 import * as pathsModule from './paths.js';
 import * as resourceDefaults from './resources.js';
@@ -201,6 +203,11 @@ export function normalizeDispatchInput(raw) {
             }
         }
     }
+    // T18：按调用声明的容量（可选）。形状不合法是调用方错误，静默忽略会把「我声明了上限」变成谎话。
+    const callCapacity = capacitySource.parseCallCapacity(raw.capacity);
+    if (callCapacity.issue !== null) {
+        push(callCapacity.issue, '按 $defs.dispatchInput.capacity 传 {max_members, max_active_subagents}（都必须是 >=1 的整数）');
+    }
     if (issues.length > 0)
         return { ok: false, value: {}, issues, operationId };
     // 走到这里说明上面每一项形状检查都通过了：这几个字段必然是字符串，
@@ -224,6 +231,8 @@ export function normalizeDispatchInput(raw) {
             timebox_ms: typeof raw.timebox_ms === 'number' ? raw.timebox_ms : 1800000,
             delivery_timeout_ms: typeof raw.delivery_timeout_ms === 'number' ? raw.delivery_timeout_ms : 60000,
             retry_of: retryOf === null ? null : { ...recordOf(retryOf) },
+            // 没声明就不写这个键：输入哈希与升级前逐字一致（恢复旧 operation 不会被判冲突）。
+            ...(callCapacity.value === null ? {} : { capacity: callCapacity.value }),
         },
     };
 }
@@ -634,6 +643,10 @@ export async function handleDispatch(ctx, input) {
         const projectAdapter = deps.projectAdapter;
         const teamAdapter = deps.teamAdapter;
         const callerName = caller.name ?? 'lead';
+        // T18：容量观测值按会话生效（席位随会话重置），所以这一次调用只认本会话的身份。
+        // 与下面锁用的 `sessionId`（binding 里的会话或占位串 `session-unbound`）分开：
+        // 占位串不是真实会话 id，绝不能拿它去匹配观测值。
+        const capacitySessionId = sessionIdOf(deps, caller.root, ctx);
         if (!projectAdapter) {
             return {
                 envelope: blockedEnvelope(envelope, {
@@ -725,7 +738,7 @@ export async function handleDispatch(ctx, input) {
         if (existing === null) {
             const pre = await preflight({
                 ctx, deps, envelope, request, root, dispatchId, attemptId, excludeTaskIds,
-                resourcesMod, contractMod, callerName, projectAdapter, teamAdapter,
+                resourcesMod, contractMod, callerName, projectAdapter, teamAdapter, capacitySessionId,
             });
             if (!pre.ok)
                 return { envelope: pre.envelope };
@@ -761,7 +774,7 @@ export async function handleDispatch(ctx, input) {
                 ctx, deps, envelope, request, root, operationId, inputHash, ledger,
                 dispatchId, attemptId, attemptIndex, contractRef, workDir, runIdReservation,
                 retry, excludeTaskIds, plan, bindingSnap, callerName, existing,
-                resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter,
+                resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter, capacitySessionId,
                 onPersisted: () => { persisted = true; },
             });
             return { envelope: run };
@@ -782,6 +795,26 @@ export async function handleDispatch(ctx, input) {
             }),
         };
     }
+}
+/**
+ * 本会话身份（T18）：`TeamId` = 团队根 Session id = Lead 会话 id，席位随会话重置。
+ *
+ * 与 `rt_roster` 同一条推导（`binding.sessionIdentityFrom`），只读可信执行上下文
+ * （`identity.root` + `exec`/`config` 的显式会话字段）。拿不到就是 `null`：
+ * 那时任何观测值都**不得**套用，也无法把新观测值归到某个会话上。
+ */
+function sessionIdOf(deps, callerRoot, ctx) {
+    const injected = recordOf(deps.binding);
+    const derive = typeof injected.sessionIdentityFrom === 'function'
+        ? injected.sessionIdentityFrom
+        : bindingModule.sessionIdentityFrom;
+    const derived = derive({
+        identity: { role: 'lead', name: null, root: callerRoot },
+        exec: recordOf(ctx).exec,
+        config: recordOf(ctx).config,
+    });
+    const value = recordOf(derived).session_id;
+    return nonEmpty(value) ? value : null;
 }
 /** 从台账 `data` 里挑出已知身份（缺席的键不写）。 */
 function identitiesOf(data) {
@@ -1145,7 +1178,7 @@ async function dependentArtifacts(input) {
     artifacts.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
     return { ok: true, artifacts };
 }
-async function preflight({ ctx, deps, envelope, request, root, dispatchId, attemptId, excludeTaskIds, resourcesMod, contractMod, callerName, projectAdapter, teamAdapter, }) {
+async function preflight({ ctx, deps, envelope, request, root, dispatchId, attemptId, excludeTaskIds, resourcesMod, contractMod, callerName, projectAdapter, teamAdapter, capacitySessionId, }) {
     const def = (code, reason, nextStep) => ({ code, reason, nextStep });
     // (1) 路线 + impact
     const routeRead = recordOf(await projectAdapter.readRoute(request.route_id));
@@ -1351,10 +1384,39 @@ async function preflight({ ctx, deps, envelope, request, root, dispatchId, attem
             }),
         };
     }
-    const activations = recordOf(capacity.activations);
-    const remainingActivations = activations.known === true ? activations.total : null;
+    // (4b) T18：生效容量 = 按调用 > 项目 > profile > 本会话观测 > unknown。
+    // 适配器（D1）只回答「有没有声明」；这里再叠加「本次调用」与「本会话观测」。
+    const observedRead = await capacitySource.readObservedCapacity(root, capacitySessionId);
+    const effective = capacitySource.resolveCapacity({
+        call: request.capacity ?? null,
+        declared: capacity,
+        observed: observedRead,
+    });
+    const capacityUnknown = effective.source === 'unknown';
+    const capacityDiagnostics = capacityGapsToDiagnostics(effective.gaps);
+    if (capacityUnknown) {
+        // 并发保护（T18 §3）：无已知容量 + 已有「观测中」标记 → 明确拒绝，而不是一起冲。
+        const guard = capacitySource.capacityMarkerGuard(await capacitySource.readObservationMarker(root), capacitySessionId);
+        if (guard.blocked) {
+            return {
+                envelope: blockedEnvelope(envelope, {
+                    code: 'CAPACITY_UNKNOWN',
+                    operationId: request.operation_id,
+                    reason: guard.reason ?? '容量仍在观测中：拒绝再撞一次',
+                    nextStep: guard.next_step ?? '等这次观测结束再派发',
+                }),
+            };
+        }
+        if (guard.reason !== null) {
+            // 标记属于别的会话：不挡，但要如实报告（不能静默丢一条事实）。
+            capacityDiagnostics.push(envelope.diagnostic('CAPACITY_OBSERVING_OTHER_SESSION', guard.reason, guard.next_step ?? '确认旧会话的那次派发已结束即可'));
+        }
+        // 容量未声明**不再拒绝**：照派，但必须把「不保证有位置、最多损失一个名字与席位」说清楚。
+        capacityDiagnostics.push(undeclaredCapacityWarning(effective.memberSlots.used, observedRead.gap?.detail ?? null));
+    }
     const planBudget = planBudgetOf(deps.capacity);
-    const budget = planBudget({
+    // 容量未知时**不做预算裁剪**：没有上限就没有可裁剪的对象，猜一个数才是 D1 明令禁止的事。
+    const budget = capacityUnknown ? { assigned: [{ post_id: post.id }], gaps: [] } : planBudget({
         candidates: [{
                 post_id: post.id,
                 priority: post.priority,
@@ -1366,8 +1428,8 @@ async function preflight({ ctx, deps, envelope, request, root, dispatchId, attem
                 enabled: post.enabled,
                 capability: { satisfied: true, missing: [] },
             }],
-        remainingMemberSlots: recordOf(capacity.memberSlots).remaining ?? null,
-        remainingActivations,
+        remainingMemberSlots: effective.memberSlots.remaining,
+        remainingActivations: effective.activations.known === true ? effective.activations.total : null,
         reuseCandidates: memberDecision.action === 'reuse'
             ? [{ post_id: post.id, member: memberDecision.member, activation_increment: 1 }]
             : [],
@@ -1375,7 +1437,9 @@ async function preflight({ ctx, deps, envelope, request, root, dispatchId, attem
         reservedMemberSlots: 0,
         reservedActivations: 0,
     });
-    const planned = budget.assigned.find((entry) => entry.post_id === post.id);
+    const planned = capacityUnknown
+        ? { post_id: post.id }
+        : budget.assigned.find((entry) => entry.post_id === post.id);
     if (!planned) {
         // 与迁移前的 `['CAPACITY_UNKNOWN','CAPACITY_EXHAUSTED'].includes(entry.code)` 等价。
         const gap = budget.gaps.find((entry) => entry.code === 'CAPACITY_UNKNOWN' || entry.code === 'CAPACITY_EXHAUSTED')
@@ -1566,17 +1630,222 @@ async function preflight({ ctx, deps, envelope, request, root, dispatchId, attem
             resourcePlan,
             baseline: capture,
             routeTargets,
-            gaps: [...budget.gaps, ...(Array.isArray(capacity.gaps) ? capacity.gaps : [])],
+            gaps: [...budget.gaps, ...effective.gaps],
             callerName,
+            capacitySource: effective.source,
+            capacityLimits: {
+                max_members: effective.memberSlots.total,
+                max_active_subagents: effective.activations.total,
+            },
+            capacityDiagnostics,
             digests: frozen.digests,
         },
     };
+}
+/** 容量缺口（`{code, detail, nextStep}`）→ 契约诊断（三字段）。 */
+function capacityGapsToDiagnostics(value) {
+    const rows = Array.isArray(value) ? value : [];
+    return rows.map((raw) => {
+        const gap = recordOf(raw);
+        return {
+            code: nonEmpty(gap.code) ? gap.code : 'CAPACITY_UNKNOWN',
+            reason: nonEmpty(gap.detail) ? gap.detail : '容量声明或计数不可用',
+            next_step: nonEmpty(gap.nextStep)
+                ? gap.nextStep
+                : '在 re/team/capacity.json 声明 maxMembers/maxActiveSubagents 后重试',
+        };
+    });
+}
+/**
+ * 未声明容量时的风险警告（T18 §3 逐条要求）：
+ * 明说「容量未声明」「本次创建不保证有位置」「最多可能损失一个成员名与席位」。
+ *
+ * 这不是提示音，是**知情同意**：一次失败 spawn 会永久烧掉名字与席位（D1/D12），
+ * 而宿主没有受支持的余额查询；Leader 选择照派，就必须看到这个代价。
+ */
+function undeclaredCapacityWarning(usedSeats, observedGap) {
+    const used = usedSeats === null ? '数不到已用席位' : `当前已用席位 ${usedSeats}`;
+    const extra = observedGap === null ? '' : `（${observedGap}）`;
+    return {
+        code: 'CAPACITY_UNDECLARED',
+        reason: '容量未声明（capacity_source=unknown）：re/team/capacity.json 与 profile config.capacity 都没有声明，'
+            + `本会话也还没有观测值，${used}${extra}。本次派发照派，但**不保证**有位置：`
+            + '宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位（该名字不会再用，D12）',
+        next_step: '要么在 re/team/capacity.json（或本次调用传 capacity）声明 maxMembers/maxActiveSubagents，'
+            + '要么接受这一次学费；命中宿主上限后会把观察到的上限写进 re/team/capacity-observed.json，'
+            + '后续派发按它算。不要为了试探余额而派发（那是主动探测，不是被动观测）',
+    };
+}
+// ---------------------------------------------------------------------------
+// T18：锁内的容量闸门与「撞一次就学」
+// ---------------------------------------------------------------------------
+/** 台账里的 `capacity_source` 归一（不认识的键按 unknown，绝不猜来源）。 */
+function storedCapacitySource(value) {
+    return value === 'call' || value === 'project' || value === 'profile' || value === 'observed' ? value : 'unknown';
+}
+/** 当前已用席位（含失败成员；`listMembers` 失败时 `null`，绝不猜）。 */
+async function usedSeatsNow(teamAdapter) {
+    const listed = recordOf(await teamAdapter.listMembers(undefined));
+    if (listed.ok !== true)
+        return null;
+    return recordRows(listed.members).filter((row) => row.role === 'teammate').length;
+}
+/**
+ * spawn 之前的容量闸门（锁内）。
+ *
+ * - 已知上限（call/project/profile/observed）→ 直接放行，不写标记（不改变既有行为）。
+ * - 未知上限：先重读观测值（等锁期间别的派发可能已经学到了上限）；仍有「观测中」标记 →
+ *   明确拒绝（并发保护）；都没有 → 写标记、放行，并在 spawn 结束后删除。
+ */
+async function openCapacityGate({ root, sessionId, teamAdapter, capacitySource: sourceValue, member, operationId, nowIso, }) {
+    const source = storedCapacitySource(sourceValue);
+    if (source !== 'unknown')
+        return { refusal: null, state: { source, markerWritten: false, note: null } };
+    const fresh = await capacitySource.readObservedCapacity(root, sessionId);
+    if (fresh.record !== null && fresh.applies) {
+        const used = await usedSeatsNow(teamAdapter);
+        if (used !== null) {
+            const remaining = Math.max(0, fresh.record.max_members - used);
+            if (remaining < 1) {
+                return {
+                    refusal: {
+                        code: 'CAPACITY_EXHAUSTED',
+                        reason: `本会话已观测到成员上限 maxMembers=${fresh.record.max_members}，当前已用 ${used} 席：到顶，`
+                            + '不再创建成员（避免再烧一个名字与席位）',
+                        nextStep: '复用已有成员或等一个成员释放；要放宽上限就在 re/team/capacity.json 显式声明（并在本次调用传 capacity）；'
+                            + '不要靠再撞一次去试探余额',
+                    },
+                    state: { source: 'observed', markerWritten: false, note: null },
+                };
+            }
+            return { refusal: null, state: { source: 'observed', markerWritten: false, note: null } };
+        }
+    }
+    const guard = capacitySource.capacityMarkerGuard(await capacitySource.readObservationMarker(root), sessionId);
+    if (guard.blocked) {
+        return {
+            refusal: {
+                code: 'CAPACITY_UNKNOWN',
+                reason: guard.reason ?? '容量仍在观测中：拒绝再撞一次',
+                nextStep: guard.next_step ?? '等这次观测结束再派发',
+            },
+            state: { source, markerWritten: false, note: null },
+        };
+    }
+    try {
+        await capacitySource.writeObservationMarker(root, { sessionId, member, operationId, startedAt: nowIso });
+        return { refusal: null, state: { source, markerWritten: true, note: null } };
+    }
+    catch (error) {
+        // 标记只是本地并发提示：写不了不改变「照派」的裁决，但必须把「这次没有第二道保护」记下来。
+        return {
+            refusal: null,
+            state: {
+                source,
+                markerWritten: false,
+                note: `写 ${capacitySource.OBSERVING_MARKER_PATH} 失败（${thrownMessage(error)}）：本次没有并发保护`,
+            },
+        };
+    }
+}
+/**
+ * 被动观测：宿主因上限拒绝了一次**真实需要**的创建之后，把「你已经到顶了」记下来。
+ *
+ * `max_members` 取**观测当时的已用席位数**（失败成员已计入）：真实上限只会 ≥ 这个数，
+ * 所以它是保守下限 —— 宁可少开，也不靠猜多开。activation 占用不可观测（D25），
+ * 同一个已用席位数只作为 `max_active_subagents` 的保守下限，不声称知道真实池大小。
+ */
+async function recordCapacityObservation(params) {
+    const used = await usedSeatsNow(params.teamAdapter);
+    if (used === null) {
+        return { ref: null, used: null, error: 'listMembers 失败，数不到已用席位' };
+    }
+    if (used < 1) {
+        return { ref: null, used, error: `观测当时的已用席位是 ${used}，不能当作上限` };
+    }
+    if (params.sessionId === null) {
+        return { ref: null, used, error: '拿不到本会话身份，观测值无法归到会话（未落盘）' };
+    }
+    try {
+        const ref = await capacitySource.writeObservedCapacity(params.root, {
+            schema_version: capacitySource.OBSERVED_SCHEMA_VERSION,
+            session_id: params.sessionId,
+            observed_at: params.nowIso,
+            max_members: used,
+            max_active_subagents: used,
+            basis: { used_at_observation: used, host_code: params.hostCode },
+        });
+        return { ref, used, error: null };
+    }
+    catch (error) {
+        return { ref: null, used, error: `写 ${capacitySource.OBSERVED_CAPACITY_PATH} 失败：${thrownMessage(error)}` };
+    }
+}
+/** 容量碰撞的 failure 文案：点名被烧掉的成员、宿主原始码、观测值落点（D21：细节写进文本）。 */
+function capacityFailureReason(member, hostCode, spawnReason, observed) {
+    const raw = nonEmpty(spawnReason) ? spawnReason : '宿主没有给原始文案';
+    const host = hostCode === null ? '' : `，hostCode=${hostCode}`;
+    const head = `宿主因容量上限拒绝创建成员 ${member}（${raw}${host}）：该名字与席位已被烧掉，不得同名重试（D12）`;
+    if (observed === null)
+        return `${head}。本次没能观测到上限`;
+    if (observed.ref === null)
+        return `${head}。观测值没有落盘：${observed.error ?? '未知原因'}`;
+    return `${head}。已把观测到的上限写进 ${observed.ref}：`
+        + `max_members=${String(observed.used)}（取失败那刻的已用席位数，失败成员已计入）、`
+        + `max_active_subagents=${String(observed.used)}（activation 占用不可观测，同一个保守下限）`;
+}
+/** 容量碰撞的下一步：只允许换名字重试，且先核对名册。 */
+function capacityFailureNextStep(member, observed) {
+    const rename = `先核对成员名册确认 ${member} 是否已存在/失败；换名字重试（下一次派发会用 ${member}-2），不要用同名`;
+    if (observed !== null && observed.ref !== null) {
+        return `${rename}。后续派发按 ${observed.ref} 的 observed 上限算（剩余 0 时不会再创建）；`
+            + '要放宽上限就在 re/team/capacity.json 显式声明（或本次调用传 capacity）';
+    }
+    const why = observed === null ? '本次不是容量碰撞' : (observed.error ?? '未知原因');
+    return `${rename}。在 re/team/capacity.json 显式声明 maxMembers/maxActiveSubagents 后再派发（观测值未落盘：${why}）`;
+}
+/** 容量碰撞的两条诊断：一条说宿主拒绝，一条说观测值去了哪里（含 `hostCode`）。 */
+function capacityFailureDiagnostics(code, member, hostCode, observed) {
+    const host = hostCode === null ? code : hostCode;
+    const out = [{
+            code,
+            reason: `宿主拒绝创建成员 ${member}（hostCode=${host}）：名字与席位已消耗`,
+            next_step: '不要用同名重试（D12）；下一次派发会自动用下一个名字',
+        }];
+    if (observed !== null && observed.ref !== null) {
+        out.push({
+            code: 'CAPACITY_OBSERVED',
+            reason: `已把观测到的上限写进 ${observed.ref}：max_members=${String(observed.used)}、`
+                + `max_active_subagents=${String(observed.used)}（观测当时已用 ${String(observed.used)} 席，hostCode=${host}）`,
+            next_step: '这是「你已经到顶了」的保守下限，不是宿主声明：要放宽就在 re/team/capacity.json 声明；不要靠再撞一次去试探',
+        });
+    }
+    else {
+        out.push({
+            code: 'CAPACITY_OBSERVED_UNWRITTEN',
+            reason: `观测值没有落盘：${observed?.error ?? '本次不是容量碰撞'}`,
+            next_step: '先声明容量再派发；不要为了试探余额重复派发（D1）',
+        });
+    }
+    return out;
+}
+/** 台账里存下的容量诊断（成功回执要原样交回；恢复路径也一样）。 */
+function capacityDiagnosticsFrom(data) {
+    const rows = Array.isArray(data.capacity_diagnostics) ? data.capacity_diagnostics : [];
+    return rows.map((raw) => {
+        const entry = recordOf(raw);
+        return {
+            code: nonEmpty(entry.code) ? entry.code : 'CAPACITY_UNKNOWN',
+            reason: nonEmpty(entry.reason) ? entry.reason : '容量来源未记录',
+            next_step: nonEmpty(entry.next_step) ? entry.next_step : '在 re/team/capacity.json 声明容量后重试',
+        };
+    });
 }
 // ---------------------------------------------------------------------------
 // 锁内阶段推进
 // ---------------------------------------------------------------------------
 async function runLocked(params) {
-    const { ctx, deps, envelope, request, root, operationId, inputHash, ledger, dispatchId, attemptId, attemptIndex, contractRef, workDir, runIdReservation, retry, excludeTaskIds, plan, bindingSnap, callerName, existing, resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter, onPersisted, } = params;
+    const { ctx, deps, envelope, request, root, operationId, inputHash, ledger, dispatchId, attemptId, attemptIndex, contractRef, workDir, runIdReservation, retry, excludeTaskIds, plan, bindingSnap, callerName, existing, resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter, onPersisted, capacitySessionId, } = params;
     const clock = deps.clock;
     const now = () => (typeof clock?.isoNow === 'function' ? clock.isoNow() : new Date().toISOString());
     const record = existing ?? null;
@@ -1628,7 +1897,7 @@ async function runLocked(params) {
         };
         await writeAttemptRecord({ root, atomic, paths, record: attemptRecord });
     };
-    const failure = (code, { reason, nextStep, phase: failurePhase, extra = {}, resolvedCode, }) => partialEnvelope(envelope, {
+    const failure = (code, { reason, nextStep, phase: failurePhase, extra = {}, resolvedCode, diagnostics, }) => partialEnvelope(envelope, {
         code: resolvedCode ?? stableCode(code),
         operationId,
         phase: failurePhase ?? phase ?? 'prepared',
@@ -1643,7 +1912,7 @@ async function runLocked(params) {
         },
         reason,
         nextStep,
-        diagnostics: [diagnosticOf(envelope, resolvedCode ?? stableCode(code), reason, nextStep)],
+        diagnostics: diagnostics ?? [diagnosticOf(envelope, resolvedCode ?? stableCode(code), reason, nextStep)],
     });
     // ---- step 1：登记操作（先存意图：身份先算好） ----
     if (phase === null) {
@@ -1658,6 +1927,12 @@ async function runLocked(params) {
             binding: bindingSnap,
             retry_of: request.retry_of,
             retry_recovery_ref: retry?.recoveryRef ?? null,
+            // T18：出问题要能回答「当时它以为上限是多少」——来源与数字都进台账。
+            capacity_source: plan?.capacitySource ?? 'unknown',
+            capacity_max_members: plan?.capacityLimits?.max_members ?? null,
+            capacity_max_active_subagents: plan?.capacityLimits?.max_active_subagents ?? null,
+            capacity_session_id: capacitySessionId,
+            capacity_diagnostics: (plan?.capacityDiagnostics ?? []).map((entry) => ({ ...entry })),
         });
         onPersisted();
         const reloaded = await ledger.findById(operationId);
@@ -1875,6 +2150,8 @@ async function runLocked(params) {
         }
         // 台账里的意图（`advance` 刚写或恢复时读回）；字段一律按 `unknown` 读。
         const intent = recordOf(data.member_intent);
+        // 成员名只用于拼文案/写标记；非字符串（损坏台账）按空串处理，形状由适配器拒绝。
+        const intentName = nonEmpty(intent.name) ? intent.name : '';
         const membersNow = recordOf(await teamAdapter.listMembers(undefined));
         const rows = membersNow.ok === true ? recordRows(membersNow.members) : [];
         const existingRow = rows.find((row) => row.name === intent.name) ?? null;
@@ -1900,40 +2177,91 @@ async function runLocked(params) {
                     phase: 'prepared',
                 });
             }
+            // T18：锁内复核容量（并发保护 + 观测值可能在本进程等锁期间落地）。
+            const gate = await openCapacityGate({
+                root,
+                sessionId: capacitySessionId,
+                teamAdapter,
+                capacitySource: data.capacity_source,
+                member: intentName,
+                operationId,
+                nowIso: now(),
+            });
+            if (gate.refusal !== null) {
+                return failure(gate.refusal.code, {
+                    reason: gate.refusal.reason,
+                    nextStep: gate.refusal.nextStep,
+                    phase: 'prepared',
+                });
+            }
+            if (gate.state.note !== null) {
+                // 标记写失败不改变裁决，但必须留在台账里（否则「这次没有并发保护」就没人知道了）。
+                await advance(phase, { capacity_marker_note: gate.state.note });
+            }
             const prompt = contractMod.buildMemberPrompt({
                 post: postForPrompt,
                 rulesEntry: RULES_ENTRY,
                 skillCopyPath: SKILL_COPY_ENTRY,
             });
-            const spawned = recordOf(await teamAdapter.spawnTeammate({
-                name: intent.name,
-                prompt,
-                description: `rt_dispatch ${postForPrompt.id} ${request.route_id}`,
-            }));
-            // 成功分支带成员视图（可能是 `null`：适配器把非对象投影成 null）。
-            const spawnedMember = recordOf(spawned.member);
-            if (spawned.ok === true) {
-                member = { name: spawnedMember.name ?? intent.name, id: spawnedMember.id ?? null, mode: 'spawn' };
-            }
-            else {
-                const after = recordOf(await teamAdapter.listMembers(undefined));
-                const appeared = after.ok === true
-                    ? recordRows(after.members).find((row) => row.name === intent.name && row.status !== 'failed' && row.status !== 'provisioning') ?? null
-                    : null;
-                if (appeared !== null) {
-                    member = { name: appeared.name, id: appeared.id, mode: 'spawn-adopted' };
+            try {
+                const spawned = recordOf(await teamAdapter.spawnTeammate({
+                    name: intentName,
+                    prompt,
+                    description: `rt_dispatch ${postForPrompt.id} ${request.route_id}`,
+                }));
+                // 成功分支带成员视图（可能是 `null`：适配器把非对象投影成 null）。
+                const spawnedMember = recordOf(spawned.member);
+                if (spawned.ok === true) {
+                    member = { name: spawnedMember.name ?? intent.name, id: spawnedMember.id ?? null, mode: 'spawn' };
                 }
                 else {
-                    const code = stableCode(spawned.code);
-                    await advance(phase, {
-                        member_failed: { name: intent.name, code, reason: spawned.reason ?? null, at: now() },
-                    });
-                    return failure(code, {
-                        reason: `创建成员 ${intent.name} 失败：${spawned.reason ?? code}。该名字与席位可能已被消耗（D12）`,
-                        nextStep: `先核对成员名册确认 ${intent.name} 是否已占用；不要用同名重试，下一次派发会自动用下一个名字`,
-                        phase: 'member_ready',
-                        extra: { member: intent.name },
-                    });
+                    const after = recordOf(await teamAdapter.listMembers(undefined));
+                    const appeared = after.ok === true
+                        ? recordRows(after.members).find((row) => row.name === intent.name && row.status !== 'failed' && row.status !== 'provisioning') ?? null
+                        : null;
+                    if (appeared !== null) {
+                        member = { name: appeared.name, id: appeared.id, mode: 'spawn-adopted' };
+                    }
+                    else {
+                        const code = stableCode(spawned.code);
+                        const hostCode = nonEmpty(spawned.hostCode) ? spawned.hostCode : null;
+                        // T18：宿主因上限拒绝一次**真实需要**的创建 → 被动观测（不是主动试探）。
+                        const observed = code === 'CAPACITY_EXHAUSTED'
+                            ? await recordCapacityObservation({
+                                root,
+                                sessionId: capacitySessionId,
+                                teamAdapter,
+                                hostCode: hostCode ?? code,
+                                nowIso: now(),
+                            })
+                            : null;
+                        await advance(phase, {
+                            member_failed: { name: intent.name, code, host_code: hostCode, reason: spawned.reason ?? null, at: now() },
+                            ...(observed === null || observed.ref === null
+                                ? {}
+                                : {
+                                    capacity_observed: {
+                                        ref: observed.ref,
+                                        max_members: observed.used,
+                                        host_code: hostCode,
+                                        at: now(),
+                                    },
+                                }),
+                        });
+                        return failure(code, {
+                            reason: capacityFailureReason(intentName, hostCode, spawned.reason, observed),
+                            nextStep: capacityFailureNextStep(intentName, observed),
+                            phase: 'member_ready',
+                            extra: { member: intent.name },
+                            diagnostics: capacityFailureDiagnostics(code, intentName, hostCode, observed),
+                        });
+                    }
+                }
+            }
+            finally {
+                // 「观测中」标记只覆盖这一次 spawn：成功/失败/抛出都要收走，否则下一次派发会被自己挡住。
+                if (gate.state.markerWritten) {
+                    await capacitySource.clearObservationMarker(root).catch(() => { });
                 }
             }
         }
@@ -2127,7 +2455,9 @@ async function runLocked(params) {
         });
     }
     // ---- step 8：审计 + 保存结果 ----
-    const diagnostics = [];
+    // T18：容量来源与风险诊断在台账里（prepare 时写的），成功回执也要把它们交回给模型 ——
+    // 「未知容量照派」如果只活在台账里，模型就看不见自己接受了什么代价。
+    const diagnostics = capacityDiagnosticsFrom(data);
     let auditWritten = data.audit_at !== undefined;
     if (justDelivered && !auditWritten) {
         // `AuditEntry` 的列都是文本：台账里的任务是字符串（写进去的是字符串 ID），
