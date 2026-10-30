@@ -2111,8 +2111,9 @@ function capacityGapsToDiagnostics(value: unknown): Diagnostic[] {
  * 未声明容量时的风险警告（T18 §3 逐条要求）：
  * 明说「容量未声明」「本次创建不保证有位置」「最多可能损失一个成员名与席位」。
  *
- * 这不是提示音，是**知情同意**：一次失败 spawn 会永久烧掉名字与席位（D1/D12），
- * 而宿主没有受支持的余额查询；Leader 选择照派，就必须看到这个代价。
+ * 这不是提示音，是**知情同意**：一次失败 spawn **可能**永久烧掉名字与席位（activation 池满会；
+ * 成员席位满发生在写成员行之前，不会 —— T18c），而宿主没有受支持的余额查询；Leader 选择照派，
+ * 就必须看到这个代价。
  */
 function undeclaredCapacityWarning(usedSeats: number | null, observedGap: string | null): Diagnostic {
   const used = usedSeats === null ? '数不到已用席位' : `当前已用席位 ${usedSeats}`
@@ -2122,7 +2123,8 @@ function undeclaredCapacityWarning(usedSeats: number | null, observedGap: string
     reason:
       '容量未声明（capacity_source=unknown）：re/team/capacity.json 与 profile config.capacity 都没有声明，'
       + `本会话也还没有观测值，${used}${extra}。本次派发照派，但**不保证**有位置：`
-      + '宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位（该名字不会再用，D12）',
+      + '宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位：activation 池满会烧掉名字，'
+      + '成员席位满发生在写成员行之前（名字还在，可以同名重试，T18c）',
     next_step:
       '要么在 re/team/capacity.json（或本次调用传 capacity）声明 maxMembers/maxActiveSubagents，'
       + '要么接受这一次学费；命中宿主上限后会把观察到的上限写进 re/team/capacity-observed.json，'
@@ -2326,7 +2328,40 @@ function observedLimitsText(observed: CapacityObservationResult): string {
   return `max_members=${String(observed.max_members)}、max_active_subagents=${String(observed.max_active_subagents)}`
 }
 
-/** 容量碰撞的 failure 文案：点名被烧掉的成员、宿主原始码、观测值落点（D21：细节写进文本）。 */
+/**
+ * 一次容量拒绝是否**已经**写下了成员行 —— 这决定名字与席位到底有没有被烧掉（T18c）。
+ *
+ * 宿主两条容量码的抛出时机不同（安装构建 `_agent-team.js:1021-1030`、checkout
+ * `packages/experimental/agent-team/src/roster.ts:252-261`，见 UPSTREAM-API「宿主容量拒绝消息」）：
+ *
+ * - `TEAM_MEMBER_LIMIT` 在 `journal.appendAndFlush` **之前**抛 → 根本没有成员行，
+ *   名字仍然空闲、席位没有消耗，容量解决后**同名重试是合法的**；
+ * - `ACTIVATION_LIMIT_REACHED` 在成员行 append **之后**（`subagents.startActivation`）抛，
+ *   catch 把该行 settle 成 `phase:'failed'` → 名字与席位都被烧掉，不得同名重试（D12）。
+ *
+ * 认不出的宿主码一律按「已烧掉」说：宁可保守，也不给一个可能失败的「同名重试没问题」的承诺。
+ * 把这条判断收敛到一个函数里，是因为「已烧掉」这句话有两个出口（failure 文案与诊断），
+ * 两处各写一遍就是 T18c 要修的那个缺陷。
+ */
+function capacityRefusalBurned(hostCode: string | null): boolean {
+  return hostCode !== 'TEAM_MEMBER_LIMIT'
+}
+
+/** 名字与席位的损坏结论（两条码各一句；reason 与诊断共用，不许各写一套）。 */
+function refusalDamageClause(hostCode: string | null): string {
+  return capacityRefusalBurned(hostCode)
+    ? '该名字与席位已被烧掉，不得同名重试（D12）'
+    : '该名字没有被占用、也没有消耗席位 —— 宿主在写成员行之前就拒绝了'
+}
+
+/** 解析到成员上限时点名这个数字（只对 `TEAM_MEMBER_LIMIT` 有意义，其余码为空串）。 */
+function refusalLimitClause(hostCode: string | null, observed: CapacityObservationResult | null): string {
+  if (capacityRefusalBurned(hostCode)) return ''
+  const limit = observed?.parsed_limit ?? null
+  return limit === null ? '' : `（宿主报的成员上限 ${String(limit)} 席）`
+}
+
+/** 容量碰撞的 failure 文案：点名成员、宿主原始码、损坏语义、观测值落点（D21：细节写进文本）。 */
 function capacityFailureReason(
   member: string,
   hostCode: string | null,
@@ -2335,7 +2370,8 @@ function capacityFailureReason(
 ): string {
   const raw = nonEmpty(spawnReason) ? spawnReason : '宿主没有给原始文案'
   const host = hostCode === null ? '' : `，hostCode=${hostCode}`
-  const head = `宿主因容量上限拒绝创建成员 ${member}（${raw}${host}）：该名字与席位已被烧掉，不得同名重试（D12）`
+  const head = `宿主因容量上限拒绝创建成员 ${member}（${raw}${host}）：`
+    + `${refusalDamageClause(hostCode)}${refusalLimitClause(hostCode, observed)}`
   if (observed === null) return `${head}。本次没能观测到上限`
   if (observed.ref === null) return `${head}。观测值没有落盘：${observed.error ?? '未知原因'}`
   if (observed.origin === 'retained') {
@@ -2351,11 +2387,20 @@ function capacityFailureReason(
     + '（回落：消息里没有可解析的数字，取失败那刻的已用席位数，失败成员已计入）'
 }
 
-/** 容量碰撞的下一步：只允许换名字重试，且先核对名册。 */
+/** 容量碰撞的下一步：名字还在时允许同名重试（先解决容量），被烧掉时只允许换名字。 */
 function capacityFailureNextStep(
   member: string,
+  hostCode: string | null,
   observed: CapacityObservationResult | null,
 ): string {
+  const unset = observed === null ? '本次不是容量碰撞' : (observed.error ?? '未知原因')
+  if (!capacityRefusalBurned(hostCode)) {
+    const base = '先解决容量（复用空闲成员、等一个成员释放，或在 re/team/capacity.json 放宽 maxMembers），'
+      + `再用同名 ${member} 重试 —— 这个名字没有被占用`
+    return observed !== null && observed.ref !== null
+      ? `${base}。后续派发按 ${observed.ref} 的 observed 上限算（剩余 0 时不会再创建）`
+      : `${base}。在 re/team/capacity.json 显式声明 maxMembers/maxActiveSubagents 后再派发（观测值未落盘：${unset}）`
+  }
   const rename = `先核对成员名册确认 ${member} 是否已存在/失败；换名字重试（下一次派发会用 ${member}-2），不要用同名`
   if (observed !== null && observed.ref !== null) {
     return `${rename}。后续派发按 ${observed.ref} 的 observed 上限算（剩余 0 时不会再创建）；`
@@ -2365,7 +2410,7 @@ function capacityFailureNextStep(
   return `${rename}。在 re/team/capacity.json 显式声明 maxMembers/maxActiveSubagents 后再派发（观测值未落盘：${why}）`
 }
 
-/** 容量碰撞的两条诊断：一条说宿主拒绝，一条说观测值去了哪里（含 `hostCode`）。 */
+/** 容量碰撞的两条诊断：一条说宿主拒绝（含损坏语义），一条说观测值去了哪里（含 `hostCode`）。 */
 function capacityFailureDiagnostics(
   code: string,
   member: string,
@@ -2375,8 +2420,11 @@ function capacityFailureDiagnostics(
   const host = hostCode === null ? code : hostCode
   const out: Diagnostic[] = [{
     code,
-    reason: `宿主拒绝创建成员 ${member}（hostCode=${host}）：名字与席位已消耗`,
-    next_step: '不要用同名重试（D12）；下一次派发会自动用下一个名字',
+    reason: `宿主拒绝创建成员 ${member}（hostCode=${host}）：`
+      + `${refusalDamageClause(hostCode)}${refusalLimitClause(hostCode, observed)}`,
+    next_step: capacityRefusalBurned(hostCode)
+      ? '不要用同名重试（D12）；下一次派发会自动用下一个名字'
+      : `先解决容量（复用空闲成员、等一个成员释放，或放宽 maxMembers），再用同名 ${member} 重试`,
   }]
   if (observed !== null && observed.ref !== null) {
     if (observed.origin === 'parsed') {
@@ -2872,7 +2920,7 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
             })
             return failure(code, {
               reason: capacityFailureReason(intentName, hostCode, spawned.reason, observed),
-              nextStep: capacityFailureNextStep(intentName, observed),
+              nextStep: capacityFailureNextStep(intentName, hostCode, observed),
               phase: 'member_ready',
               extra: { member: intent.name },
               diagnostics: capacityFailureDiagnostics(code, intentName, hostCode, observed),

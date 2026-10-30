@@ -15,8 +15,11 @@
  *   只有指派具体成员时才检查 `taskReady`（清空 owner 的分支在 gate 之前 early-return）；
  *   `complete` 要求 `in_progress` 且调用者是 owner 或 Lead；CAS 失败抛
  *   `TEAM_TASK_STALE_REVISION` 且消息里带当前 revision。
- * - D12 的失败席位语义：`spawnTeammate` 先写 `provisioning` 行再启动子代理，失败后该行
- *   变 `failed` 并**永久占用名字与席位**，其已指派任务仍被占用。
+ * - D12 的失败席位语义按**宿主抛出的时机**分两种（T18c，见 UPSTREAM-API「宿主容量拒绝消息」）：
+ *   `TEAM_MEMBER_LIMIT` / `TEAM_MEMBER_NAME_TAKEN` 在写成员行**之前**抛 → 没有成员行，
+ *   名字仍空闲、席位没有消耗；`ACTIVATION_LIMIT_REACHED` 与运行期故障在成员行 append **之后**抛
+ *   → 该行 settle 成 `failed` 并**永久占用名字与席位**（其已指派任务仍被占用）。
+ *   替身两种都照抄；`failNextSpawn({code})` 也按码选抛出点（见 `PRE_APPEND_SPAWN_CODES`）。
  *
  * ## 公开面
  *
@@ -34,7 +37,7 @@
  * team.faults.afterHost(op, n?, spec?)    // 副作用后抛错（响应丢失）
  * team.faults.dropResponse(op, n?, spec?) // 成功但返回丢失
  * team.faults.clear() / team.faults.list()
- * team.failNextSpawn(spec)                // 下一次 spawn 在写完 provisioning 行后失败
+ * team.failNextSpawn(spec)                // 下一次 spawn 失败；spec.code 决定抛出时机（写成员行之前/之后）
  * team.failMember(name)                   // 把成员置为 failed（席位与任务都保留）
  * team.setActivations(n)
  * ```
@@ -96,6 +99,22 @@ const MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MEMBER_NAME_MAX = 64;
 const MAX_SUBJECT = 200;
 const MAX_DESCRIPTION = 16384;
+
+/**
+ * 在写成员行**之前**就抛出的宿主拒绝码（T18c）。
+ *
+ * 依据：`roster.ts` 的 `spawnTeammate()`（安装构建 `_agent-team.js:1021-1030`）先校验角色与名字、
+ * 再在 `journal.transact` 内查重名与席位上限于 `appendAndFlush` **之前** —— 这几条拒绝都不产生
+ * 成员行，名字与席位都还在。`ACTIVATION_LIMIT_REACHED` 恰好相反：它在 append 之后由
+ * `subagents.startActivation` 抛出，catch 会把那一行 settle 成 `failed`。
+ */
+const PRE_APPEND_SPAWN_CODES = new Set([
+  HOST_CODES.LEAD_REQUIRED,
+  HOST_CODES.INVALID_MEMBER_NAME,
+  HOST_CODES.MEMBER_NAME_TAKEN,
+  HOST_CODES.MEMBER_LIMIT,
+]);
+
 const ACTIONS = new Set([
   'claim', 'release', 'edit', 'set_dependencies', 'complete', 'reopen', 'reassign', 'delete',
 ]);
@@ -454,10 +473,17 @@ export function createFakeTeam(options = {}) {
       throw hostError(HOST_CODES.MEMBER_LIMIT, `Team member limit ${memberLimit} reached`);
     }
 
-    // 真实实现先写 provisioning 行并 flush，再申请 activation。失败行永久占用名字与席位。
-    const row = addTeammate({ name, status: 'provisioning', phase: 'provisioning', description });
+    // 注入的失败按宿主**抛出的时机**分两种（T18c）：写成员行之前就拒绝的码不产生成员行
+    //（名字仍空闲、席位没有消耗）；其余（activation 池满、运行期故障）在 append 之后，
+    // 会把那一行 settle 成 failed —— 名字与席位都被烧掉。
     const failure = pendingSpawnFailure;
     pendingSpawnFailure = null;
+    if (failure !== null && PRE_APPEND_SPAWN_CODES.has(failure.code)) {
+      throw hostError(failure.code, failure.message ?? 'spawn rejected before the member row');
+    }
+
+    // 真实实现先写 provisioning 行并 flush，再申请 activation。
+    const row = addTeammate({ name, status: 'provisioning', phase: 'provisioning', description });
     try {
       if (failure !== null) {
         throw hostError(failure.code ?? HOST_CODES.HOST_FAILED_AFTER_EFFECT, failure.message ?? 'spawn failed');
@@ -767,6 +793,8 @@ export function createFakeTeam(options = {}) {
     },
     faults,
     failNextSpawn(spec) {
+      // `spec.code` 决定抛出时机：`PRE_APPEND_SPAWN_CODES` 里的码在写成员行之前抛（不产生行，
+      // 名字与席位都还在），其余按「append 之后失败」处理（该行 settle 成 failed）。
       pendingSpawnFailure = spec ?? {};
     },
     failMember(name) {

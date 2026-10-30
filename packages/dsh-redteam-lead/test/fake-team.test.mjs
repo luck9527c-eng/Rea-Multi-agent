@@ -270,6 +270,44 @@ test('失败成员留在名册、占用席位、其 in_progress 任务仍被占�
   );
 });
 
+test('两条容量拒绝的席位语义不同：成员席位满不留行，activation 池满留 failed 行（T18c）', async () => {
+  // 1) TEAM_MEMBER_LIMIT：宿主在写成员行**之前**抛（roster.ts:258 在 appendAndFlush 之前）
+  //    → 没有成员行，名字仍空闲、席位没有消耗。
+  const memberFull = createFakeTeam();
+  memberFull.failNextSpawn({ code: HOST_CODES.MEMBER_LIMIT, message: 'Team member limit 4 reached' });
+  assert.equal(
+    await codeOfAsync(() => memberFull.service.spawnTeammate(memberFull.agent, spawnRequest('rt-scout'))),
+    HOST_CODES.MEMBER_LIMIT,
+  );
+  assert.equal(memberFull.snapshot().teammates, 0, '这条拒绝不得留下成员行、不得占席位');
+  assert.equal(
+    memberFull.service.listMembers(memberFull.agent).some((row) => row.name === 'rt-scout'),
+    false,
+    '名字没有被占用',
+  );
+  // 因此同名重试是合法的：同一个名字再建一次（这次不再注入上限）应当成功。
+  const spawned = await memberFull.service.spawnTeammate(memberFull.agent, spawnRequest('rt-scout'));
+  assert.equal(spawned.member.name, 'rt-scout', '同名重试必须被接受');
+  assert.equal(memberFull.snapshot().teammates, 1);
+
+  // 2) ACTIVATION_LIMIT_REACHED：成员行已经 append 之后才失败（startActivation 抛），
+  //    catch 把该行 settle 成 failed → 名字与席位都被烧掉（D12）。
+  const noSlot = createFakeTeam();
+  noSlot.failNextSpawn({ code: HOST_CODES.ACTIVATION_LIMIT_REACHED });
+  assert.equal(
+    await codeOfAsync(() => noSlot.service.spawnTeammate(noSlot.agent, spawnRequest('rt-scout'))),
+    HOST_CODES.ACTIVATION_LIMIT_REACHED,
+  );
+  const failed = noSlot.service.listMembers(noSlot.agent).find((row) => row.name === 'rt-scout');
+  assert.equal(failed.status, 'failed', '失败成员留在名册（D12）');
+  assert.equal(noSlot.snapshot().teammates, 1, '失败成员占席位');
+  assert.equal(
+    await codeOfAsync(() => noSlot.service.spawnTeammate(noSlot.agent, spawnRequest('rt-scout'))),
+    HOST_CODES.MEMBER_NAME_TAKEN,
+    '同名重试必须被宿主拒绝',
+  );
+});
+
 test('sendMessage：自消息与未知目标被拒，正常投递可数', async () => {
   const team = createFakeTeam({ members: [{ name: 'rt-scout' }] });
   const signal = new AbortController().signal;
