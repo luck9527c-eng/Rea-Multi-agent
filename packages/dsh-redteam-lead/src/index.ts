@@ -529,6 +529,120 @@ export function renderResult(label: string, value: unknown): TextBlock[] {
   }
 }
 
+/**
+ * `render` 写进文本的标量：只接受字符串/数字/布尔/大整数。
+ *
+ * 对象、数组、`null`/`undefined` 一律返回 `''`（「无值」），由调用方决定降级成什么 ——
+ * 这样病态 data 不会把 `[object Object]`/`undefined` 写进模型看到的那段文本。
+ */
+function scalarText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value === 'boolean' || typeof value === 'bigint') return String(value)
+  return ''
+}
+
+/** 折叠换行/连续空白但不截断（比对用；显示时再截断）。 */
+function flatText(value: unknown): string {
+  return scalarText(value).replace(/\s+/gu, ' ').trim()
+}
+
+/** 截断到 `max` 个字符（`…` 表示后面还有）；`reason` 契约上是一行，渲染也不允许它把版面撑开。 */
+function clipText(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+/** 一行文本：折叠空白 + 截断。 */
+function oneLineText(value: unknown, max: number): string {
+  return clipText(flatText(value), max)
+}
+
+/** 「要么有值、要么未知」的字段：缺失/异常形状一律写 `null`（与 D19 的 capacity 口径一致）。 */
+function scalarOrNull(value: unknown): string {
+  const text = oneLineText(value, 200)
+  return text.length > 0 ? text : 'null'
+}
+
+/**
+ * D19：wire `capacity` 恰好 4 个字段（没有 `known`）。未知写 `null`，不猜、不省略字段 ——
+ * A09 的判据就是「未知显示 null，声明后显示数值」，渲染层必须把这两态都摆出来。
+ */
+const CAPACITY_FIELDS = Object.freeze([
+  'remaining_member_slots',
+  'remaining_activations',
+  'reserved_member_slots',
+  'reserved_activations',
+] as const)
+
+/** `capacity` 一行：`remaining_member_slots=7，remaining_activations=null，…`。 */
+function capacityLine(capacity: unknown): string {
+  const view = recordOf(capacity)
+  const parts = CAPACITY_FIELDS.map((field) => {
+    const value = view[field]
+    const known = typeof value === 'number' && Number.isFinite(value)
+    return `${field}=${known ? String(value) : 'null'}`
+  })
+  return `capacity：${parts.join('，')}`
+}
+
+/**
+ * `posts` 摘要：一行一个岗位（`post_id` + `state` + 成员/所需能力族/一行 reason），不整段 JSON。
+ *
+ * `required` 是岗位**要求**的能力族（含 `shell`/`fs` 这类已被满足的），所以只标「要求」而不标
+ * 「缺失」：真正缺哪一族写在岗位自己的 `reason` 与 `gaps` 条目里，渲染层不替数据下结论。
+ *
+ * `gapReasons` 是 `gaps` 段已经打印过的 reason：容量模块把同一条缺口拼成 `岗位 <post_id> <reason>`
+ * 投进 gaps，这里就不再逐字重复一遍 —— 岗位行保持摘要，细节仍在下面 `gaps` 段可读。
+ */
+function postsLines(posts: unknown, gapReasons: ReadonlySet<string>): string[] {
+  if (!Array.isArray(posts)) return ['posts：无法读取（不是数组）']
+  const lines = [`posts（${posts.length}）：`]
+  for (const entry of posts) {
+    const view = recordOf(entry)
+    const postId = oneLineText(view.post_id, 64) || '(未命名岗位)'
+    const state = oneLineText(view.state, 32) || '(状态未知)'
+    const details: string[] = []
+    const member = oneLineText(view.member, 64)
+    if (member.length > 0) details.push(`成员 ${member}`)
+    // 显式收成 `unknown[]`：`Array.isArray` 的窄化是 `any[]`，到回调里就成了隐式 any。
+    const requiredNames: unknown[] = Array.isArray(view.required) ? view.required : []
+    const required = requiredNames.map((name) => oneLineText(name, 48)).filter((name) => name.length > 0)
+    if (required.length > 0) details.push(`要求 ${required.join('／')}`)
+    const reason = flatText(view.reason)
+    if (reason.length > 0 && !gapReasons.has(`岗位 ${postId} ${reason}`)) details.push(clipText(reason, 160))
+    lines.push(`- ${postId}：${state}${details.length > 0 ? `；${details.join('；')}` : ''}`)
+  }
+  return lines
+}
+
+/** `gaps` 段将要打印的 reason 原文（`posts` 去重用；只折叠空白，不截断）。 */
+function gapReasonSet(gaps: unknown): ReadonlySet<string> {
+  const reasons = new Set<string>()
+  if (!Array.isArray(gaps)) return reasons
+  for (const entry of gaps) {
+    const reason = flatText(recordOf(entry).reason)
+    if (reason.length > 0) reasons.add(reason)
+  }
+  return reasons
+}
+
+/**
+ * `gaps` 摘要：每条 `code` + 一行 `reason`（A38 要读的就是这里的 code）。
+ *
+ * `next_step` 不在这里重复 —— 它与诊断段同源，条目多了会淹掉重点；缺口的下一步仍可从诊断段读到。
+ */
+function gapsLines(gaps: unknown): string[] {
+  if (!Array.isArray(gaps)) return ['gaps：无法读取（不是数组）']
+  const lines = [`gaps（${gaps.length}）：`]
+  for (const entry of gaps) {
+    const view = recordOf(entry)
+    const code = oneLineText(view.code, 64) || '(未命名诊断)'
+    const reason = oneLineText(view.reason, 200)
+    lines.push(reason.length > 0 ? `- [${code}] ${reason}` : `- [${code}]`)
+  }
+  return lines
+}
+
 /** 按工具给 data 一段摘要；字段一律先判类型，缺就跳过。 */
 function summarizeData(label: string, data: unknown): string[] {
   if (data === null || data === undefined || typeof data !== 'object') return ['data：无']
@@ -542,9 +656,15 @@ function summarizeData(label: string, data: unknown): string[] {
   if (label === 'rt_roster') {
     push('action', view.action)
     push('project_root', view.project_root)
+    // A40：「本会话」与「同一个根」这两件事要能直接读到，否则只能翻 `re/team/operations/*.json`。
+    lines.push(`project_id：${scalarOrNull(view.project_id)}`)
+    lines.push(`session_id：${scalarOrNull(view.session_id)}`)
+    lines.push(`team_id：${scalarOrNull(view.team_id)}`)
     push('compatibility', view.compatibility)
-    if (Array.isArray(view.posts)) push('posts', view.posts.length)
-    if (Array.isArray(view.gaps)) push('gaps', view.gaps.length)
+    // A09：4 个容量字段（未知写 null）；A38：每条缺口带 code 与一行 reason。
+    lines.push(capacityLine(view.capacity))
+    lines.push(...postsLines(view.posts, gapReasonSet(view.gaps)))
+    lines.push(...gapsLines(view.gaps))
     push('recommended_members', view.recommended_members)
     push('proposal_hash', view.proposal_hash)
     push('binding_ref', view.binding_ref)
