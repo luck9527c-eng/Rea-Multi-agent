@@ -259,15 +259,42 @@ export async function acquire(root: string, options: AcquireOptions = {}): Promi
   // 锁的「已存在」永远是冲突信号：不读回内容比较，直接按 PROJECT_BUSY 报告持有者。
   const created = await tryCreateExclusive(lockPath, `${JSON.stringify(record, null, 2)}\n`)
   if (!created) {
-    const holder = await readLock(root) // 损坏时抛出 RECOVERY_REQUIRED：绝不当成没锁
+    // 锁文件已存在 ≠ 一定能读出内容：`tryCreateExclusive` 是「先 O_EXCL 建名、再写正文」，
+    // 两个 acquirer 撞在一起时，败者可能恰好读到零长度或半截的锁文件。
+    // 那时唯一成立的结论是「有人正在持有或正在发布这把锁」，**绝不是「没有锁」**，
+    // 所以报 PROJECT_BUSY 并把「内容读不出来」如实标出来（T22：此前会抛 RECOVERY_REQUIRED，
+    // 把一次正常的并发冲突说成了锁损坏 —— 那是个假故障，而且随 I/O 时序偶发）。
+    let holder: LockRecord | null = null
+    let unreadable: string | null = null
+    try {
+      holder = await readLock(root)
+    } catch (error) {
+      // 区分两种「读不出来」，它们要求的处置完全不同：
+      //   ① 零长度 —— 正是 `tryCreateExclusive` 的发布窗口（O_EXCL 先建名、再写正文）。
+      //      并发撞上就是普通冲突，报 PROJECT_BUSY 让调用方重试即可（T22：此前报成锁损坏，
+      //      把一次正常并发说成故障，且随 I/O 时序偶发）。
+      //   ② 非空但解析不了 —— 那是真损坏，仍按 RECOVERY_REQUIRED 抛，绝不当成没锁。
+      let empty = false
+      try {
+        empty = (await readFile(lockPath)).length === 0
+      } catch {
+        empty = false
+      }
+      if (!empty) throw error
+      unreadable = '锁文件为空：正被另一个写者发布（tryCreateExclusive 的建名与写正文之间）'
+    }
     throw new ContractError({
       code: 'PROJECT_BUSY',
-      message: `项目锁已被持有: ${LOCK_PATH}（session=${String(holder?.session)} operation=${holder?.operation ?? 'null'} pid=${String(holder?.pid)}）`,
+      message:
+        holder === null
+          ? `项目锁已存在但内容不可读（可能正被另一个写者发布）: ${LOCK_PATH}${unreadable === null ? '' : `：${unreadable}`}`
+          : `项目锁已被持有: ${LOCK_PATH}（session=${String(holder.session)} operation=${holder.operation ?? 'null'} pid=${String(holder.pid)}）`,
       nextStep:
         '等待持锁操作结束；只有核实原进程/Lead 不再写且恢复记录已保存后，才用 release({force:true, recoveryRef}) 显式清理',
       details: {
         holder,
-        stale: isStale(holder, { now: nowMs, isAlive, processStart }),
+        holder_unreadable: unreadable,
+        stale: holder === null ? null : isStale(holder, { now: nowMs, isAlive, processStart }),
       },
     })
   }

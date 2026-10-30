@@ -11,6 +11,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
 
 import {
   environment, withProject, writeTargets, writeRoute, writeRun, writeProject,
@@ -167,3 +168,24 @@ test('串行整合窗口：两个任务在锁内各 seal 一次，真实 check -
     assert.equal(sealedB.run_id, RUN_B)
   })
 })
+
+// T22 回归：`acquire` 发布锁的方式是「先 O_EXCL 建名、再写正文」，两个 acquirer 撞在一起时，
+// 败者可能恰好在正文落盘前读它 —— 零长度或半截。那必须报「有人持有/正在发布」（PROJECT_BUSY），
+// **不能**报成锁损坏（RECOVERY_REQUIRED）。此前正是这个把一次正常并发冲突变成了随机的假故障。
+test('锁文件存在但内容不可读：报 PROJECT_BUSY 并标出读不出来，不报成锁损坏（T22）', async (t) => {
+  await withProject(t, async ({ root }) => {
+    const lockPath = path.join(root, 're', 'team', 'lock')
+    await mkdir(path.dirname(lockPath), { recursive: true })
+    await writeFile(lockPath, '') // 零长度：模拟「名字已发布、正文还没落」的窗口
+
+    const error = await rejectionCode(
+      acquire(root, { session: 'lead-x', ownerNonce: 'nonce-x', pid: process.pid, ttlMs: 60_000 }),
+      'PROJECT_BUSY',
+      '零长度锁文件',
+    )
+    assert.equal(error.details.holder, null, '读不出内容时 holder 必须是 null，不能假装知道持有者')
+    assert.equal(typeof error.details.holder_unreadable, 'string', '必须如实标出「读不出来」，不要吞掉这个事实')
+    assert.equal(error.details.stale, null, '读不出持有者时不给 stale 判断')
+  })
+})
+
