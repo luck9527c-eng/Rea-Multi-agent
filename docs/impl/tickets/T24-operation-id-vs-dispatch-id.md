@@ -1,6 +1,6 @@
 # T24：`operation_id` 与 `dispatch_id` / `attempt_id` 的区别在工具描述里没说清，模型第一次收口就复用错 id
 
-状态：待办（小改动，当天可交付）
+状态：**已完成**（2026-10-30，`df0cb39`）。三处描述已改，`bundle.test.mjs:849-859` 加了断言钉住 `rt_conclude` 的那两句；门禁 574/0。
 来源：真会话 `session-eda089ea-1e8a-465d-958c-9959492b4db2`
 
 ## 观测
