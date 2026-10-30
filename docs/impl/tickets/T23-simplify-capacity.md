@@ -44,12 +44,28 @@
 > 名册报 `used`（来自宿主）与岗位状态；`capacity.json` 存在时按它把超额岗位标 `deferred`，不存在就都标可派。
 > 派发直接调 `spawnTeammate`；宿主拒绝就返回 `CAPACITY_EXHAUSTED` + 宿主原话，不猜上限、不声称"烧了什么"。
 
-## 需要拍板的一处
+## 已决：全删（用户裁决，2026-10-30）
 
-`capacity.json` 留还是全删？
+**`capacity.json` 一并删除**，不留"操作者可下设上限"这种半留半删。
 
-- **留（建议）**：操作者确实可能想"这个项目最多 3 个人"。一个只读文件，代价小；删了就没有任何提前截断手段。
-- **全删**：最彻底，`rt_roster` 不再有预算概念，`planBudget` 与 `recommended_members` 一起删。**功能会真的变少**（没法提前把岗位标 deferred）。
+裁决理由（用户原话）：官方 Agent Teams 自己都不做容量规划，上限还是刻意藏起来的；我们替它做只会越猜越偏。
+
+连带追加删除：
+
+| 追加删除项 | 位置（预估） |
+|---|---|
+| `re/team/capacity.json` 读取（`readDeclaredCapacity` / `capacitySourceGap('project')`） | `src/capacity.ts`、`src/team-adapter.ts` |
+| `planBudget` 的一切预算：剩余席位/activation、`deferred` 标记、`recommended_members` | `src/roster.ts` |
+| `capacity` 入参与 schema（`max_members` / `max_active_subagents` / `reserved_*`） | `src/tool-schema.ts`、`src/index.ts` |
+| 名册 render 里的 `capacity：` 行与 `reserved_*` | `src/index.ts`（render） |
+| `profile config.capacity` 读取 | 装配层 / `src/team-adapter.ts` |
+| SEAMS §7 状态归属表里 `re/team/capacity.json` 那一行 | `docs/impl/SEAMS.md` |
+
+**删完之后 `rt_roster` 只剩三件事**：读宿主名册（成员与任务）、报项目 skill 兼容性缺口与技术能力缺口、生成/校验 `proposal_hash` 供 bind。
+没有"预算"、没有"剩余多少"、没有"建议几人"。岗位能不能派只看**能力是否满足**，不看容量。
+
+`DECISIONS.md` 要写清：D40 的**结论保留**（容量未知也照派、不主动探测），但为它服务的整套推断机与声明文件**全部删除**；
+D40 那张五档优先级表**保留原文并标"已废止"**，不要改写历史。
 
 ## 验收
 
