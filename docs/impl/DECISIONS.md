@@ -404,3 +404,71 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 
 回归时若看到「篡改依赖产物却报 `SUBMISSION_INVALID`」，说明快照里的 `artifacts` 又空了（回到 D37 的缺口），
 或者被篡改的文件恰好也在本次提交的 `artifacts` 里（合法的更早 fail-fast）。
+
+## D40 — 有意的 spec 偏离：容量未知不再拒绝，改为「照派、撞一次就学」
+
+> 来源：用户裁决（2026-10-30）+ ticket [`tickets/T18-capacity-per-call.md`](tickets/T18-capacity-per-call.md)。
+> 实现：`src/capacity-source.ts`（新）、`src/roster.ts`、`src/dispatch.ts`、
+> `docs/specs/rt-tools.schema.json` + `src/tool-schema.ts`（`capacity` 入参）；
+> 用例：`test/t18-capacity.test.mjs`（T0–T7）与 `test/dispatch.test.mjs` 的「未声明容量」用例。
+
+### 改了哪条 spec 原文
+
+`docs/specs/orchestration-contract.md` §「岗位目录与预算裁剪」（第 44 行）逐字写着：
+
+> 「无法取得或保守确定可用额度时返回 CAPACITY_UNKNOWN，不估计后盲目创建。」
+
+同一份契约的「派发前置」表也把 `CAPACITY_UNKNOWN` 列为派发前置码（第 157 行）。
+
+**本票把「未知即拒绝」改成「未知则照派，并在宿主拒绝时学一次上限」。** `rt_roster`/`bind` 的
+预算裁剪口径不变（未知仍然 defer + `CAPACITY_UNKNOWN`，因为那一步不产生不可逆副作用）；
+变化的只有 `rt_dispatch` 遇到**未声明**容量时的前置判定。`CAPACITY_UNKNOWN` 这个码**保留**：
+它现在只用于「复用增量未知」「用量数不到」「观测进行中」这类**有具体未知项**的情形，
+不再用于「项目压根没声明上限」。
+
+### 为什么
+
+宿主事实（D1）没有变：`maxMembers` / `maxActiveSubagents` / `ActivationPool.slots` 全无公开读法，
+一次失败 spawn 还会**永久烧掉成员名与席位**（D12）。所以「猜一个 8/16」仍然禁止。
+但「必须先写配置文件才能第一次派发」同样有代价：它把「开几个人」的决定权从 Leader 手里拿走，
+而 Leader 本来就有这个上下文。用户的裁决是：**把决定权交给 Leader，并接受最多一次不可逆损失作为学费**。
+
+### 代价（如实记录）
+
+1. 未声明容量的第一次派发**可能真的烧掉一个成员名与一个席位**；诊断会明说这一点，不静默。
+2. 观测值是**保守下限**：`max_members` 取「宿主拒绝那一刻的已用席位数」（失败成员已计入），
+   即 ticket 说的「你已经到顶了」。真实上限只会 ≥ 这个数，所以学到之后**宁可不派**：
+   剩余 0 时后续派发直接 `CAPACITY_EXHAUSTED`（前置拒绝、零副作用），不会再烧名字。
+3. `max_active_subagents` 在观测时**不可观测**（D25：池内占用没有只读查询）。ticket 要求这个字段
+   必须写，因此实现取同一个「已用席位数」作为它的保守下限，并只用它做更严格的裁剪；
+   它**不声称**知道真实 activation 池大小。要放宽就显式声明，不要靠再撞一次去试探
+   （D1 仍然禁止「为探测而 spawn」）。
+4. 观测值**按会话生效**：`TeamId` 就是 Lead 会话 id，席位随会话重置。`session_id` 与当前会话不一致、
+   或当前会话身份拿不到时，观测值**不套用**（仍按 `unknown` 或其它声明来源），并且会留一条诊断说明为什么不套用。
+5. 并发保护：未知容量 + 已存在 `re/team/capacity-observing.json` 标记时，第二次派发**明确拒绝**
+   （`CAPACITY_UNKNOWN`，message 点名标记文件与被观测的成员），避免并行撞出 N 个不可逆损失。
+   标记属于**别的会话**时不挡（席位已重置），但会留一条诊断；标记无法归到任何会话时按本会话处理（保守）。
+
+### 谁决定
+
+用户（2026-10-30 裁决），由 Lead 立项为本票；实现方只落实口径，不再复议。
+
+### 落地口径（后续改动请照这个，不要各写一套）
+
+| 项 | 取值 |
+|---|---|
+| 优先级 | 按调用 `capacity` > `re/team/capacity.json` > profile `config.capacity` > **本会话**观测值 > `unknown` |
+| `capacity_source` | `call` / `project` / `profile` / `observed` / `unknown`，写进 operation 台账（`capacity_source`、`capacity_max_members`、`capacity_max_active_subagents`、`capacity_session_id`）与诊断文本（`capacity_source=…` 出现在 reason 里） |
+| 观测值文件 | `re/team/capacity-observed.json`：`{schema_version:1, session_id, observed_at, max_members, max_active_subagents, basis:{used_at_observation, host_code}}` |
+| 写入时机 | **只在**宿主因容量拒绝了一次**真实需要**的 spawn 之后（`CAPACITY_EXHAUSTED`）；绝不为了探测而派发 |
+| 观测中标记 | `re/team/capacity-observing.json`（spawn 前写、spawn 结束删；只在容量未知时写） |
+| 回执 | `status=partial`、`code=CAPACITY_EXHAUSTED`、`data.member` 点名被烧的成员；`hostCode` 与观测值落点写进诊断（D21：`failureData` 是封闭对象，细节只能进文本） |
+| 同名重试 | **禁止**（D12），失败分支不重试，下一次派发自然用 `-2` |
+| 免拒绝范围 | 只有 `capacity_source === 'unknown'`；**已声明**容量（项目/调用/观测）仍按原预算裁剪，行为不变 |
+
+**诊断原文（未声明时，逐字）**：
+
+> 容量未声明（capacity_source=unknown）：re/team/capacity.json 与 profile config.capacity 都没有声明，
+> 本会话也还没有观测值，当前已用席位 N。本次派发照派，但**不保证**有位置：
+> 宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位（该名字不会再用，D12）
+

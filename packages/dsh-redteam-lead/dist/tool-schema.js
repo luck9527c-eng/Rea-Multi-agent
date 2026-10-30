@@ -223,6 +223,24 @@ const SPEC = {
                     "minimum": 0,
                     "default": 2
                 },
+                "capacity": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "max_members",
+                        "max_active_subagents"
+                    ],
+                    "properties": {
+                        "max_members": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "max_active_subagents": {
+                            "type": "integer",
+                            "minimum": 1
+                        }
+                    }
+                },
                 "operation_id": {
                     "$ref": "#/$defs/id"
                 },
@@ -374,6 +392,24 @@ const SPEC = {
                 },
                 "prohibited": {
                     "$ref": "#/$defs/strings"
+                },
+                "capacity": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "max_members",
+                        "max_active_subagents"
+                    ],
+                    "properties": {
+                        "max_members": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "max_active_subagents": {
+                            "type": "integer",
+                            "minimum": 1
+                        }
+                    }
                 },
                 "capability_needs": {
                     "$ref": "#/$defs/strings",
