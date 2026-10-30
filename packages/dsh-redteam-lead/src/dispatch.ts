@@ -2246,45 +2246,84 @@ interface CapacityObservationResult {
   ref: string | null
   used: number | null
   error: string | null
+  /** 上限数字的来源：解析成功 / 回落 / 沿用已有解析值（没落盘时 `null`）。 */
+  origin: capacitySource.ObservationOrigin | null
+  /** 本次宿主消息里解析出的准确值（回落/沿用为 `null`）。 */
+  parsed_limit: number | null
+  max_members: number | null
+  max_active_subagents: number | null
 }
 
 /**
- * 被动观测：宿主因上限拒绝了一次**真实需要**的创建之后，把「你已经到顶了」记下来。
+ * 被动观测：宿主因上限拒绝了一次**真实需要**的创建之后，把它写在消息里的上限记下来。
  *
- * `max_members` 取**观测当时的已用席位数**（失败成员已计入）：真实上限只会 ≥ 这个数，
- * 所以它是保守下限 —— 宁可少开，也不靠猜多开。activation 占用不可观测（D25），
- * 同一个已用席位数只作为 `max_active_subagents` 的保守下限，不声称知道真实池大小。
+ * T18b：宿主在两条拒绝消息里写着真实数字（`active child limit: N` / `Team member limit N reached`），
+ * 解析到就写准确的 N —— 只有解析不到时才回落到 T18 的语义（观测当时的已用席位数，即「你已经到顶了」）。
+ * 已经解析到准确值之后，一次不可解析的碰撞**不得**把它降级（`origin: 'retained'`，原样沿用）。
  */
 async function recordCapacityObservation(params: {
   root: string
   sessionId: string | null
   teamAdapter: TeamAdapterLike
   hostCode: string
+  /** 宿主原始文案（解析依据；适配器把它放在 `reason` 里）。 */
+  hostMessage: string | null
   nowIso: string
 }): Promise<CapacityObservationResult> {
+  const unwritten = (
+    used: number | null,
+    error: string,
+    origin: capacitySource.ObservationOrigin | null = null,
+  ): CapacityObservationResult =>
+    ({ ref: null, used, error, origin, parsed_limit: null, max_members: null, max_active_subagents: null })
+
   const used = await usedSeatsNow(params.teamAdapter)
-  if (used === null) {
-    return { ref: null, used: null, error: 'listMembers 失败，数不到已用席位' }
+  if (used === null) return unwritten(null, 'listMembers 失败，数不到已用席位')
+  if (used < 1) return unwritten(used, `观测当时的已用席位是 ${used}，不能当作上限`)
+  const sessionId = params.sessionId
+  if (sessionId === null) return unwritten(used, '拿不到本会话身份，观测值无法归到会话（未落盘）')
+
+  // 同会话已有的观测值：决定「覆盖」还是「沿用」（解析失败时不许把准确值降级成推断值）。
+  const existing = await capacitySource.readObservedCapacity(params.root, sessionId)
+  const observation = capacitySource.observeCapacity({
+    sessionId,
+    observedAt: params.nowIso,
+    used,
+    hostCode: params.hostCode,
+    message: params.hostMessage,
+    existing: existing.applies ? existing.record : null,
+  })
+  const settled: CapacityObservationResult = {
+    ref: capacitySource.OBSERVED_CAPACITY_PATH,
+    used,
+    error: null,
+    origin: observation.origin,
+    parsed_limit: observation.parsed_limit,
+    max_members: observation.record.max_members,
+    max_active_subagents: observation.record.max_active_subagents,
   }
-  if (used < 1) {
-    return { ref: null, used, error: `观测当时的已用席位是 ${used}，不能当作上限` }
-  }
-  if (params.sessionId === null) {
-    return { ref: null, used, error: '拿不到本会话身份，观测值无法归到会话（未落盘）' }
+  if (observation.origin === 'retained') {
+    // 没有新的准确值也没有新信息：不重写文件（重写就等于用一次失败的解析换掉 observed_at 与原文）。
+    return settled
   }
   try {
-    const ref = await capacitySource.writeObservedCapacity(params.root, {
-      schema_version: capacitySource.OBSERVED_SCHEMA_VERSION,
-      session_id: params.sessionId,
-      observed_at: params.nowIso,
-      max_members: used,
-      max_active_subagents: used,
-      basis: { used_at_observation: used, host_code: params.hostCode },
-    })
-    return { ref, used, error: null }
+    const ref = await capacitySource.writeObservedCapacity(params.root, observation.record)
+    return { ...settled, ref }
   } catch (error) {
-    return { ref: null, used, error: `写 ${capacitySource.OBSERVED_CAPACITY_PATH} 失败：${thrownMessage(error)}` }
+    return { ...settled, ref: null, error: `写 ${capacitySource.OBSERVED_CAPACITY_PATH} 失败：${thrownMessage(error)}` }
   }
+}
+
+/** 解析出的那个数字落在哪个维度（两条宿主消息各只讲一件事）。 */
+function parsedLimitDimension(hostCode: string | null): string {
+  if (hostCode === 'TEAM_MEMBER_LIMIT') return '成员席位数'
+  if (hostCode === 'ACTIVATION_LIMIT_REACHED') return 'activation 池大小'
+  return '上限'
+}
+
+/** 观测到的两个上限（`max_members`/`max_active_subagents`）。 */
+function observedLimitsText(observed: CapacityObservationResult): string {
+  return `max_members=${String(observed.max_members)}、max_active_subagents=${String(observed.max_active_subagents)}`
 }
 
 /** 容量碰撞的 failure 文案：点名被烧掉的成员、宿主原始码、观测值落点（D21：细节写进文本）。 */
@@ -2299,9 +2338,17 @@ function capacityFailureReason(
   const head = `宿主因容量上限拒绝创建成员 ${member}（${raw}${host}）：该名字与席位已被烧掉，不得同名重试（D12）`
   if (observed === null) return `${head}。本次没能观测到上限`
   if (observed.ref === null) return `${head}。观测值没有落盘：${observed.error ?? '未知原因'}`
-  return `${head}。已把观测到的上限写进 ${observed.ref}：`
-    + `max_members=${String(observed.used)}（取失败那刻的已用席位数，失败成员已计入）、`
-    + `max_active_subagents=${String(observed.used)}（activation 占用不可观测，同一个保守下限）`
+  if (observed.origin === 'retained') {
+    return `${head}。已有观测值（${observed.ref}）里的准确上限仍然成立：${observedLimitsText(observed)}；`
+      + '这次消息里没有可解析的数字，因此不覆盖、不降级（observed_at 保持不变）'
+  }
+  if (observed.origin === 'parsed') {
+    return `${head}。已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}`
+      + `（其中 ${String(observed.parsed_limit)} 来自宿主消息里的${parsedLimitDimension(hostCode)}；`
+      + '消息没讲到的那个维度取观测当时已用席位的保守下限）'
+  }
+  return `${head}。已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}`
+    + '（回落：消息里没有可解析的数字，取失败那刻的已用席位数，失败成员已计入）'
 }
 
 /** 容量碰撞的下一步：只允许换名字重试，且先核对名册。 */
@@ -2332,14 +2379,35 @@ function capacityFailureDiagnostics(
     next_step: '不要用同名重试（D12）；下一次派发会自动用下一个名字',
   }]
   if (observed !== null && observed.ref !== null) {
-    out.push({
-      code: 'CAPACITY_OBSERVED',
-      reason:
-        `已把观测到的上限写进 ${observed.ref}：max_members=${String(observed.used)}、`
-        + `max_active_subagents=${String(observed.used)}（观测当时已用 ${String(observed.used)} 席，hostCode=${host}）`,
-      next_step:
-        '这是「你已经到顶了」的保守下限，不是宿主声明：要放宽就在 re/team/capacity.json 声明；不要靠再撞一次去试探',
-    })
+    if (observed.origin === 'parsed') {
+      out.push({
+        code: 'CAPACITY_OBSERVED',
+        reason:
+          `已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}。`
+          + `其中 ${String(observed.parsed_limit)} 是从宿主消息里解析出的${parsedLimitDimension(hostCode)}准确值`
+          + `（hostCode=${host}，原文留存在 basis.message），另一维取观测当时已用席位的保守下限`,
+        next_step:
+          '这是宿主自己写的数字，不是估算；但上限可能因为改设置而失效 —— 下一次再撞到会覆盖并更新 observed_at。'
+          + '要写死就在 re/team/capacity.json 声明；不要为了刷新它而故意再撞一次',
+      })
+    } else if (observed.origin === 'retained') {
+      out.push({
+        code: 'CAPACITY_OBSERVED',
+        reason:
+          `本次宿主消息里没有可解析的数字，沿用 ${observed.ref} 里已解析的准确上限：${observedLimitsText(observed)}`
+          + `（hostCode=${host}；不覆盖、不降级，observed_at 保持不变）`,
+        next_step: '准确值仍然成立，只是这一次没重新读到；若反复出现，核对 basis.message 与宿主是否改了措辞',
+      })
+    } else {
+      out.push({
+        code: 'CAPACITY_OBSERVED',
+        reason:
+          `已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}`
+          + `（回落：消息里没有可解析的数字，basis.parsed_limit=null，观测当时已用 ${String(observed.used)} 席，hostCode=${host}）`,
+        next_step:
+          '这是「你已经到顶了」的下限，不是宿主声明：要放宽就在 re/team/capacity.json 声明；不要靠再撞一次去试探',
+      })
+    }
   } else {
     out.push({
       code: 'CAPACITY_OBSERVED_UNWRITTEN',
@@ -2775,12 +2843,14 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
             const code = stableCode(spawned.code)
             const hostCode = nonEmpty(spawned.hostCode) ? spawned.hostCode : null
             // T18：宿主因上限拒绝一次**真实需要**的创建 → 被动观测（不是主动试探）。
+            // T18b：观测读的是宿主自己抛出的文案（适配器放在 `reason` 里），从里面解析出准确上限。
             const observed = code === 'CAPACITY_EXHAUSTED'
               ? await recordCapacityObservation({
                 root,
                 sessionId: capacitySessionId,
                 teamAdapter,
                 hostCode: hostCode ?? code,
+                hostMessage: nonEmpty(spawned.reason) ? spawned.reason : null,
                 nowIso: now(),
               })
               : null
@@ -2791,7 +2861,10 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
                 : {
                   capacity_observed: {
                     ref: observed.ref,
-                    max_members: observed.used,
+                    max_members: observed.max_members,
+                    max_active_subagents: observed.max_active_subagents,
+                    parsed_limit: observed.parsed_limit,
+                    origin: observed.origin,
                     host_code: hostCode,
                     at: now(),
                   },

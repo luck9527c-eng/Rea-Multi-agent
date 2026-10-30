@@ -161,5 +161,31 @@ makeTempProject({t, files}) / makeTempDir(t) / makeClock(start) / makeFakeTools(
 - `makeCtx` 的 `deps` 已装 T1/T3 真实模块；`binding/contract/resources/submission/anchors/baseline` 仍为 `null`（由 T5/T6/T7 填）。
 - `capacity:{known:true,maxMembers,maxActiveSubagents,via:'project'|'config'}` 会落成 `re/team/capacity.json` 或 `ctx.config.capacity`；不传就 `known:false`。
 
+## 宿主容量拒绝消息（外部事实；T18b 起本包解析它们）
+
+两条容量拒绝消息里**写着真实数字**。本包只读宿主抛给调用方的 `error.message`（被动观测：不读私有字段、
+也不为试探而 spawn，D1），并且**只**对这两个稳定码做匹配 —— 不把任意宿主消息拿去正则。
+
+| 宿主码 | 消息原文 | 数字是什么 |
+|---|---|---|
+| `ACTIVATION_LIMIT_REACHED` | `subagent limit reached (active child limit: ${capacity}); wait for an existing child to finish or complete this work with the current agents` | `capacity` = `ActivationPool.reserve(capacity)` 的入参，即该池允许的**同时** activation 数；team spawn 走 `pool.reserve(this.maxActiveSubagents())`，每次预留时才读闭包 → **运行期可变** |
+| `TEAM_MEMBER_LIMIT` | `Team member limit ${this.maxMembers} reached` | `maxMembers` = 成员席位上限；`state.members.length >= this.maxMembers` 时抛 |
+
+出处：安装构建 `0.2.1-rc.3` 的 `app.asar`（`@deepseek-ai/dsh-subagent/lib/index.js:1047`、
+`@deepseek-ai/dsh-experimental-agent-team/lib/index.js:1024`）。checkout 源码里逐字复核：
+`packages/subagent/subagent/src/activation.ts`（`ActivationPool.reserve`）与
+`packages/experimental/agent-team/src/roster.ts`（`spawnTeammate`）。
+
+两个与「观测」有关的细节：
+
+- `TEAM_MEMBER_LIMIT` 的检查在写成员行**之前**（`journal.transact` 内先查上限、再 append），所以这条拒绝
+  **不烧**成员名与席位：观测当时的 `used` 正好等于 `maxMembers`。
+- `ACTIVATION_LIMIT_REACHED` 发生在成员行 `appendAndFlush` **之后**，catch 里把该行 settle 成 `phase:'failed'`
+  → 名字与席位确实被烧掉（D12），`used` 含这一行。
+
+消费方：`src/capacity-source.ts` 的 `parseHostCapacityLimit()`（正则只认这两条码）。拿不到数字就回落为
+观测当时的已用席位数（T18 语义），并在诊断里说明「回落」—— 不抛、不猜。**宿主改措辞时**，先更新本表，
+再更新那两条正则与 `test/t18b-capacity-limit.test.mjs`。
+
 ## 尚未交付（T5/T6/T7）
 `src/{roster,binding,dispatch,contract,resources,conclude,submission,anchors,baseline}.mjs` 与其测试。

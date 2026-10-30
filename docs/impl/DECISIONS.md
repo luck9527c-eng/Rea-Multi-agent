@@ -439,10 +439,12 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 2. 观测值是**保守下限**：`max_members` 取「宿主拒绝那一刻的已用席位数」（失败成员已计入），
    即 ticket 说的「你已经到顶了」。真实上限只会 ≥ 这个数，所以学到之后**宁可不派**：
    剩余 0 时后续派发直接 `CAPACITY_EXHAUSTED`（前置拒绝、零副作用），不会再烧名字。
+   *（T18b 起：能解析到宿主消息里的准确值时就不是下限了，见下面的补记。）*
 3. `max_active_subagents` 在观测时**不可观测**（D25：池内占用没有只读查询）。ticket 要求这个字段
    必须写，因此实现取同一个「已用席位数」作为它的保守下限，并只用它做更严格的裁剪；
    它**不声称**知道真实 activation 池大小。要放宽就显式声明，不要靠再撞一次去试探
    （D1 仍然禁止「为探测而 spawn」）。
+   *（T18b 起：`ACTIVATION_LIMIT_REACHED` 的消息里带着池大小本身，这个代理值只在解析不到时使用。）*
 4. 观测值**按会话生效**：`TeamId` 就是 Lead 会话 id，席位随会话重置。`session_id` 与当前会话不一致、
    或当前会话身份拿不到时，观测值**不套用**（仍按 `unknown` 或其它声明来源），并且会留一条诊断说明为什么不套用。
 5. 并发保护：未知容量 + 已存在 `re/team/capacity-observing.json` 标记时，第二次派发**明确拒绝**
@@ -459,7 +461,7 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 |---|---|
 | 优先级 | 按调用 `capacity` > `re/team/capacity.json` > profile `config.capacity` > **本会话**观测值 > `unknown` |
 | `capacity_source` | `call` / `project` / `profile` / `observed` / `unknown`，写进 operation 台账（`capacity_source`、`capacity_max_members`、`capacity_max_active_subagents`、`capacity_session_id`）与诊断文本（`capacity_source=…` 出现在 reason 里） |
-| 观测值文件 | `re/team/capacity-observed.json`：`{schema_version:1, session_id, observed_at, max_members, max_active_subagents, basis:{used_at_observation, host_code}}` |
+| 观测值文件 | `re/team/capacity-observed.json`：`{schema_version:1, session_id, observed_at, max_members, max_active_subagents, basis:{host_code, parsed_limit, used_at_observation, message}}`（`basis` 是四字段并集，T18b） |
 | 写入时机 | **只在**宿主因容量拒绝了一次**真实需要**的 spawn 之后（`CAPACITY_EXHAUSTED`）；绝不为了探测而派发 |
 | 观测中标记 | `re/team/capacity-observing.json`（spawn 前写、spawn 结束删；只在容量未知时写） |
 | 回执 | `status=partial`、`code=CAPACITY_EXHAUSTED`、`data.member` 点名被烧的成员；`hostCode` 与观测值落点写进诊断（D21：`failureData` 是封闭对象，细节只能进文本） |
@@ -471,4 +473,54 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 > 容量未声明（capacity_source=unknown）：re/team/capacity.json 与 profile config.capacity 都没有声明，
 > 本会话也还没有观测值，当前已用席位 N。本次派发照派，但**不保证**有位置：
 > 宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位（该名字不会再用，D12）
+
+### 补记（T18b，2026-10-30）：上限有了**准确值**，不只是「你已经到顶了」
+
+> ticket [`tickets/T18b-parse-exact-limit.md`](tickets/T18b-parse-exact-limit.md)。
+> 实现：`src/capacity-source.ts`（`parseHostCapacityLimit` 纯解析 + `observeCapacity` 纯归并）、
+> `src/dispatch.ts`（`recordCapacityObservation` 只负责 IO）。
+> 用例：`test/t18b-capacity-limit.test.mjs`（T18b-1…7）；宿主消息格式记在
+> [`UPSTREAM-API.md`](UPSTREAM-API.md) 的「宿主容量拒绝消息」一节。
+
+宿主把**真实数字写在拒绝消息里**，所以「撞一次就学」学到的不再是推断值：
+
+| 宿主码 | 消息 | 写进哪个字段 |
+|---|---|---|
+| `ACTIVATION_LIMIT_REACHED` | `subagent limit reached (active child limit: N); …` | `max_active_subagents = N` |
+| `TEAM_MEMBER_LIMIT` | `Team member limit N reached` | `max_members = N` |
+
+**这修掉了代价第 3 条（T18 被迫用已用席位数代理 activation 池大小）**：D25 说的是「activation 的**当前占用**
+没有只读查询」，这一点没变；但**池大小**本来就在拒绝消息里，之前没读。现在 `max_active_subagents` 拿到的是 N，
+`rt_roster` 的 activation 维度因此第一次有真实数字。同理，`max_members = N` 之后余量是**真余量**
+（`N - used - 预留`），不再恒为 0 —— 这正是「别的 activation 释放后还能开几个」的前提。
+
+每条消息只讲一件事，所以**另一个维度仍按 T18 的语义回落**为观测当时的已用席位数（保守下限）。
+`basis.host_code` 说明这个 `parsed_limit` 落在哪个维度（`TEAM_MEMBER_LIMIT` → 成员席位；
+`ACTIVATION_LIMIT_REACHED` → activation 池）。
+
+**两种来源都必须可查**（`re/team/capacity-observed.json` 的 `basis` 是四字段并集，旧的
+`{used_at_observation, host_code}` 不够用了）：
+
+| `basis.parsed_limit` | 含义 | 诊断怎么说 |
+|---|---|---|
+| `>= 1` | 从宿主消息里解析出的**准确值** | 「从宿主消息里解析出的准确值」，原文留在 `basis.message` |
+| `null` | 消息里没有数字 → **回落**为 `used_at_observation`（你已到顶） | 明说「回落」+ `basis.parsed_limit=null`，不假装知道真实上限 |
+
+**这个值会失效。** `dsh-subagent` 的容量是**每次预留时通过闭包读**的（`pool.reserve(this.maxActiveSubagents())`），
+`maxMembers` 同样来自配置：用户在设置里改了就变。因此：
+
+- 观测值一定带 `observed_at`，**不是**永久常量；
+- 同会话下一次撞到并解析出不同的 N → **覆盖**并更新 `observed_at`（ticket 用例 5）；
+- 解析失败的碰撞**不得把准确值降级**：原样沿用、连 `observed_at` 都不改（用例 4），
+  否则宿主一次改措辞就把准确值退化成推断值；
+- 消息没讲到的那个维度取 `max(已有值, used)`，不会被另一个维度的消息顺手缩小。
+
+**兼容**：`basis` 现在是四字段并集（`host_code` 仍在，没删字段）。旧的两字段文件会被判
+`CAPACITY_OBSERVED_INVALID`（诊断给出新形状），下一次真实碰撞自动重写一份 —— 不需要手工迁移。
+`schema_version` 仍是 1（形状只增不减，读方本来就按字段校验）。
+
+**观测中标记可判残骸**：`re/team/capacity-observing.json` 的正常生命周期是「spawn 前写、spawn 结束删」，
+进程被杀就留下来了。并发拒绝的诊断现在同时给出标记内的 `started_at` 与**该文件的 mtime**
+（`readObservationMarker().modified_at`），操作者据此判断是「刚刚有人在观测」还是「很久以前的残骸」；
+处置仍是先核对名册、再手工删文件（插件不自动清理别人的标记）。已知限制同步写进 README。
 
