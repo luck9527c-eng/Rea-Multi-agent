@@ -4,7 +4,7 @@
 > 规则只有一条：**贴原文，不要复述**。工具返回整段贴，项目侧哈希用 `collect` 的输出，
 > 判定只允许 `pass` / `fail` / `not-run`。没有证据的项写 `not-run`，不要写"看起来正常"。
 >
-> 判据来源：`docs/verify/l3-checklist.md`（由 `scripts/l3-verify.mjs checklist` 生成，七步 × 54 条断言）。
+> 判据来源：`docs/verify/l3-checklist.md`（由 `scripts/l3-verify.mjs checklist` 生成，七步 × 55 条断言）。
 
 ## 1. 元信息
 
@@ -113,9 +113,9 @@ node <仓库根>\packages\dsh-redteam-lead\bin\doctor.mjs --profile <profile 根
 
 ---
 
-### 第 2 步 — `rt_roster`：兼容性 / 岗位需求 / 缺口 / 预算
+### 第 2 步 — `rt_roster`：兼容性 / 岗位需求 / 缺口 / max_posts 裁剪
 
-**① 调用与入参**（至少两组入参，证明"岗位数随目标与预算变化"）
+**① 调用与入参**（至少两组入参，证明"岗位数随目标与 `max_posts` 变化"）
 
 ```text
 <rt_roster({project_root:"…",action:"inspect",target_kinds:["webapp"],max_posts:6})>
@@ -125,7 +125,7 @@ node <仓库根>\packages\dsh-redteam-lead\bin\doctor.mjs --profile <profile 根
 **② 原始返回**
 
 ```json
-<两次完整返回；保留 compatibility / posts / gaps / capacity / proposal_hash>
+<两次完整返回；保留 compatibility / posts / gaps / 已用席位诊断（`TEAM_SEATS_USED`，来自宿主名册）/ proposal_hash>
 ```
 
 **③ 项目侧证据**
@@ -135,7 +135,7 @@ node <仓库根>\packages\dsh-redteam-lead\bin\doctor.mjs --profile <profile 根
 | `s2-before.json` | `<...>` | `<n>` | `<sha256>` |
 | `s2-after.json` | `<...>` | `<n>` | `<sha256>` |
 | `s2-diff.json` | `<...>` | `<n>` | `<sha256>` |
-| `re/team/capacity.json`（若创建） | `<...>` | `<n>` | `<sha256>` |
+| `s2-seats.json`（`list_agents` 原始返回；已用席位来自宿主名册，含失败成员） | `<...>` | `<n>` | `<sha256>` |
 
 `digest`：before=`<...>` after=`<...>`（inspect 不得改变 digest）
 
@@ -146,9 +146,9 @@ node <仓库根>\packages\dsh-redteam-lead\bin\doctor.mjs --profile <profile 根
 | 兼容性有明确判定（缺团队规则 → `SKILL_INCOMPATIBLE`） | `<pass/fail>` | `<...>` |
 | 每个可用岗位 `required` 非空、disabled 岗不出现 | `<pass/fail>` | `<...>` |
 | 缺口与当前能力相符（`CAPABILITY_MISSING` 点名能力族） | `<pass/fail>` | `<...>` |
-| 岗位数随 `target_kinds`/预算变化且稳定 | `<pass/fail>` | `<...>` |
-| A09：无声明时 `remaining_*` 为 `null` + `CAPACITY_UNKNOWN`，无常数兜底 | `<pass/fail>` | `<...>` |
-| A09：声明后余额可读 + `ACTIVATION_USAGE_UNOBSERVED` gap | `<pass/fail>` | `<...>` |
+| 岗位数随 `target_kinds`/`max_posts` 变化且稳定 | `<pass/fail>` | `<...>` |
+| (T23 起，原 A09) 传已删除的 `capacity` 入参 → 未知字段拒绝（`INVALID_ARGUMENT`），无宿主调用 | `<pass/fail>` | `<...>` |
+| (T23 起，原 A09) `re/team/` 下无任何容量声明/观测文件；已用席位仅作诊断 | `<pass/fail>` | `<...>` |
 | inspect 零副作用（digest 不变、无 binding 新增） | `<pass/fail>` | `<...>` |
 | A40：`project_id` 由根决定、`session_id` 是本会话 | `<pass/fail>` | `<...>` |
 | A40：换执行者后重算 | `<需构造 → pass/fail/not-run>` | `<...>` |
@@ -205,6 +205,7 @@ node <仓库根>\packages\dsh-redteam-lead\bin\doctor.mjs --profile <profile 根
 | A12：消息层失败返回 `partial` 且重投不重复启动 | `<需构造 → pass/fail/not-run>` | `<...>` |
 | A12：超长消息被拒（`DELIVERY_FAILED`） | `<需构造 → pass/fail/not-run>` | `<...>` |
 | A13：无 `start.json` 超时 | `<不可观察 → not-run>` | `<原因>` |
+| (T23 起，原 A09) 宿主拒绝 spawn → `CAPACITY_EXHAUSTED`/`partial`，diagnostics 逐字含宿主原话、不出现"烧掉/损失" | `<仅当发生 → pass/fail/not-run>` | `<...>` |
 
 **⑤ 本步判定**：`<pass/fail/not-run>`
 

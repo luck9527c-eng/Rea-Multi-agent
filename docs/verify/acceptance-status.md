@@ -40,9 +40,11 @@
   算进去，所以判 `pass`，L3 半未执行写在备注里。
 - **门禁命令**（本表所有 `pass` 都能被它复跑，在仓库根执行）：
   `npm run build && node --test "packages/dsh-redteam-lead/test/**/*.test.mjs"`
-  当前结果：**567 用例 / 567 pass / 0 fail / 0 skipped**（含本表自身的文档契约用例
+  当前结果：**574 用例 / 574 pass / 0 fail / 0 skipped**（这是全量用例数；含本表自身的文档契约用例
   [acceptance-status.test.mjs](../../packages/dsh-redteam-lead/test/acceptance-status.test.mjs)；
-  T16 新增 3 条路线回写用例：L3 第 6b 步抓到的"路线证据不落盘"缺陷的红→绿）。
+  T16 新增 3 条路线回写用例：L3 第 6b 步抓到的"路线证据不落盘"缺陷的红→绿。T22 的
+  `test/l2/lock.test.mjs`「串行整合窗口（A21）」在全量并发下约 1/3 概率偶发红、单跑必过，
+  不属本表任何一行，也不改变本数）。
 - 用例名与文件路径都相对于 `packages/dsh-redteam-lead/test/`；测试跑的是 **`dist/` 里的发货字节**。
 - **L2 用例有环境前提**：`test/l2/*.test.mjs` 要真实 `python` 和一份权威 skill 副本
   （`RPM_SKILL_ROOT`，默认值是开发机的 `C:/Users/Administrator/.agents/skills/reverse-project-management`；
@@ -76,12 +78,12 @@
 | A01 | L1/L3 | `not-run` | L1 半：[doctor.test.mjs](../../packages/dsh-redteam-lead/test/doctor.test.mjs)「健康 profile/项目：configuration_ready、runtime_ready=unknown、退出码 0」等 11 例；L3 半（部分）：[records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §2.1 | L1 半已通过（离线 doctor 可达、给修复路径、不假报 runtime）。L3 只覆盖前两条分句：两轮真会话里 doctor 都退出码 0、`runtime_ready="unknown"`、`diagnostics=[]`。**缺「未注册工具不是唯一入口」这一构造**——本轮工具全都注册上了，所以整行仍 `not-run`。 |
 | A02 | L3 | `pass` | [records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §4.1「`send_message` / `interrupt_agent` 的参数面与未知目标行为」 | `agent_id` 被参数校验拒绝（`Error: invalid arguments: missing required property "target"`）、`target` 走"查不到人"（宿主原文 `Error: active teammate "nobody-xyz" not found`）——留下来的是**团队版**参数面与行为，不是靠名字判的。**证据来自上一轮会话 `session-d9cdf339`**（本轮未重跑第 1 步）。同名对照组已被 patch 删除这一事实照旧：只能说"留下的是团队版"。 |
 | A03 | L1/L3 | `pass` | L1 半：[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 允许真实 teammate；裸子代理被拒且零副作用」「inspect 作为 Lead：给出可核对提议，且不创建成员/任务、不写 binding 与 roster」；L3 半：[records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §4.5 | 真实 teammate `rt-triage`：`rt_dispatch` / `rt_conclude` / `bind` / `takeover` 四条都是 `ROLE_REQUIRED`，`rt_roster(inspect)` 成功且给出与 Lead **同一个** `proposal_hash`；`r2-s5-diff.json` 0/0/0（身份拒绝零副作用），`task-2` 仍 `in_progress`。 |
-| A04 | L1/L2 | `pass` | [roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 作为 Lead：给出可核对提议，且不创建成员/任务、不写 binding 与 roster」「inspect 不落盘：两次 inspect 之间项目文件零变化（不写 audit.jsonl）」「bind：proposal_hash 匹配时写 binding + roster，成员仍为 0，INDEX 有指针」「bind 拒绝篡改/过期的 proposal_hash，并且不写盘」「bind 用别的 target_kinds 的旧提议 → 拒绝且不写盘」「bind 重放同一 operation_id：返回原结果 replayed=true，不重复追加历史/审计」「bind 在锁内按同一预算复核：预算内无法满足 → CAPACITY_EXHAUSTED 且不写 binding」「bind 拒绝「预算已经变了」的过期提议（inspect 之后改容量声明）」「proposal_hash 绑定已解析的容量：maxMembers 8→2 必须换提议」 | inspect 不落盘（含审计：契约「roster inspect 不落盘」）、bind 不建成员、重放不重复历史、过期提议不超配（预算变了 → `OPERATION_CONFLICT` 要求重新提议；预算内放不下 → `CAPACITY_EXHAUSTED`），四条都有断言（L1）。 |
+| A04 | L1/L2 | `pass` | [roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 作为 Lead：给出可核对提议，且不创建成员/任务、不写 binding 与 roster」「inspect 不落盘：两次 inspect 之间项目文件零变化（不写 audit.jsonl）」「bind：proposal_hash 匹配时写 binding + roster，成员仍为 0，INDEX 有指针」「bind 拒绝篡改/过期的 proposal_hash，并且不写盘」「bind 用别的 target_kinds 的旧提议 → 拒绝且不写盘」「bind 重放同一 operation_id：返回原结果 replayed=true，不重复追加历史/审计」「bind 在锁内按当前 max_posts 复核：放不下 → CAPACITY_EXHAUSTED 且不写 binding」「bind 拒绝「提议已经变了」的过期提议（inspect 之后改了 max_posts）」「proposal_hash 绑定 max_posts：上限一变就必须换提议」 | inspect 不落盘（含审计：契约「roster inspect 不落盘」）、bind 不建成员、重放不重复历史、过期提议不超配（`max_posts` 变了 → `OPERATION_CONFLICT` 要求重新提议；放不下 → `CAPACITY_EXHAUSTED`），四条都有断言（L1）。 |
 | A05 | L1/L2 | `pass` | [l2/compat.test.mjs](../../packages/dsh-redteam-lead/test/l2/compat.test.mjs) 7 例（含「非默认布局：probe 分类布局、给出 blocking 缺口与可读下一步，且不静默另建 re/（A05）」「旧副本缺团队规则：blocking 缺口 + 具体下一步，且不覆盖副本/INDEX/历史（A05 / D8）」「缺 Python：PYTHON_MISSING（blocking）点名解释器，check 明确失败而不是假装成功（A05）」）；[project-adapter.test.mjs](../../packages/dsh-redteam-lead/test/project-adapter.test.mjs)「probe：缺团队规则/缺 INDEX/缺 Python 各自给出具体 gap 与下一步」 | 缺配置 / 缺 Python / 旧副本无团队规则 / 非默认布局四类缺口都报实际差异；不重 init、不覆盖副本/INDEX/历史（用哈希对比断言）。**非默认布局是 T10 补的实现缺口**（原 `layoutKind` 恒为 `'default'`）。L2 用例依赖本机的 `RPM_SKILL_ROOT`/`RT_L2_PYTHON`（见 [README](README.md)）。 |
 | A06 | L1 | `pass` | [capacity.test.mjs](../../packages/dsh-redteam-lead/test/capacity.test.mjs)「A06 场景：mixed 并集、缺工具、预算只够两岗时稳定裁剪且保留专岗缺口」「vacant / deferred / disabled 三类分开返回，缺口码可区分」；[catalog.test.mjs](../../packages/dsh-redteam-lead/test/catalog.test.mjs)「mixed 给 game+webapp 得到按 post_id 去重的并集，各自专岗都在」 | 并集去重 + 稳定裁剪 + 三类分开 + 不强凑四岗，L1 断言齐全。 |
 | A07 | L1 | `pass` | [capability.test.mjs](../../packages/dsh-redteam-lead/test/capability.test.mjs)「族名本身、插件 ID、子串与前缀都不算命中」「web-recon 组合必须 web、fs、search 全部满足」「binary-static 没有任何默认工具名：存在 REA/MCP 名也不放行」「mcp:<server> 未绑定即缺口，不能凭工具名猜归属」；[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 的 gaps 区分：缺工具、未就绪 provider、预算延后、disabled」；[catalog.test.mjs](../../packages/dsh-redteam-lead/test/catalog.test.mjs)「模板不含 disabled 岗位，web-attack 只出现在 reserved_posts」 | 不凭 REA 名字推定能力、模板需求不可删（[contract.test.mjs](../../packages/dsh-redteam-lead/test/contract.test.mjs)「prohibited / evidence_required 只追加：传空数组不会删掉岗位默认要求」）、disabled 岗不派。 |
 | A08 | L1/L3 | `not-run` | L1 半：[roster.test.mjs](../../packages/dsh-redteam-lead/test/roster.test.mjs)「inspect 工具可见性取自实际执行者：Lead 与 teammate 的 vacant 不同」「执行者注册表是数组形状（宿主真实形状）时 shell/fs/search 三项全部匹配」「按名字为键的旧形状（老宿主/旧替身）仍然被解析」；[host.test.mjs](../../packages/dsh-redteam-lead/test/host.test.mjs)「工具可见性按 agent 名字区分」；[schemas-shape.test.mjs](../../packages/dsh-redteam-lead/test/schemas-shape.test.mjs)（`schemas()` → 工具名集合的取值契约，含「数组形状：绝不把数组下标当工具名」）；[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「缺必需能力 → CAPABILITY_MISSING，且不建成员/任务」「执行者注册表是数组形状（宿主真实形状）时派发不再被 CAPABILITY_MISSING 拦下」 | 缺 L3：其他作用域可见/已卸载/后端 fail、bootstrap 失败保留席位返回 partial——需要真实成员与真实工具注册表。L1 半已用宿主真实形状（schema 对象数组）钉住：T15 之前替身按「名字为键的对象」建模，把错的契约保持成了绿色。 |
-| A09 | — | 已废止 | [acceptance-matrix.md](../specs/acceptance-matrix.md) 第 19 行（原文保留） | **2026-10-30 废止**：宿主不公开上限，插件自 T23/D41 起不再做容量规划，T25 又从规格删除 `capacity` / `reserved_*` / `recommended_members`。现行行为是照派、宿主拒绝即按原话返回 `CAPACITY_EXHAUSTED`；原判据「按各余额和预留限制，不以常数 8 替代；未知时不盲目 spawn」不再适用。本行保留废止前记录：曾为 L1/L3 `not-run`，L1 半由容量/适配器/派发用例覆盖，L3 只有两轮旁证。 |
+| A09 | — | 已废止 | [acceptance-matrix.md](../specs/acceptance-matrix.md) 第 19 行（原文保留） | **2026-10-30 废止**：宿主不公开上限，插件自 T23/D41 起不再做容量规划，T25 又从规格删除了 `capacity` / `reserved_*` / 建议成员数键。现行行为是照派、宿主拒绝即按原话返回 `CAPACITY_EXHAUSTED`；原判据「按各余额和预留限制，不以常数 8 替代；未知时不盲目 spawn」不再适用。本行保留废止前记录：曾为 L1/L3 `not-run`，L1 半由容量/适配器/派发用例覆盖，L3 只有两轮旁证。 |
 | A10 | L1/L3 | `pass` | L1 半：[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「契约 >64 KiB 仍能派发：消息 <65536 字节、契约完整、哈希与文件字节一致」「started_at 只认成员写下的 start.json，不从 delivered 推断」；[contract.test.mjs](../../packages/dsh-redteam-lead/test/contract.test.mjs)「成员 bootstrap prompt 只含角色、规则入口与「等待任务」，不含契约正文」；L3 半：[records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §4.3 | 真会话：`rt-triage` 是 `role=teammate`，`task-1` 是 `in_progress` 且 owner 正确；契约文件字节哈希 == `operation.data.contract_sha256` == 任务摘要里的值，身份四元组一致；`started_at` 为 `null`，该 attempt **零 RUN**，成员先核对契约 SHA 再写 `start.json`。**本轮契约是 5644 字节，不是 >64 KiB 场景**——那一半只由 L1 用例覆盖。 |
 | A11 | L1/L3 | `pass` | L1 半：[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「同岗成员忙碌 → MEMBER_BUSY，且零副作用」「同岗已有空闲成员时复用，不新建成员，交付同一份契约引用」；L3 半：[records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) §4.4 | 真会话：两次 `list_agents` **字节相同**（teammate 只有 `rt-triage`）；`task-1`→`task-2`，旧的 `completed` 且 owner 保留；新契约 5679 字节、sha `02bb9343…`（≠ 首份 `78fe3662…`）、`work_dir` 换新；忙碌重派 `MEMBER_BUSY` 且 `r2-s4-busy-diff.json` 0/0/0。 |
 | A12 | L1/L3 | `not-run` | L1 半：[dispatch.test.mjs](../../packages/dsh-redteam-lead/test/dispatch.test.mjs)「消息发送失败 → partial + DELIVERY_FAILED + 保留身份；重投只发同一份信封」 | 缺 L3：真实消息上限拒绝与同信封重投。 |
@@ -178,7 +180,7 @@
 |---|---|---|
 | 平台"挡住一切下一层创建"不成立：`workflow` 传 `parent` 但不传 `maxDepth`（D5） | 不声称平台挡住；以契约「你没有派发权」+ `TEAM_LEAD_REQUIRED` 补偿，并记为已知限制 | A03（L3 已实测：成员拿不到 Lead 授权、`subagent`/`subagent_fork` 被 depth 挡）/ A34（L3 未覆盖） |
 | 宿主没有受支持的容量余额只读查询（D1/D41） | 插件不做容量规划、不读任何容量声明、不预留席位；上限由宿主强制，被拒按原话返回 `CAPACITY_EXHAUSTED` | A09（2026-10-30 已废止） |
-| `$defs.rosterData.capacity` / `recommended_members`（D19/D41） | T25 已从规格删除这两个键；D19 与 D41 落地面表仅存历史 | 无（规格已无此形状） |
+| `$defs.rosterData.capacity` / 建议成员数键（D19/D41） | T25 已从规格删除这两个键；D19 与 D41 落地面表仅存历史 | 无（规格已无此形状） |
 | 两套阶段枚举不得混用（D24） | `FAILURE_PHASES` / `OPERATION_PHASES` 各自逐字 | A24 / A32 |
 | `re/env/tools.json` 没有生产者（D11） | 插件容忍缺失、报 unknown/gap，绝不自己生成 | A41 / A42 / A43 |
 | 版本漂移：安装目标 rc.3、checkout 0.2.2-alpha.2（D6/D13） | 基线取 rc.3；删两行同名冲突插件 | A02（L3 已实测：留下的是团队版参数面） |
@@ -198,7 +200,7 @@ L3 实测发现的检测盲区，而实现里**没有载体**。按"未实现就
 ## 记录在哪
 
 - **L3 执行方法**：[docs/verify/README.md](README.md)（前置五项、七步循环、失败怎么留证、卸载）。
-- **L3 清单**：[docs/verify/l3-checklist.md](l3-checklist.md)（七步 × 54 条断言）。
+- **L3 清单**：[docs/verify/l3-checklist.md](l3-checklist.md)（七步 × 55 条断言）。
 - **L3 记录模板**：[docs/verify/l3-record-template.md](l3-record-template.md)；填好的实例放 `docs/verify/records/`。
 - **已填好的记录**：
   - [records/20261029-session-040cb6df.md](records/20261029-session-040cb6df.md) — 第 2/3/4/5/6/6b/6c/7 步（本轮），
