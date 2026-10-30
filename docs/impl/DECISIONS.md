@@ -457,6 +457,10 @@ Lead 手里还有哪几件可独立推进的事，也没有"必须先做下一�
 
 用户（2026-10-30 裁决），由 Lead 立项为本票；实现方只落实口径，不再复议。
 
+> **已废止（T23 / D41，2026-10-30）**：下面这张五档优先级表、以及本节与之配套的观测文件、
+> 观测中标记、从宿主消息解析上限、烧/不烧分类 **全部删除**。D40 的**结论**（容量未知也照派、
+> 不主动探测）仍然有效，见 D41。原文按下划线保留，只作历史记录，**不再是实现口径**。
+
 ### 落地口径（后续改动请照这个，不要各写一套）
 
 | 项 | 取值 |
@@ -686,4 +690,69 @@ T19 遗留的 5 处（非焚烧类仍带 `phase: 'member_ready'`、台账 `membe
 要求点名 `reverse-project-management`，并**禁止**出现 skill 的操作原文（`INDEX.md`、`check --hashes`、`project.py`）。
 委托句里点话题名（"封存、验收归 skill"）是允许的，只禁抄命令。
 原中立性断言（不含「指挥」、不含「你是」）仍未放宽。
+
+## D41 — 容量子系统整体删除：不再预测宿主上限，只照派 + 转述宿主原话
+
+> 来源：用户裁决（2026-10-30）+ ticket [`tickets/T23-simplify-capacity.md`](tickets/T23-simplify-capacity.md)。
+> 实现：删除 `src/capacity-source.ts`；`src/capacity.ts` 只剩 `planPosts()`；
+> `src/team-adapter.ts` 的 `capacity()` → `usedSeats()`；`src/roster.ts` / `src/dispatch.ts` /
+> `src/index.ts` 同步收窄；用例：删除 `t18-*` / `t18b-*` / `t18c-*` / `t19-refusal-wording`，
+> 新增 `test/capacity-removed.test.mjs`（源码级删除断言）。
+
+### 结论：D40 的**判定**保留，**机器**删除
+
+- **保留**：容量未知**不拒绝**、**不主动探测**（不为了学上限而 spawn）。派发照派，宿主自己拒。
+- **保留**：`used` 仍然从宿主 `listMembers` 数（`role === 'teammate'`，含失败成员）。
+- **删除**：`re/team/capacity-observed.json` 与 `re/team/capacity-observing.json`、`parseHostCapacityLimit`、
+  `capacityRefusalBurned` 的烧/不烧分类、五档优先级（`call`/`project`/`profile`/`observed`/`unknown`）、
+  `re/team/capacity.json` 与 `profile config.capacity` 的读取、`reserved_member_slots`/`reserved_activations`。
+- D40 那张五档表已在原处标「已废止」，原文未改写（历史记录，不再是口径）。
+
+### 为什么（用户裁决的原始理由）
+
+官方 Agent Teams **自己都不做容量规划**，上限还是**刻意藏起来**的：
+`maxMembers` 是 `TeamService` 的构造函数参数（`config.maxMembers ?? DEFAULT_MAX_MEMBERS`），
+**没有任何 getter 或 state 投影**，唯一用途是抛 `Team member limit N reached`（`TEAM_MEMBER_LIMIT`）；
+`maxActiveSubagents` 在团队服务里**根本不存在**（activation 限制来自 subagent 层）。
+**读不到是设计，不是我们没找到 API。** 四张票（T18/T18b/T18c/T19）都在给「预测一个宿主明确不给的数」
+打补丁 —— 这本身就是过复杂的信号。所以整套推断机连同它的声明文件一起删掉。
+
+### 删除后的语义（一段话）
+
+> 名册报「已用几席」（来自 `listMembers`）与岗位状态；岗位能不能派只看**能力是否满足**（与操作者的
+> `max_posts`）。派发直接调 `spawnTeammate`；宿主拒绝就返回 `CAPACITY_EXHAUSTED` + **宿主原话逐字**，
+> 不猜上限、不声称"烧掉/损失了什么"。
+
+### 落地面（读代码的人按这个，不要各写一套）
+
+| 项 | 取值 |
+|---|---|
+| 岗位状态 | `assigned` / `vacant`（能力缺口）/ `deferred`（**只**因 `max_posts` 用尽）/ `disabled` |
+| 缺口码 | `CAPABILITY_*`、`POST_DISABLED`、`CAPACITY_EXHAUSTED`（`max_posts`）。**不再有** `CAPACITY_UNKNOWN` / `CAPACITY_UNDECLARED` |
+| 已用席位 | `rt_roster` 的一条诊断 `TEAM_SEATS_USED`（数不到 → `TEAM_SEATS_UNKNOWN`）；`rt_dispatch` 拒绝时附在诊断里 |
+| 宿主拒绝 | `status=partial`、`code=CAPACITY_EXHAUSTED`、`data.phase=prepared`（成员身份未落台账）、诊断逐字含 `error.message` 与 `hostCode`；**不带** `data.member` |
+| `rosterData.capacity` | wire 必备的 4 个键恒为「未知 / 不预留」：`remaining_*: null`、`reserved_*: 0` |
+| `recommended_members` | 语义收窄为「本次提议需要**新建**成员的岗位数」（不再表示"预算内还能开几个"） |
+| bind 闸门 | 只在 `max_posts` 放不下时拒绝（`CAPACITY_EXHAUSTED`）；容量不再参与 |
+| 台账 | `capacity_source` / `capacity_max_*` / `capacity_diagnostics` 删；只留 `used_seats` 存证 |
+
+### 与 specs 的冲突（**未**改 `docs/specs/**`，由 Lead 处置）
+
+1. `docs/specs/rt-tools.schema.json` 仍声明 `rosterInput.capacity`、`dispatchInput.capacity`、
+   `rosterData.capacity`（4 个必备整数/null 字段）、`rosterData.recommended_members`。
+   `src/tool-schema.ts` 是它的**逐字副本**（有漂移用例），所以本票**没有删**这几个键：
+   - 入参 `capacity` / `reserved_*` 仍会被校验放行，但收到就回一条诊断 `CAPACITY_ARGUMENT_OBSOLETE`（不静默忽略）；
+   - 出参 `capacity` / `recommended_members` 照发（值见上表），否则 `$defs.rosterData` 过不了入口校验。
+2. `docs/specs/orchestration-contract.md` 第 20 行的 `rt_roster` 行仍写着 `max_posts=6；reserved_member_slots=1；
+   reserved_activations=2`；后两个已废止。
+3. 验收 A09（"未知时不盲目 spawn"）与 D40 起就是**有意偏离**，T23 之后偏离更大（连"撞一次就学"也删了）。
+   现状：未知照派、宿主拒绝即转述。要把它写回规格，需要 Lead 改 `acceptance-matrix.md` 与契约原文。
+
+### 代价（如实记录）
+
+- 删掉 4 个测试文件、改写 8 个；门禁用例数 603 → 569（净 -34）。
+- 被删掉的能力是"下一次派发不再重复撞同一堵墙"。现在每次撞墙都会真的调用一次 `spawnTeammate`；
+  宿主拒绝时**没有**任何本地记忆。这是用户明确接受的代价（"官方自己都不做容量规划"）。
+- 名字是否还能复用**不再由本插件判断**：拒绝之后名册里有没有那一行由宿主决定，
+  诊断只引导"先 `listMembers` 核对，再决定复用/换名"。D12 的"失败行占名"仍然有效，但只在**读名册之后**成立。
 

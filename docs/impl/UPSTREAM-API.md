@@ -96,31 +96,34 @@ matchCapabilities(needs, toolNames, inventory, bindings) -> { matched, missing, 
 - 族名/插件 ID/子串/前缀**永不**算命中；区分大小写；`all_capabilities` 必须全满足。
 - provider 记录要求 9 字段齐备、`snapshot_sha256` 64-hex、inventory revision 与 transport_tools 对得上。
 
-### `src/capacity.mjs`
+### `src/capacity.mjs`（T23 后只剩岗位计划）
+
+> **T23 已删掉本节的容量部分**（见 [DECISIONS.md](DECISIONS.md) D41）：没有 `remainingMemberSlots` /
+> `remainingActivations` / `reserved*` / `reuseCandidates`，也没有 `capacity` / `recommended_members` 输出；
+> `deferred` 只剩「超出 `max_posts`」一个理由，`CAPACITY_UNKNOWN` 不再产生。下面是删除前的原文，
+> 保留作历史对照。
+
 ```js
-planBudget({ candidates, remainingMemberSlots, remainingActivations,
-             reuseCandidates, maxPosts, reservedMemberSlots, reservedActivations }) -> {
-  assigned, vacant, deferred, disabled, gaps, recommended_members, capacity
-}
+planPosts({ candidates, maxPosts }) -> { assigned, vacant, deferred, disabled, gaps }
 ```
 - 每个 post 条目恰好是 `$defs.post` 的 7 字段形状（`post_id,state,required,optional,anchors_required,member,reason`），**可直接塞进 `rosterData.posts`**。
 - `gaps[]` 恰好 `{code, reason, next_step}`，post id 嵌在 `reason` 里。
-- 候选可带 `id` 或 `post_id`；复用项 `{post_id|id, member, activation_increment}`。
-- 新成员岗位在任一余额为 null 时 → `deferred` + `CAPACITY_UNKNOWN`；复用岗位在 increment 是已验证整数且 activation 已知时仍可 assigned（不占席位）。
-- `recommended_members` = `member === null` 的 assigned 条数。
-- **`planBudget().capacity` 带 `known`/`available_*`，这是内部形状**：投进 `rosterData.capacity` 时只能保留 schema 的 4 个字段（`remaining_member_slots`/`remaining_activations`/`reserved_member_slots`/`reserved_activations`），未知用 `null`，**`known` 不得上线**（见 [DECISIONS.md](DECISIONS.md) D19）。
+- 候选可带 `id` 或 `post_id`。
+- 已运行岗位永远 `assigned` 且计入 `max_posts`；能力不满足 → `vacant`；`max_posts` 用尽 → `deferred`。
+- **没有余额输入，也没有余额投影**：宿主上限读不到，插件不猜（D41）。
 
 ## T4 适配器与替身
 
 ### `src/team-adapter.mjs`
 ```js
 createTeamAdapter({ ctx })            // 或 { services, exec, agent, config, projectRoot }
-readDeclaredCapacity(projectRoot)     // 读校验 re/team/capacity.json
+usedSeats()                           // → {ok, used: number|null}；T23 起没有 capacity()/readDeclaredCapacity
 CONTRACT_VERSION / ADAPTER_CONTRACT_VERSION = 1
 hasService()
 ```
 服务获取链：`services.agentTeams` → `ctx.get('agentTeams')`；缺席时全部方法 `TEAM_SERVICE_UNAVAILABLE`。
-返回的 `capacity()` 形状见 [SEAMS.md](SEAMS.md) §3；**`activations.remaining` 恒为 null**，上限已声明时 `total` 有值 —— 组装规则见 [DECISIONS.md](DECISIONS.md) **D25（必读）**。
+`usedSeats()` 的形状见 [SEAMS.md](SEAMS.md) §3：**只从 `listMembers()` 数 `role === 'teammate'`（含失败成员）**；
+T23 起适配器不读项目文件、不读 `config.capacity`，**没有上限读数**（[DECISIONS.md](DECISIONS.md) D41）。
 错误映射：`TEAM_LEAD_REQUIRED → ROLE_REQUIRED`；`TEAM_MEMBER_LIMIT / ACTIVATION_LIMIT_REACHED → CAPACITY_EXHAUSTED`（带 `hostCode`、`retryable:false`）；`TEAM_TASK_STALE_REVISION → REVISION_CONFLICT`（带 `actualRevision`）；`TEAM_TASK_*` 原样透传；未知宿主码 → `RECOVERY_REQUIRED` + `hostCode` + 原文。
 `task` 投影额外带 `ready`/`writeScopes`；`getTask` 对墓碑返回 `status:'deleted'`。
 `spawnTeammate` 接受 `{name, prompt}`，内部补 `description`（prompt 首行截 200）/`context:'fresh'`/`provider:'spawn'`/自建 `AbortSignal`，调用方可覆盖。
@@ -149,22 +152,23 @@ checkCompatibility(...)  // 与已存 binding 比对，不一致 → 需重新�
 ```js
 createFakeTeam(options)   // → { service, agent, agentFor(name), calls, callsFor(op), resetCalls, snapshot(),
                           //     faults{beforeHost,afterHost,dropResponse,clear,list}, failNextSpawn({code,message}),
-                          //     failMember(name), setActivations(n), capacityDeclaration }
+                          //     failMember(name), setActivations(n) }        // T23：不再有 capacityDeclaration
 createFakeProject({ projectRoot, responses:{check,impact,index,seal,probe,auditScope}, routes, runs, seals, ... })
                           // 对象本身即 adapter + calls / callsFor(cmd) / order() / queue(cmd, resp) / reset()
-makeCtx({ role, agentName, team?, teamOpts, project?, projectOpts, capacity, tools,
+makeCtx({ role, agentName, team?, teamOpts, project?, projectOpts, tools,
           depsOverrides, config, projectRoot, t, now })   // 直接可传给 handler
 makeTempProject({t, files}) / makeTempDir(t) / makeClock(start) / makeFakeTools({...}) / makeFs() / DEP_KEYS
 ```
 - `createFakeTeam` 的 `service` 是**宿主形状**，抛**宿主码**（`TEAM_LEAD_REQUIRED`/`TEAM_MEMBER_LIMIT`/`ACTIVATION_LIMIT_REACHED`…），端到端经真实适配器才变成契约码 —— 测契约码就要走 `makeCtx`。
 - `faults.beforeHost(op)` = 副作用前抛；`afterHost(op)` = 副作用后抛（模拟成功但响应丢失）；`dropResponse(op)` = 成功但返回丢失，`error.effectApplied=true`。
 - `makeCtx` 的 `deps` 已装 T1/T3 真实模块；`binding/contract/resources/submission/anchors/baseline` 仍为 `null`（由 T5/T6/T7 填）。
-- `capacity:{known:true,maxMembers,maxActiveSubagents,via:'project'|'config'}` 会落成 `re/team/capacity.json` 或 `ctx.config.capacity`；不传就 `known:false`。
+- **T23**：`makeCtx` 不再接受 `capacity` fixture，也不再写 `re/team/capacity.json` / `ctx.config.capacity`
+  —— 宿主没有容量来源可模拟（[DECISIONS.md](DECISIONS.md) D41）。要断言「已用几席」，用 `deps.teamAdapter.usedSeats()`。
 
-## 宿主容量拒绝消息（外部事实；T18b 起本包解析它们）
+## 宿主容量拒绝消息（外部事实；T23 起只转述，不解析）
 
-两条容量拒绝消息里**写着真实数字**。本包只读宿主抛给调用方的 `error.message`（被动观测：不读私有字段、
-也不为试探而 spawn，D1），并且**只**对这两个稳定码做匹配 —— 不把任意宿主消息拿去正则。
+两条容量拒绝消息里**写着真实数字**。**T23 起本包不再解析它们**（[DECISIONS.md](DECISIONS.md) D41）：
+原文逐字进诊断，数字不提取、不落盘。下面是宿主事实，供将来核对措辞变化。
 
 | 宿主码 | 消息原文 | 数字是什么 |
 |---|---|---|
@@ -185,13 +189,13 @@ makeTempProject({t, files}) / makeTempDir(t) / makeClock(start) / makeFakeTools(
 
 rc.3 安装构建与 checkout 对这两条顺序**一致**（`_agent-team.js:1024/1025/1032/1051` vs
 `roster.ts:257-260/264/276-296`），`ActivationPool.reserve()` 在 asar 里与 `activation.ts:24-35` 逐字相同
-（`throw` 在 `slots.add` **之前** → 失败的预留不占 activation 槽）。**这条事实决定的不只是观测值**：
-`src/dispatch.ts` 的 `capacityRefusalBurned()` 用同一个判断决定失败文案说「名字没被占用、可同名重试」
-还是「已烧掉、不得同名重试」（T18c，见 DECISIONS 的 D40 补记）。
+（`throw` 在 `slots.add` **之前** → 失败的预留不占 activation 槽）。**这条事实只在读名册时有用**：
+T23 删掉了按宿主码推断「烧没烧」的 `capacityRefusalBurned()`，拒绝之后名册里到底有没有那一行，
+由 `listMembers` 说了算。
 
-消费方：`src/capacity-source.ts` 的 `parseHostCapacityLimit()`（正则只认这两条码）。拿不到数字就回落为
-观测当时的已用席位数（T18 语义），并在诊断里说明「回落」—— 不抛、不猜。**宿主改措辞时**，先更新本表，
-再更新那两条正则与 `test/t18b-capacity-limit.test.mjs`。
+**T23 之后的消费方**：`src/dispatch.ts` 的 `hostRefusalReason()` / `hostRefusalDiagnostics()` 只做一件事 ——
+把 `error.message` **逐字**写进 `reason` 与诊断（外加 `hostCode` 与「当前已用 N 席」），
+不解析数字、不声称损坏。宿主改措辞时只要原话还完整，本包不需要改代码。
 
 ## 尚未交付（T5/T6/T7）
 `src/{roster,binding,dispatch,contract,resources,conclude,submission,anchors,baseline}.mjs` 与其测试。
