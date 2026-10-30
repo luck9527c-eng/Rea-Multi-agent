@@ -56,12 +56,11 @@
  * | `activations` | 0 | 已占用 activation 数 |
  * | `maxMessageBytes` | 65536 | 含 `Team message from <name>:` 前缀的 JSON 字节上限 |
  * | `maxTasks` | 256 | 未删除任务上限（`TEAM_TASK_LIMIT`） |
- * | `capacity` | `null` | **容量声明 fixture**，不是宿主 API；见下 |
  * | `clock` | `() => Date.now()` | 调用流水的时间戳 |
  *
- * `capacity` 只做 fixture 载体：真实宿主**没有任何**容量查询（DECISIONS D1）。`host.mjs`
- * 会把它落成 `re/team/capacity.json`（`via:'project'`）或 `ctx.config.capacity`
- * （`via:'config'`）；`{known:false}` 或不传表示“没有显式声明”。
+ * 真实宿主**没有任何容量查询**（DECISIONS D1）：`maxMembers` 只是构造函数参数，`maxActiveSubagents`
+ * 在团队服务里根本不存在。所以替身也没有 `capacity()` 之类的读取口 —— 上限的唯一体现是
+ * `memberLimit` / `activationLimit` 触发的那两条宿主拒绝。
  */
 
 /** 宿主错误码（与 E2 笔记的 27 个 `TEAM_*` 码 + `ACTIVATION_LIMIT_REACHED` 同名）。 */
@@ -760,7 +759,6 @@ export function createFakeTeam(options = {}) {
     },
     agent: caller,
     teamId,
-    capacityDeclaration: options.capacity ?? null,
     calls,
     callsFor(op) {
       return calls.filter((call) => call.op === op);

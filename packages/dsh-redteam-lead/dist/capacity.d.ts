@@ -1,63 +1,40 @@
 /** 岗位在计划里的去向（`$defs.post.state` 的子集）。 */
-export type BudgetPostState = 'assigned' | 'vacant' | 'deferred' | 'disabled';
-/** 一条预算缺口（`$defs.diagnostic` 的三字段）。 */
-export interface BudgetGap {
+export type PostPlanState = 'assigned' | 'vacant' | 'deferred' | 'disabled';
+/** 一条缺口（`$defs.diagnostic` 的三字段）。 */
+export interface PostPlanGap {
     code: string;
     reason: string;
     next_step: string;
 }
 /** `assigned/vacant/deferred/disabled` 里的一项（`$defs.post` 的 7 字段形状）。 */
-export interface BudgetPostEntry {
+export interface PostPlanEntry {
     post_id: string | null;
-    state: BudgetPostState;
+    state: PostPlanState;
     required: string[];
     optional: string[];
     anchors_required: string[];
     member: string | null;
     reason: string;
 }
-/** 内部形状：投进 `rosterData.capacity` 前只能保留 schema 的 4 个字段（D19）。 */
-export interface BudgetCapacity {
-    known: boolean;
-    member_slots_known: boolean;
-    activations_known: boolean;
-    remaining_member_slots: number | null;
-    remaining_activations: number | null;
-    reserved_member_slots: number;
-    reserved_activations: number;
-    available_member_slots: number | null;
-    available_activations: number | null;
+/** `planPosts()` 的返回。 */
+export interface PostPlan {
+    assigned: PostPlanEntry[];
+    vacant: PostPlanEntry[];
+    deferred: PostPlanEntry[];
+    disabled: PostPlanEntry[];
+    gaps: PostPlanGap[];
 }
-/** `planBudget()` 的返回。 */
-export interface BudgetPlan {
-    assigned: BudgetPostEntry[];
-    vacant: BudgetPostEntry[];
-    deferred: BudgetPostEntry[];
-    disabled: BudgetPostEntry[];
-    gaps: BudgetGap[];
-    recommended_members: number;
-    capacity: BudgetCapacity;
-}
-/**
- * `planBudget()` 的入参。
- *
- * 余额/上限一律按「调用方给什么就收什么」声明：`null`=未知，非法值按缺省处理
- * （裁剪前会再过一遍 `toNonNegativeInt`），所以这里写 `unknown` 而不是假装一定是 number。
- */
-export interface PlanBudgetInput {
+/** `planPosts()` 的入参：候选岗位 + 操作者的岗位数上限。 */
+export interface PlanPostsInput {
     /** 候选岗位（可含 enabled/running/member/capability）。 */
     candidates?: unknown;
-    /** 宿主报告的剩余成员席位；null=未知。 */
-    remainingMemberSlots?: unknown;
-    /** 宿主报告的剩余 activation；null=未知。 */
-    remainingActivations?: unknown;
-    /** 复用项：`{post_id|id, member, activation_increment}`。 */
-    reuseCandidates?: unknown;
     maxPosts?: unknown;
-    reservedMemberSlots?: unknown;
-    reservedActivations?: unknown;
 }
 /**
- * 生成预算内的岗位计划。
+ * 把候选岗位归类成计划。
+ *
+ * 只有三种理由会让岗位「不能立刻派」：岗位被禁用（disabled）、能力不满足（vacant）、
+ * 超出操作者的 `max_posts`（deferred）。**没有**任何「剩余席位不足」这一类 —— 那件事宿主不说，
+ * 我们也不猜。
  */
-export declare function planBudget({ candidates, remainingMemberSlots, remainingActivations, reuseCandidates, maxPosts, reservedMemberSlots, reservedActivations, }?: PlanBudgetInput): BudgetPlan;
+export declare function planPosts({ candidates, maxPosts }?: PlanPostsInput): PostPlan;

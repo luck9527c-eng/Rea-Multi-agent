@@ -75,7 +75,7 @@ interface CreateDepsOptions {
  *   exec/services/config 与 `projectRoot` 绑进去（不跨调用复用）。
  *
  * `projectRoot` 必须由调用方（`invokeTool`）先解析入参、`normalizeProjectRoot` 之后再传进来：
- * 适配器只有在拿到真实根时才能读 `re/routes/**`、`re/team/capacity.json`。传 `undefined`
+ * 项目适配器只有在拿到真实根时才能读 `re/routes/**`。传 `undefined`
  * 表示本次没有可用根（入参非法），适配器仍会装配但不绑定 —— 由 handler 返回可读错误。
  *
  * @param {{ services: object, exec: unknown, config: object, ctx?: unknown,

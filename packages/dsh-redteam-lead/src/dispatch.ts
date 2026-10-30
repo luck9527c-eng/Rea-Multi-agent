@@ -7,7 +7,8 @@
  *    `target_ids` 必须是该路线目标集合的非空子集，额外目标要先建新路线。
  * 2. 有效 `validated` 依赖、条件版本、open 争议、恢复待办逐项核查。
  * 3. 能力 = 岗位 `required` ∪ 任务 `capability_needs`（只追加）；缺通道/入口 → `CAPABILITY_MISSING`。
- * 4. 预算（D25 组装口径）+ `MEMBER_BUSY` + `DEPENDENCY_BLOCKED`。
+ * 4. 成员占用（`MEMBER_BUSY`）+ `DEPENDENCY_BLOCKED`。**不做容量规划**（T23 / D41）：
+ *    宿主的上限读不到，派发直接调 `spawnTeammate`；宿主拒绝时按它的原话报 `CAPACITY_EXHAUSTED`。
  * 5. 资源在锁内检查/租用；别名归一、默认独占、`quarantined` 不再分配。
  *
  * 前置任一不过 → `status=blocked` **且零副作用**（不建成员、不建任务、不写 `re/team/`）。
@@ -25,8 +26,6 @@ import { join } from 'node:path'
 import { ContractError, isErrorCode } from './errors.js'
 import { toolNamesFromSchemas } from './capability.js'
 import * as bindingModule from './binding.js'
-import * as capacitySource from './capacity-source.js'
-import type { CallCapacity, CapacitySource, EffectiveCapacity } from './capacity-source.js'
 import { isRecord, recordOf, thrownCode, thrownMessage } from './guards.js'
 import * as pathsModule from './paths.js'
 import * as resourceDefaults from './resources.js'
@@ -83,8 +82,6 @@ type AtomicModule = typeof import('./atomic.js')
 type ResourcesModule = typeof import('./resources.js')
 /** `deps.contract` 的形状。 */
 type ContractModule = typeof import('./contract.js')
-/** `deps.capacity` 的形状。 */
-type CapacityModule = typeof import('./capacity.js')
 /** 项目适配器实例（`deps.projectAdapter` 可为 `null`，调用方先判空）。 */
 type ProjectAdapterLike = NonNullable<Deps['projectAdapter']>
 /** 团队适配器实例（`deps.teamAdapter` 可为 `null`，调用方先判空）。 */
@@ -125,13 +122,14 @@ interface DispatchRequest {
   delivery_timeout_ms: number
   retry_of: Record<string, unknown> | null
   /**
-   * T18：本次调用声明的容量（优先级最高）。
+   * 已废止的容量入参（T23）：wire schema 仍声明 `capacity`（`docs/specs` 由 Lead 维护），
+   * 校验会放行。这里只记下「传了」，用于回一条 `CAPACITY_ARGUMENT_OBSOLETE`。
    *
    * **可选**而不是 `null` 占位：`operationInputHash()` 会对整个请求对象求哈希，
    * 未声明时也不能凭空多出一个键 —— 否则升级前登记的 operation 在恢复时会被判
    * `OPERATION_CONFLICT`（输入哈希变了，但输入其实没变）。
    */
-  capacity?: CallCapacity | null
+  obsolete_capacity?: true
 }
 
 /** `normalizeDispatchInput` 的结果：形状错误时 `value` 为空对象（调用方不会读它）。 */
@@ -173,33 +171,6 @@ interface CapabilityMatchResult extends CapabilityMatchView {
   missing: readonly { code: unknown; capability: unknown; reason: unknown; next_step: string }[]
 }
 
-/** 预算分配结果（`capacity.planBudget` 的产物里本模块用到的两个数组）。 */
-interface BudgetPlan {
-  assigned: readonly { post_id: unknown }[]
-  gaps: readonly { code?: string; reason?: string; next_step?: string }[]
-}
-
-/** `capacity.planBudget` 的入参：本模块实际传的七个键。 */
-interface PlanBudgetInput {
-  candidates: readonly Record<string, unknown>[]
-  remainingMemberSlots: unknown
-  remainingActivations: unknown
-  reuseCandidates: readonly Record<string, unknown>[]
-  maxPosts: number
-  reservedMemberSlots: number
-  reservedActivations: number
-}
-
-/**
- * 取 `capacity.planBudget` 的调用视图。
- *
- * `capacity.PlanBudgetInput` 把每个字段都声明成可选 `unknown`，本模块的七个键逐字可赋值给它，
- * 所以这里**不需要断言**：直接取函数引用即可（运行期拿到的还是同一个函数）。
- */
-function planBudgetOf(module: CapacityModule): (input: PlanBudgetInput) => BudgetPlan {
-  return module.planBudget
-}
-
 /** `resources.normalizeResourceNeeds` 的 issues 形状（三字段诊断）。 */
 interface ResourceIssue {
   code: string
@@ -214,7 +185,7 @@ interface FailureOptions {
   phase?: unknown
   extra?: Record<string, unknown>
   resolvedCode?: string
-  /** 覆盖默认的单条诊断（T18 的容量碰撞要一次说清成员名、hostCode 与观测值落点）。 */
+  /** 覆盖默认的单条诊断（宿主拒绝创建时要一次说清 hostCode、宿主原话与已用席位）。 */
   diagnostics?: readonly Diagnostic[]
 }
 
@@ -224,18 +195,11 @@ interface PreflightPlan {
   post: CatalogPost
   requirements: MergedRequirements
   match: CapabilityMatchView
-  capacity: unknown
-  budget: unknown
   memberDecision: MemberChoice
   resourcePlan: unknown
   baseline: unknown
   routeTargets: string[]
-  gaps: unknown[]
   callerName: string
-  /** T18：生效容量的来源、上限与诊断（unknown 会照派，但必须把风险说清楚）。 */
-  capacitySource: CapacitySource
-  capacityLimits: { max_members: number | null; max_active_subagents: number | null }
-  capacityDiagnostics: Diagnostic[]
   /** 门 1 探测到的兼容性摘要：契约必须冻结它（收口侧的规则漂移守卫靠它）。 */
   digests: ContractDigests
 }
@@ -282,8 +246,6 @@ interface PreflightParams {
   callerName: string
   projectAdapter: ProjectAdapterLike
   teamAdapter: TeamAdapterLike
-  /** T18：本会话身份（观测值按会话生效；`null` = 拿不到，观测值一律不套用）。 */
-  capacitySessionId: string | null
 }
 
 /** `runLocked` 的入参。 */
@@ -315,8 +277,6 @@ interface RunLockedParams {
   projectAdapter: ProjectAdapterLike
   teamAdapter: TeamAdapterLike
   onPersisted: () => void
-  /** T18：本会话身份（写观测值/判「观测中」标记时用；与 preflight 同一口径）。 */
-  capacitySessionId: string | null
 }
 
 /** `resolveRetry` 的入参。 */
@@ -461,11 +421,9 @@ export function normalizeDispatchInput(raw: unknown): NormalizedDispatch {
       }
     }
   }
-  // T18：按调用声明的容量（可选）。形状不合法是调用方错误，静默忽略会把「我声明了上限」变成谎话。
-  const callCapacity = capacitySource.parseCallCapacity(raw.capacity)
-  if (callCapacity.issue !== null) {
-    push(callCapacity.issue, '按 $defs.dispatchInput.capacity 传 {max_members, max_active_subagents}（都必须是 >=1 的整数）')
-  }
+  // T23：容量子系统已删除，但 wire schema 仍声明 `capacity`（`docs/specs` 由 Lead 维护），
+  // 校验会放行。传了就记一笔并在信封里说清「收到了但没用」，不静默忽略。
+  const capacityGiven = raw.capacity !== undefined
 
   if (issues.length > 0) return { ok: false, value: {}, issues, operationId }
 
@@ -491,7 +449,7 @@ export function normalizeDispatchInput(raw: unknown): NormalizedDispatch {
       delivery_timeout_ms: typeof raw.delivery_timeout_ms === 'number' ? raw.delivery_timeout_ms : 60000,
       retry_of: retryOf === null ? null : { ...recordOf(retryOf) },
       // 没声明就不写这个键：输入哈希与升级前逐字一致（恢复旧 operation 不会被判冲突）。
-      ...(callCapacity.value === null ? {} : { capacity: callCapacity.value }),
+      ...(capacityGiven ? { obsolete_capacity: true as const } : {}),
     },
   }
 }
@@ -1022,10 +980,6 @@ export async function handleDispatch(ctx: HandlerCtx, input: unknown): Promise<H
     const projectAdapter = deps.projectAdapter
     const teamAdapter = deps.teamAdapter
     const callerName = caller.name ?? 'lead'
-    // T18：容量观测值按会话生效（席位随会话重置），所以这一次调用只认本会话的身份。
-    // 与下面锁用的 `sessionId`（binding 里的会话或占位串 `session-unbound`）分开：
-    // 占位串不是真实会话 id，绝不能拿它去匹配观测值。
-    const capacitySessionId = sessionIdOf(deps, caller.root, ctx)
 
     if (!projectAdapter) {
       return {
@@ -1121,7 +1075,7 @@ export async function handleDispatch(ctx: HandlerCtx, input: unknown): Promise<H
     if (existing === null) {
       const pre = await preflight({
         ctx, deps, envelope, request, root, dispatchId, attemptId, excludeTaskIds,
-        resourcesMod, contractMod, callerName, projectAdapter, teamAdapter, capacitySessionId,
+        resourcesMod, contractMod, callerName, projectAdapter, teamAdapter,
       })
       if (!pre.ok) return { envelope: pre.envelope }
       plan = pre.plan
@@ -1157,7 +1111,7 @@ export async function handleDispatch(ctx: HandlerCtx, input: unknown): Promise<H
         ctx, deps, envelope, request, root, operationId, inputHash, ledger,
         dispatchId, attemptId, attemptIndex, contractRef, workDir, runIdReservation,
         retry, excludeTaskIds, plan, bindingSnap, callerName, existing,
-        resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter, capacitySessionId,
+        resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter,
         onPersisted: () => { persisted = true },
       })
       return { envelope: run }
@@ -1176,27 +1130,6 @@ export async function handleDispatch(ctx: HandlerCtx, input: unknown): Promise<H
       }),
     }
   }
-}
-
-/**
- * 本会话身份（T18）：`TeamId` = 团队根 Session id = Lead 会话 id，席位随会话重置。
- *
- * 与 `rt_roster` 同一条推导（`binding.sessionIdentityFrom`），只读可信执行上下文
- * （`identity.root` + `exec`/`config` 的显式会话字段）。拿不到就是 `null`：
- * 那时任何观测值都**不得**套用，也无法把新观测值归到某个会话上。
- */
-function sessionIdOf(deps: Partial<Deps>, callerRoot: string | null, ctx: HandlerCtx): string | null {
-  const injected = recordOf(deps.binding)
-  const derive = typeof injected.sessionIdentityFrom === 'function'
-    ? injected.sessionIdentityFrom
-    : bindingModule.sessionIdentityFrom
-  const derived: unknown = derive({
-    identity: { role: 'lead', name: null, root: callerRoot },
-    exec: recordOf(ctx).exec,
-    config: recordOf(ctx).config,
-  })
-  const value = recordOf(derived).session_id
-  return nonEmpty(value) ? value : null
 }
 
 /** 从台账 `data` 里挑出已知身份（缺席的键不写）。 */
@@ -1596,7 +1529,6 @@ async function preflight({
   callerName,
   projectAdapter,
   teamAdapter,
-  capacitySessionId,
 }: PreflightParams): Promise<PreflightResult> {
   const def = (code: string, reason: string, nextStep: string): { code: string; reason: string; nextStep: string } => ({ code, reason, nextStep })
 
@@ -1765,18 +1697,11 @@ async function preflight({
     }
   }
 
-  // (4) 预算 / 成员 / 依赖任务
-  const capacity = recordOf(await teamAdapter.capacity())
-  if (capacity.ok !== true) {
-    return {
-      envelope: blockedEnvelope(envelope, {
-        code: stableCode(capacity.code ?? 'TEAM_SERVICE_UNAVAILABLE'),
-        operationId: request.operation_id,
-        reason: `拿不到容量信息：${capacity.reason ?? 'teamAdapter.capacity() 失败'}`,
-        nextStep: '先修好团队服务/身份；不要靠 spawn 试探余额（会烧名字与席位）',
-      }),
-    }
-  }
+  // (4) 成员 / 依赖任务
+  //
+  // T23 / D41：这里**没有**容量预算。宿主的席位与 activation 上限读不到（`maxMembers` 是
+  // TeamService 的构造参数，没有 getter），也不该猜：派发直接调 `spawnTeammate`，宿主拒绝时
+  // 按它的原话报 `CAPACITY_EXHAUSTED`。名册照读，只用于决定复用谁 / 新名字。
   // `listMembers` 的形参是「可选 agent」：显式传 `undefined` 与不传等价（适配器内部再回落）。
   const members = recordOf(await teamAdapter.listMembers(undefined))
   if (members.ok !== true) {
@@ -1816,85 +1741,6 @@ async function preflight({
         operationId: request.operation_id,
         reason: `岗位 ${post.id} 的成员 ${memberDecision.members.join(', ')} 都有未收口任务（同一成员最多一个）`,
         nextStep: '先等该成员的任务收口（rt_conclude）或改派；v0 不排队、不抢占',
-      }),
-    }
-  }
-
-  // (4b) T18：生效容量 = 按调用 > 项目 > profile > 本会话观测 > unknown。
-  // 适配器（D1）只回答「有没有声明」；这里再叠加「本次调用」与「本会话观测」。
-  const observedRead = await capacitySource.readObservedCapacity(root, capacitySessionId)
-  const effective: EffectiveCapacity = capacitySource.resolveCapacity({
-    call: request.capacity ?? null,
-    declared: capacity,
-    observed: observedRead,
-  })
-  const capacityUnknown = effective.source === 'unknown'
-  const capacityDiagnostics = capacityGapsToDiagnostics(effective.gaps)
-  if (capacityUnknown) {
-    // 并发保护（T18 §3）：无已知容量 + 已有「观测中」标记 → 明确拒绝，而不是一起冲。
-    const guard = capacitySource.capacityMarkerGuard(await capacitySource.readObservationMarker(root), capacitySessionId)
-    if (guard.blocked) {
-      return {
-        envelope: blockedEnvelope(envelope, {
-          code: 'CAPACITY_UNKNOWN',
-          operationId: request.operation_id,
-          reason: guard.reason ?? '容量仍在观测中：拒绝再撞一次',
-          nextStep: guard.next_step ?? '等这次观测结束再派发',
-        }),
-      }
-    }
-    if (guard.reason !== null) {
-      // 标记属于别的会话：不挡，但要如实报告（不能静默丢一条事实）。
-      capacityDiagnostics.push(envelope.diagnostic(
-        'CAPACITY_OBSERVING_OTHER_SESSION',
-        guard.reason,
-        guard.next_step ?? '确认旧会话的那次派发已结束即可',
-      ))
-    }
-    // 容量未声明**不再拒绝**：照派，但必须把「不保证有位置、最多损失一个名字与席位」说清楚。
-    capacityDiagnostics.push(undeclaredCapacityWarning(
-      effective.memberSlots.used,
-      observedRead.gap?.detail ?? null,
-    ))
-  }
-
-  const planBudget = planBudgetOf(deps.capacity)
-  // 容量未知时**不做预算裁剪**：没有上限就没有可裁剪的对象，猜一个数才是 D1 明令禁止的事。
-  const budget: BudgetPlan = capacityUnknown ? { assigned: [{ post_id: post.id }], gaps: [] } : planBudget({
-    candidates: [{
-      post_id: post.id,
-      priority: post.priority,
-      required: post.required,
-      optional: post.optional,
-      anchors_required: post.anchors_required,
-      // `disabled` 已在上面早返回里拒绝过；`planBudget` 只按 `enabled === false` 判禁用，
-      // 所以原值透传与原来的 `!== false` 分类一致（`undefined` 仍是「已启用」）。
-      enabled: post.enabled,
-      capability: { satisfied: true, missing: [] },
-    }],
-    remainingMemberSlots: effective.memberSlots.remaining,
-    remainingActivations: effective.activations.known === true ? effective.activations.total : null,
-    reuseCandidates: memberDecision.action === 'reuse'
-      ? [{ post_id: post.id, member: memberDecision.member, activation_increment: 1 }]
-      : [],
-    maxPosts: 1,
-    reservedMemberSlots: 0,
-    reservedActivations: 0,
-  })
-  const planned = capacityUnknown
-    ? { post_id: post.id }
-    : budget.assigned.find((entry) => entry.post_id === post.id)
-  if (!planned) {
-    // 与迁移前的 `['CAPACITY_UNKNOWN','CAPACITY_EXHAUSTED'].includes(entry.code)` 等价。
-    const gap = budget.gaps.find((entry) => entry.code === 'CAPACITY_UNKNOWN' || entry.code === 'CAPACITY_EXHAUSTED')
-      ?? budget.gaps[0]
-    const code = gap?.code === 'CAPACITY_EXHAUSTED' ? 'CAPACITY_EXHAUSTED' : 'CAPACITY_UNKNOWN'
-    return {
-      envelope: blockedEnvelope(envelope, {
-        code,
-        operationId: request.operation_id,
-        reason: gap?.reason ?? `岗位 ${post.id} 不在当前预算内`,
-        nextStep: gap?.next_step ?? '在 re/team/capacity.json 声明容量，或释放已有成员/activation 后重试',
       }),
     }
   }
@@ -2073,421 +1919,58 @@ async function preflight({
       post,
       requirements,
       match,
-      capacity,
-      budget,
       memberDecision,
       resourcePlan,
       baseline: capture,
       routeTargets,
-      gaps: [...budget.gaps, ...effective.gaps],
       callerName,
-      capacitySource: effective.source,
-      capacityLimits: {
-        max_members: effective.memberSlots.total,
-        max_active_subagents: effective.activations.total,
-      },
-      capacityDiagnostics,
       digests: frozen.digests,
     },
   }
 }
 
-/** 容量缺口（`{code, detail, nextStep}`）→ 契约诊断（三字段）。 */
-function capacityGapsToDiagnostics(value: unknown): Diagnostic[] {
-  const rows = Array.isArray(value) ? value : []
-  return rows.map((raw) => {
-    const gap = recordOf(raw)
-    return {
-      code: nonEmpty(gap.code) ? gap.code : 'CAPACITY_UNKNOWN',
-      reason: nonEmpty(gap.detail) ? gap.detail : '容量声明或计数不可用',
-      next_step: nonEmpty(gap.nextStep)
-        ? gap.nextStep
-        : '在 re/team/capacity.json 声明 maxMembers/maxActiveSubagents 后重试',
-    }
-  })
-}
-
 /**
- * 未声明容量时的风险警告（T18 §3 逐条要求）：
- * 明说「容量未声明」「本次创建不保证有位置」「最多可能损失一个成员名与席位」。
+ * 宿主因容量拒绝创建成员时的回执与诊断（T23 / D41）。
  *
- * 这不是提示音，是**知情同意**：一次失败 spawn **可能**永久烧掉名字与席位（activation 池满会；
- * 成员席位满发生在写成员行之前，不会 —— T18c），而宿主没有受支持的余额查询；Leader 选择照派，
- * 就必须看到这个代价。
+ * 三条规矩：
+ *
+ * 1. **逐字带回宿主原话**：`reason` 里原样嵌入适配器保留的 `error.message`，不翻译、不概括。
+ * 2. **不猜上限**：不解析消息里的数字，也不写任何「上限是多少」的结论。
+ * 3. **不声称损坏**：被拒绝之后名册里到底有没有这个名字，由读名册的人自己看；
+ *    本插件不说「已烧掉」也不说「没烧掉」—— 宿主在写成员行之前还是之后拒绝，我们不再假装知道。
  */
-function undeclaredCapacityWarning(usedSeats: number | null, observedGap: string | null): Diagnostic {
-  const used = usedSeats === null ? '数不到已用席位' : `当前已用席位 ${usedSeats}`
-  const extra = observedGap === null ? '' : `（${observedGap}）`
-  return {
-    code: 'CAPACITY_UNDECLARED',
-    reason:
-      '容量未声明（capacity_source=unknown）：re/team/capacity.json 与 profile config.capacity 都没有声明，'
-      + `本会话也还没有观测值，${used}${extra}。本次派发照派，但**不保证**有位置：`
-      + '宿主若因上限拒绝创建，最多可能损失一个成员名与一个席位：activation 池满会烧掉名字，'
-      + '成员席位满发生在写成员行之前（名字还在，可以同名重试，T18c）',
-    next_step:
-      '要么在 re/team/capacity.json（或本次调用传 capacity）声明 maxMembers/maxActiveSubagents，'
-      + '要么接受这一次学费；命中宿主上限后会把观察到的上限写进 re/team/capacity-observed.json，'
-      + '后续派发按它算。不要为了试探余额而派发（那是主动探测，不是被动观测）',
-  }
-}
-
-// ---------------------------------------------------------------------------
-// T18：锁内的容量闸门与「撞一次就学」
-// ---------------------------------------------------------------------------
-
-/** 台账里的 `capacity_source` 归一（不认识的键按 unknown，绝不猜来源）。 */
-function storedCapacitySource(value: unknown): CapacitySource {
-  return value === 'call' || value === 'project' || value === 'profile' || value === 'observed' ? value : 'unknown'
-}
-
-/** 当前已用席位（含失败成员；`listMembers` 失败时 `null`，绝不猜）。 */
-async function usedSeatsNow(teamAdapter: TeamAdapterLike): Promise<number | null> {
-  const listed = recordOf(await teamAdapter.listMembers(undefined))
-  if (listed.ok !== true) return null
-  return recordRows(listed.members).filter((row) => row.role === 'teammate').length
-}
-
-/** 闸门状态：本次是否写了「观测中」标记（决定 finally 里要不要删），以及写标记的失败原因。 */
-interface CapacityGateState {
-  source: CapacitySource
-  markerWritten: boolean
-  note: string | null
-}
-
-/** 闸门结论：拒绝时就地给出三字段（调用方只负责装信封）。 */
-interface CapacityGateResult {
-  refusal: { code: string; reason: string; nextStep: string } | null
-  state: CapacityGateState
-}
-
-/** `openCapacityGate()` 的入参。 */
-interface CapacityGateInput {
-  root: string
-  sessionId: string | null
-  teamAdapter: TeamAdapterLike
-  /** 台账里记下的生效来源（preflight 写、恢复时读回来）。 */
-  capacitySource: unknown
-  member: string
-  operationId: string
-  nowIso: string
-}
-
-/**
- * spawn 之前的容量闸门（锁内）。
- *
- * - 已知上限（call/project/profile/observed）→ 直接放行，不写标记（不改变既有行为）。
- * - 未知上限：先重读观测值（等锁期间别的派发可能已经学到了上限）；仍有「观测中」标记 →
- *   明确拒绝（并发保护）；都没有 → 写标记、放行，并在 spawn 结束后删除。
- */
-async function openCapacityGate({
-  root,
-  sessionId,
-  teamAdapter,
-  capacitySource: sourceValue,
-  member,
-  operationId,
-  nowIso,
-}: CapacityGateInput): Promise<CapacityGateResult> {
-  const source = storedCapacitySource(sourceValue)
-  if (source !== 'unknown') return { refusal: null, state: { source, markerWritten: false, note: null } }
-
-  const fresh = await capacitySource.readObservedCapacity(root, sessionId)
-  if (fresh.record !== null && fresh.applies) {
-    const used = await usedSeatsNow(teamAdapter)
-    if (used !== null) {
-      const remaining = Math.max(0, fresh.record.max_members - used)
-      if (remaining < 1) {
-        // 上限是**哪一类拒绝**教会的，决定「再派一次会不会烧」（T19）：席位满（`TEAM_MEMBER_LIMIT`）
-        // 在写成员行之前就拒绝，什么都没烧，说「避免再烧」是虚报；activation 池满与认不出的码
-        // 照旧保守说。判断只走 T18c 的 `capacityRefusalBurned()` 一处（D12 补正）。
-        const burned = capacityRefusalBurned(fresh.record.basis.host_code)
-        return {
-          refusal: {
-            code: 'CAPACITY_EXHAUSTED',
-            reason:
-              `本会话已观测到成员上限 maxMembers=${fresh.record.max_members}，当前已用 ${used} 席：到顶，`
-              + (burned
-                ? '不再创建成员（避免再烧一个名字与席位）'
-                : '宿主会在写成员行之前拒绝，名字与席位都不会被占用（同名重试仍然合法，T18c）'),
-            nextStep:
-              '复用已有成员或等一个成员释放；要放宽上限就在 re/team/capacity.json 显式声明（并在本次调用传 capacity）；'
-              + '不要靠再撞一次去试探余额',
-          },
-          state: { source: 'observed', markerWritten: false, note: null },
-        }
-      }
-      return { refusal: null, state: { source: 'observed', markerWritten: false, note: null } }
-    }
-  }
-
-  const guard = capacitySource.capacityMarkerGuard(await capacitySource.readObservationMarker(root), sessionId)
-  if (guard.blocked) {
-    return {
-      refusal: {
-        code: 'CAPACITY_UNKNOWN',
-        reason: guard.reason ?? '容量仍在观测中：拒绝再撞一次',
-        nextStep: guard.next_step ?? '等这次观测结束再派发',
-      },
-      state: { source, markerWritten: false, note: null },
-    }
-  }
-
-  try {
-    await capacitySource.writeObservationMarker(root, { sessionId, member, operationId, startedAt: nowIso })
-    return { refusal: null, state: { source, markerWritten: true, note: null } }
-  } catch (error) {
-    // 标记只是本地并发提示：写不了不改变「照派」的裁决，但必须把「这次没有第二道保护」记下来。
-    return {
-      refusal: null,
-      state: {
-        source,
-        markerWritten: false,
-        note: `写 ${capacitySource.OBSERVING_MARKER_PATH} 失败（${thrownMessage(error)}）：本次没有并发保护`,
-      },
-    }
-  }
-}
-
-/** 一次被动观测的结果。`ref === null` 表示没落盘，`error` 说明原因。 */
-interface CapacityObservationResult {
-  ref: string | null
-  used: number | null
-  error: string | null
-  /** 上限数字的来源：解析成功 / 回落 / 沿用已有解析值（没落盘时 `null`）。 */
-  origin: capacitySource.ObservationOrigin | null
-  /** 本次宿主消息里解析出的准确值（回落/沿用为 `null`）。 */
-  parsed_limit: number | null
-  max_members: number | null
-  max_active_subagents: number | null
-}
-
-/**
- * 被动观测：宿主因上限拒绝了一次**真实需要**的创建之后，把它写在消息里的上限记下来。
- *
- * T18b：宿主在两条拒绝消息里写着真实数字（`active child limit: N` / `Team member limit N reached`），
- * 解析到就写准确的 N —— 只有解析不到时才回落到 T18 的语义（观测当时的已用席位数，即「你已经到顶了」）。
- * 已经解析到准确值之后，一次不可解析的碰撞**不得**把它降级（`origin: 'retained'`，原样沿用）。
- */
-async function recordCapacityObservation(params: {
-  root: string
-  sessionId: string | null
-  teamAdapter: TeamAdapterLike
-  hostCode: string
-  /** 宿主原始文案（解析依据；适配器把它放在 `reason` 里）。 */
-  hostMessage: string | null
-  nowIso: string
-}): Promise<CapacityObservationResult> {
-  const unwritten = (
-    used: number | null,
-    error: string,
-    origin: capacitySource.ObservationOrigin | null = null,
-  ): CapacityObservationResult =>
-    ({ ref: null, used, error, origin, parsed_limit: null, max_members: null, max_active_subagents: null })
-
-  const used = await usedSeatsNow(params.teamAdapter)
-  if (used === null) return unwritten(null, 'listMembers 失败，数不到已用席位')
-  if (used < 1) return unwritten(used, `观测当时的已用席位是 ${used}，不能当作上限`)
-  const sessionId = params.sessionId
-  if (sessionId === null) return unwritten(used, '拿不到本会话身份，观测值无法归到会话（未落盘）')
-
-  // 同会话已有的观测值：决定「覆盖」还是「沿用」（解析失败时不许把准确值降级成推断值）。
-  const existing = await capacitySource.readObservedCapacity(params.root, sessionId)
-  const observation = capacitySource.observeCapacity({
-    sessionId,
-    observedAt: params.nowIso,
-    used,
-    hostCode: params.hostCode,
-    message: params.hostMessage,
-    existing: existing.applies ? existing.record : null,
-  })
-  const settled: CapacityObservationResult = {
-    ref: capacitySource.OBSERVED_CAPACITY_PATH,
-    used,
-    error: null,
-    origin: observation.origin,
-    parsed_limit: observation.parsed_limit,
-    max_members: observation.record.max_members,
-    max_active_subagents: observation.record.max_active_subagents,
-  }
-  if (observation.origin === 'retained') {
-    // 没有新的准确值也没有新信息：不重写文件（重写就等于用一次失败的解析换掉 observed_at 与原文）。
-    return settled
-  }
-  try {
-    const ref = await capacitySource.writeObservedCapacity(params.root, observation.record)
-    return { ...settled, ref }
-  } catch (error) {
-    return { ...settled, ref: null, error: `写 ${capacitySource.OBSERVED_CAPACITY_PATH} 失败：${thrownMessage(error)}` }
-  }
-}
-
-/**
- * 解析出的那个数字落在哪个维度（两条宿主消息各只讲一件事）。
- *
- * 返回值一律**可以直接接在中文之后**：`activation` 是 Latin 开头，不补分隔就会粘成
- * 「解析出的activation」（T19 第 3 条修的就是这个 typo），所以这个维度自带一个分隔空格。
- */
-function parsedLimitDimension(hostCode: string | null): string {
-  if (hostCode === 'TEAM_MEMBER_LIMIT') return '成员席位数'
-  if (hostCode === 'ACTIVATION_LIMIT_REACHED') return ' activation 池大小'
-  return '上限'
-}
-
-/** 观测到的两个上限（`max_members`/`max_active_subagents`）。 */
-function observedLimitsText(observed: CapacityObservationResult): string {
-  return `max_members=${String(observed.max_members)}、max_active_subagents=${String(observed.max_active_subagents)}`
-}
-
-/**
- * 一次容量拒绝是否**已经**写下了成员行 —— 这决定名字与席位到底有没有被烧掉（T18c）。
- *
- * 宿主两条容量码的抛出时机不同（安装构建 `_agent-team.js:1021-1030`、checkout
- * `packages/experimental/agent-team/src/roster.ts:252-261`，见 UPSTREAM-API「宿主容量拒绝消息」）：
- *
- * - `TEAM_MEMBER_LIMIT` 在 `journal.appendAndFlush` **之前**抛 → 根本没有成员行，
- *   名字仍然空闲、席位没有消耗，容量解决后**同名重试是合法的**；
- * - `ACTIVATION_LIMIT_REACHED` 在成员行 append **之后**（`subagents.startActivation`）抛，
- *   catch 把该行 settle 成 `phase:'failed'` → 名字与席位都被烧掉，不得同名重试（D12）。
- *
- * 认不出的宿主码一律按「已烧掉」说：宁可保守，也不给一个可能失败的「同名重试没问题」的承诺。
- * 把这条判断收敛到一个函数里，是因为「已烧掉」这句话有两个出口（failure 文案与诊断），
- * 两处各写一遍就是 T18c 要修的那个缺陷。
- */
-function capacityRefusalBurned(hostCode: string | null): boolean {
-  return hostCode !== 'TEAM_MEMBER_LIMIT'
-}
-
-/** 名字与席位的损坏结论（两条码各一句；reason 与诊断共用，不许各写一套）。 */
-function refusalDamageClause(hostCode: string | null): string {
-  return capacityRefusalBurned(hostCode)
-    ? '该名字与席位已被烧掉，不得同名重试（D12）'
-    : '该名字没有被占用、也没有消耗席位 —— 宿主在写成员行之前就拒绝了'
-}
-
-/** 解析到成员上限时点名这个数字（只对 `TEAM_MEMBER_LIMIT` 有意义，其余码为空串）。 */
-function refusalLimitClause(hostCode: string | null, observed: CapacityObservationResult | null): string {
-  if (capacityRefusalBurned(hostCode)) return ''
-  const limit = observed?.parsed_limit ?? null
-  return limit === null ? '' : `（宿主报的成员上限 ${String(limit)} 席）`
-}
-
-/** 容量碰撞的 failure 文案：点名成员、宿主原始码、损坏语义、观测值落点（D21：细节写进文本）。 */
-function capacityFailureReason(
-  member: string,
-  hostCode: string | null,
-  spawnReason: unknown,
-  observed: CapacityObservationResult | null,
-): string {
-  const raw = nonEmpty(spawnReason) ? spawnReason : '宿主没有给原始文案'
+function hostRefusalReason(member: string, hostCode: string | null, hostMessage: string | null): string {
+  const raw = nonEmpty(hostMessage) ? hostMessage : '宿主没有给原始文案'
   const host = hostCode === null ? '' : `，hostCode=${hostCode}`
-  const head = `宿主因容量上限拒绝创建成员 ${member}（${raw}${host}）：`
-    + `${refusalDamageClause(hostCode)}${refusalLimitClause(hostCode, observed)}`
-  if (observed === null) return `${head}。本次没能观测到上限`
-  if (observed.ref === null) return `${head}。观测值没有落盘：${observed.error ?? '未知原因'}`
-  if (observed.origin === 'retained') {
-    return `${head}。已有观测值（${observed.ref}）里的准确上限仍然成立：${observedLimitsText(observed)}；`
-      + '这次消息里没有可解析的数字，因此不覆盖、不降级（observed_at 保持不变）'
-  }
-  if (observed.origin === 'parsed') {
-    return `${head}。已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}`
-      + `（其中 ${String(observed.parsed_limit)} 来自宿主消息里的${parsedLimitDimension(hostCode)}；`
-      + '消息没讲到的那个维度取观测当时已用席位的保守下限）'
-  }
-  return `${head}。已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}`
-    + '（回落：消息里没有可解析的数字，取失败那刻的已用席位数，失败成员已计入）'
+  return `宿主拒绝创建成员 ${member}（${raw}${host}）`
 }
 
-/** 容量碰撞的下一步：名字还在时允许同名重试（先解决容量），被烧掉时只允许换名字。 */
-function capacityFailureNextStep(
-  member: string,
-  hostCode: string | null,
-  observed: CapacityObservationResult | null,
-): string {
-  const unset = observed === null ? '本次不是容量碰撞' : (observed.error ?? '未知原因')
-  if (!capacityRefusalBurned(hostCode)) {
-    const base = '先解决容量（复用空闲成员、等一个成员释放，或在 re/team/capacity.json 放宽 maxMembers），'
-      + `再用同名 ${member} 重试 —— 这个名字没有被占用`
-    return observed !== null && observed.ref !== null
-      ? `${base}。后续派发按 ${observed.ref} 的 observed 上限算（剩余 0 时不会再创建）`
-      : `${base}。在 re/team/capacity.json 显式声明 maxMembers/maxActiveSubagents 后再派发（观测值未落盘：${unset}）`
-  }
-  const rename = `先核对成员名册确认 ${member} 是否已存在/失败；换名字重试（下一次派发会用 ${member}-2），不要用同名`
-  if (observed !== null && observed.ref !== null) {
-    return `${rename}。后续派发按 ${observed.ref} 的 observed 上限算（剩余 0 时不会再创建）；`
-      + '要放宽上限就在 re/team/capacity.json 显式声明（或本次调用传 capacity）'
-  }
-  const why = observed === null ? '本次不是容量碰撞' : (observed.error ?? '未知原因')
-  return `${rename}。在 re/team/capacity.json 显式声明 maxMembers/maxActiveSubagents 后再派发（观测值未落盘：${why}）`
+/** 拒绝之后的下一步：先核对名册，再决定复用/换名字；不承诺同名可用，也不宣布名字已废。 */
+function hostRefusalNextStep(member: string): string {
+  return `先按宿主原话处置，并用 listMembers 核对 ${member} 当前是否在名册里、状态是什么，`
+    + '再决定复用、换名字还是重试；本插件不猜上限，也不替你判断名字还能不能用'
 }
 
-/** 容量碰撞的两条诊断：一条说宿主拒绝（含损坏语义），一条说观测值去了哪里（含 `hostCode`）。 */
-function capacityFailureDiagnostics(
+/**
+ * 宿主拒绝的两条诊断：第一条给宿主码与原话（可逐字引用），第二条只补一个可数的事实
+ * （当前已用席位，来自 `listMembers`；数不到就说数不到）。
+ */
+function hostRefusalDiagnostics(
   code: string,
   member: string,
   hostCode: string | null,
-  observed: CapacityObservationResult | null,
+  hostMessage: string | null,
+  usedSeats: number | null,
 ): Diagnostic[] {
-  const host = hostCode === null ? code : hostCode
-  const out: Diagnostic[] = [{
+  const host = hostCode ?? code
+  const seats = usedSeats === null
+    ? '当前已用席位：数不到（listMembers 失败）'
+    : `当前已用席位：${usedSeats}（role=teammate 的成员数，含失败成员）`
+  return [{
     code,
-    reason: `宿主拒绝创建成员 ${member}（hostCode=${host}）：`
-      + `${refusalDamageClause(hostCode)}${refusalLimitClause(hostCode, observed)}`,
-    next_step: capacityRefusalBurned(hostCode)
-      ? '不要用同名重试（D12）；下一次派发会自动用下一个名字'
-      : `先解决容量（复用空闲成员、等一个成员释放，或放宽 maxMembers），再用同名 ${member} 重试`,
+    reason: `${hostRefusalReason(member, hostCode, hostMessage)}。${seats}`,
+    next_step: hostRefusalNextStep(member),
   }]
-  if (observed !== null && observed.ref !== null) {
-    if (observed.origin === 'parsed') {
-      out.push({
-        code: 'CAPACITY_OBSERVED',
-        reason:
-          `已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}。`
-          + `其中 ${String(observed.parsed_limit)} 是从宿主消息里解析出的${parsedLimitDimension(hostCode)}准确值`
-          + `（hostCode=${host}，原文留存在 basis.message），另一维取观测当时已用席位的保守下限`,
-        next_step:
-          '这是宿主自己写的数字，不是估算；但上限可能因为改设置而失效 —— 下一次再撞到会覆盖并更新 observed_at。'
-          + '要写死就在 re/team/capacity.json 声明；不要为了刷新它而故意再撞一次',
-      })
-    } else if (observed.origin === 'retained') {
-      out.push({
-        code: 'CAPACITY_OBSERVED',
-        reason:
-          `本次宿主消息里没有可解析的数字，沿用 ${observed.ref} 里已解析的准确上限：${observedLimitsText(observed)}`
-          + `（hostCode=${host}；不覆盖、不降级，observed_at 保持不变）`,
-        next_step: '准确值仍然成立，只是这一次没重新读到；若反复出现，核对 basis.message 与宿主是否改了措辞',
-      })
-    } else {
-      out.push({
-        code: 'CAPACITY_OBSERVED',
-        reason:
-          `已把观测到的上限写进 ${observed.ref}：${observedLimitsText(observed)}`
-          + `（回落：消息里没有可解析的数字，basis.parsed_limit=null，观测当时已用 ${String(observed.used)} 席，hostCode=${host}）`,
-        next_step:
-          '这是「你已经到顶了」的下限，不是宿主声明：要放宽就在 re/team/capacity.json 声明；不要靠再撞一次去试探',
-      })
-    }
-  } else {
-    out.push({
-      code: 'CAPACITY_OBSERVED_UNWRITTEN',
-      reason: `观测值没有落盘：${observed?.error ?? '本次不是容量碰撞'}`,
-      next_step: '先声明容量再派发；不要为了试探余额重复派发（D1）',
-    })
-  }
-  return out
-}
-
-/** 台账里存下的容量诊断（成功回执要原样交回；恢复路径也一样）。 */
-function capacityDiagnosticsFrom(data: Record<string, unknown>): Diagnostic[] {
-  const rows = Array.isArray(data.capacity_diagnostics) ? data.capacity_diagnostics : []
-  return rows.map((raw) => {
-    const entry = recordOf(raw)
-    return {
-      code: nonEmpty(entry.code) ? entry.code : 'CAPACITY_UNKNOWN',
-      reason: nonEmpty(entry.reason) ? entry.reason : '容量来源未记录',
-      next_step: nonEmpty(entry.next_step) ? entry.next_step : '在 re/team/capacity.json 声明容量后重试',
-    }
-  })
 }
 
 // ---------------------------------------------------------------------------
@@ -2499,7 +1982,7 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
     ctx, deps, envelope, request, root, operationId, inputHash, ledger,
     dispatchId, attemptId, attemptIndex, contractRef, workDir, runIdReservation,
     retry, excludeTaskIds, plan, bindingSnap, callerName, existing,
-    resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter, onPersisted, capacitySessionId,
+    resourcesMod, contractMod, atomic, paths, projectAdapter, teamAdapter, onPersisted,
   } = params
 
   const clock = deps.clock
@@ -2596,12 +2079,6 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
       binding: bindingSnap,
       retry_of: request.retry_of,
       retry_recovery_ref: retry?.recoveryRef ?? null,
-      // T18：出问题要能回答「当时它以为上限是多少」——来源与数字都进台账。
-      capacity_source: plan?.capacitySource ?? 'unknown',
-      capacity_max_members: plan?.capacityLimits?.max_members ?? null,
-      capacity_max_active_subagents: plan?.capacityLimits?.max_active_subagents ?? null,
-      capacity_session_id: capacitySessionId,
-      capacity_diagnostics: (plan?.capacityDiagnostics ?? []).map((entry) => ({ ...entry })),
     })
     onPersisted()
     const reloaded = await ledger.findById(operationId)
@@ -2855,98 +2332,48 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
           phase: 'prepared',
         })
       }
-      // T18：锁内复核容量（并发保护 + 观测值可能在本进程等锁期间落地）。
-      const gate = await openCapacityGate({
-        root,
-        sessionId: capacitySessionId,
-        teamAdapter,
-        capacitySource: data.capacity_source,
-        member: intentName,
-        operationId,
-        nowIso: now(),
-      })
-      if (gate.refusal !== null) {
-        return failure(gate.refusal.code, {
-          reason: gate.refusal.reason,
-          nextStep: gate.refusal.nextStep,
-          phase: 'prepared',
-        })
-      }
-      if (gate.state.note !== null) {
-        // 标记写失败不改变裁决，但必须留在台账里（否则「这次没有并发保护」就没人知道了）。
-        await advance(phase, { capacity_marker_note: gate.state.note })
-      }
       const prompt = contractMod.buildMemberPrompt({
         post: postForPrompt,
         rulesEntry: RULES_ENTRY,
         skillCopyPath: SKILL_COPY_ENTRY,
       })
-      try {
-        const spawned = recordOf(await teamAdapter.spawnTeammate({
-          name: intentName,
-          prompt,
-          description: `rt_dispatch ${postForPrompt.id} ${request.route_id}`,
-        }))
-        // 成功分支带成员视图（可能是 `null`：适配器把非对象投影成 null）。
-        const spawnedMember = recordOf(spawned.member)
-        if (spawned.ok === true) {
-          member = { name: spawnedMember.name ?? intent.name, id: spawnedMember.id ?? null, mode: 'spawn' }
+      const spawned = recordOf(await teamAdapter.spawnTeammate({
+        name: intentName,
+        prompt,
+        description: `rt_dispatch ${postForPrompt.id} ${request.route_id}`,
+      }))
+      // 成功分支带成员视图（可能是 `null`：适配器把非对象投影成 null）。
+      const spawnedMember = recordOf(spawned.member)
+      if (spawned.ok === true) {
+        member = { name: spawnedMember.name ?? intent.name, id: spawnedMember.id ?? null, mode: 'spawn' }
+      } else {
+        const after = recordOf(await teamAdapter.listMembers(undefined))
+        const appeared = after.ok === true
+          ? recordRows(after.members).find((row) => row.name === intent.name && row.status !== 'failed' && row.status !== 'provisioning') ?? null
+          : null
+        if (appeared !== null) {
+          member = { name: appeared.name, id: appeared.id, mode: 'spawn-adopted' }
         } else {
-          const after = recordOf(await teamAdapter.listMembers(undefined))
-          const appeared = after.ok === true
-            ? recordRows(after.members).find((row) => row.name === intent.name && row.status !== 'failed' && row.status !== 'provisioning') ?? null
+          const code = stableCode(spawned.code)
+          const hostCode = nonEmpty(spawned.hostCode) ? spawned.hostCode : null
+          const hostMessage = nonEmpty(spawned.reason) ? spawned.reason : null
+          // 已用席位数（可数的事实；数不到就是 null）。只写进诊断，不参与任何判定。
+          const usedSeats = after.ok === true
+            ? recordRows(after.members).filter((row) => row.role === 'teammate').length
             : null
-          if (appeared !== null) {
-            member = { name: appeared.name, id: appeared.id, mode: 'spawn-adopted' }
-          } else {
-            const code = stableCode(spawned.code)
-            const hostCode = nonEmpty(spawned.hostCode) ? spawned.hostCode : null
-            // T18：宿主因上限拒绝一次**真实需要**的创建 → 被动观测（不是主动试探）。
-            // T18b：观测读的是宿主自己抛出的文案（适配器放在 `reason` 里），从里面解析出准确上限。
-            const observed = code === 'CAPACITY_EXHAUSTED'
-              ? await recordCapacityObservation({
-                root,
-                sessionId: capacitySessionId,
-                teamAdapter,
-                hostCode: hostCode ?? code,
-                hostMessage: nonEmpty(spawned.reason) ? spawned.reason : null,
-                nowIso: now(),
-              })
-              : null
-            await advance(phase, {
-              member_failed: { name: intent.name, code, host_code: hostCode, reason: spawned.reason ?? null, at: now() },
-              ...(observed === null || observed.ref === null
-                ? {}
-                : {
-                  capacity_observed: {
-                    ref: observed.ref,
-                    max_members: observed.max_members,
-                    max_active_subagents: observed.max_active_subagents,
-                    parsed_limit: observed.parsed_limit,
-                    origin: observed.origin,
-                    host_code: hostCode,
-                    at: now(),
-                  },
-                }),
-            })
-            return failure(code, {
-              reason: capacityFailureReason(intentName, hostCode, spawned.reason, observed),
-              nextStep: capacityFailureNextStep(intentName, hostCode, observed),
-              phase: 'member_ready',
-              // T19：席位满（`TEAM_MEMBER_LIMIT`）没有写下成员行，这个名字在名册里**不存在**；
-              // 回执点名它就是承诺一个不存在的对象。焚烧类（activation 池满 / 认不出的码）才点名。
-              // 不点名只能**不带这个键**：`$defs.failureData.member` 是 `$defs/text`
-              // （`string` / `minLength:1`），写 `null` 会让整封回执过不了 `$defs.result`，
-              // 入口会把它换成 `RECOVERY_REQUIRED`（T19 用例钉住了这一点）。
-              extra: capacityRefusalBurned(hostCode) ? { member: intent.name } : {},
-              diagnostics: capacityFailureDiagnostics(code, intentName, hostCode, observed),
-            })
-          }
-        }
-      } finally {
-        // 「观测中」标记只覆盖这一次 spawn：成功/失败/抛出都要收走，否则下一次派发会被自己挡住。
-        if (gate.state.markerWritten) {
-          await capacitySource.clearObservationMarker(root).catch(() => {})
+          await advance(phase, {
+            member_failed: { name: intent.name, code, host_code: hostCode, reason: hostMessage, at: now() },
+          })
+          return failure(code, {
+            // T23：宿主原话逐字进 reason 与诊断；不解析上限、不声称烧了什么。
+            reason: hostRefusalReason(intentName, hostCode, hostMessage),
+            nextStep: hostRefusalNextStep(intentName),
+            // 阶段是 prepared：成员身份没落进台账（`member` 还没写），别声称 member_ready。
+            phase: 'prepared',
+            // 不点名 `member`：`$defs.failureData.member` 是 `$defs/text`，且被拒绝之后名册里
+            // 到底有没有这个名字不由我们判断（T19 的裁决：不点名只能**不带这个键**）。
+            diagnostics: hostRefusalDiagnostics(code, intentName, hostCode, hostMessage, usedSeats),
+          })
         }
       }
     }
@@ -3141,9 +2568,18 @@ async function runLocked(params: RunLockedParams): Promise<Envelope> {
   }
 
   // ---- step 8：审计 + 保存结果 ----
-  // T18：容量来源与风险诊断在台账里（prepare 时写的），成功回执也要把它们交回给模型 ——
-  // 「未知容量照派」如果只活在台账里，模型就看不见自己接受了什么代价。
-  const diagnostics: Diagnostic[] = capacityDiagnosticsFrom(data)
+  // 成功回执的诊断只剩「事实类」的补充（审计写失败）；T23 起容量不再产生任何诊断，
+  // 也没有「当时以为的上限」要交回 —— 上限是宿主的事。
+  const diagnostics: Diagnostic[] = []
+  if (request.obsolete_capacity === true) {
+    // wire schema 仍声明 `capacity`（docs/specs 由 Lead 维护），收到就明说没用，不静默忽略。
+    diagnostics.push(envelope.diagnostic(
+      'CAPACITY_ARGUMENT_OBSOLETE',
+      '容量子系统已删除（T23/D41）：本次传入的 capacity 不参与任何判定，也不会被记住。'
+      + '宿主的席位/activation 上限没有读法：能不能建由宿主决定，被拒时按宿主原话报 CAPACITY_EXHAUSTED',
+      '去掉 capacity 即可；岗位能不能派只看能力是否满足',
+    ))
+  }
   let auditWritten = data.audit_at !== undefined
   if (justDelivered && !auditWritten) {
     // `AuditEntry` 的列都是文本：台账里的任务是字符串（写进去的是字符串 ID），

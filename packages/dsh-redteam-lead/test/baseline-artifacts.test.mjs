@@ -94,13 +94,7 @@ function makeHost(t, options = {}) {
         schema_version: 1,
         targets: [{ id: 'T-001', path: 're/samples/sample.bin', sha256: SAMPLE_SHA256 }],
       }),
-      're/team/capacity.json': JSON.stringify({
-        schema_version: 1,
-        declared_at: '2026-01-01T00:00:00.000Z',
-        declared_by: 't17-baseline-artifacts-test',
-        maxMembers: 6,
-        maxActiveSubagents: 4,
-      }),
+      // T23：本包不再读/写容量声明；这个文件已无消费方，故意不再放。
       're/routes/R-001.json': JSON.stringify(ROUTE),
     },
   })

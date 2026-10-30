@@ -62,66 +62,24 @@ export interface TeamTask {
     ready: boolean;
     writeScopes: string[];
 }
-/** 容量声明里的一个缺口（绝不猜上限）。 */
-export interface CapacityGap {
-    code: string;
-    detail: string;
-    nextStep: string;
-}
-/** 席位（`used` 恒可数；`total`/`remaining` 只来自显式声明）。 */
-export interface MemberSlots {
-    known: boolean;
-    remaining: number | null;
-    total: number | null;
-    used: number | null;
-}
-/** activation 池（只声明上限；当前占用不可观测）。 */
-export interface ActivationSlots {
-    known: boolean;
-    remaining: number | null;
-    total: number | null;
-}
-/** 容量来源与声明身份。 */
-export interface CapacityEvidence {
-    source: string;
-    declaredAt?: unknown;
-    declaredBy?: unknown;
-    maxMembers?: number;
-    maxActiveSubagents?: number;
-    usedSeats: number | null;
-}
-/** `capacity()` 的返回：两支都带容量投影（服务缺席时也要说清「数不到已用席位」）。 */
-export interface TeamCapacityResult {
+/** 已用席位（唯一可读的容量事实）的结果。`used === null` = 数不到，不是 0。 */
+export interface UsedSeatsResult {
     ok: boolean;
+    used: number | null;
     code?: string;
     reason?: string;
-    memberSlots: MemberSlots;
-    activations: ActivationSlots;
-    evidence: CapacityEvidence;
-    gaps: CapacityGap[];
+    nextStep?: string;
 }
-/** `re/team/capacity.json` 校验通过后的声明。 */
-export interface DeclaredCapacityKnown {
-    known: true;
-    maxMembers: number;
-    maxActiveSubagents: number;
-    declaredAt: unknown;
-    declaredBy: unknown;
-    source: string;
-    path: string;
-}
-/** 声明缺失/非法：只给缺口，不给数字。 */
-export interface DeclaredCapacityMissing {
-    known: false;
-    gap: CapacityGap;
-}
-/** `readDeclaredCapacity()` 的产物。 */
-export type DeclaredCapacity = DeclaredCapacityKnown | DeclaredCapacityMissing;
 /** `createTeamAdapter()` 的入参：两种形态（装配上下文 / 显式注入）的并集，全部按 `unknown` 收。 */
 export interface TeamAdapterOptions {
     ctx?: unknown;
     services?: unknown;
     exec?: unknown;
+    /**
+     * `config` / `projectRoot` 只为与装配层（`index.ts` 的两个适配器共用一份 options）保持同一形状：
+     * T23 起团队适配器**不读项目文件、也不读 profile 配置里的容量段**，只有 `exec.agent` 与
+     * `services.agentTeams` 会被用到。
+     */
     config?: unknown;
     agent?: unknown;
     projectRoot?: unknown;
@@ -236,29 +194,25 @@ export interface TeamAdapterApi {
     contract_version: number;
     CONTRACT_VERSION: number;
     hasService(): boolean;
-    readDeclaredCapacity(root?: unknown): Promise<DeclaredCapacity>;
     membership(agent?: unknown): Promise<MembershipResult>;
     listMembers(agent?: unknown): Promise<ListMembersResult>;
     spawnTeammate(request?: SpawnTeammateRequest): Promise<SpawnTeammateResult>;
     sendMessage(request?: SendMessageRequest): Promise<SendMessageResult>;
     interruptAgent(request?: InterruptRequest): Promise<InterruptResult>;
-    capacity(): Promise<TeamCapacityResult>;
+    usedSeats(): Promise<UsedSeatsResult>;
     createTask(request?: CreateTaskRequest): Promise<CreateTaskResult>;
     updateTask(request?: UpdateTaskRequest): Promise<UpdateTaskResult>;
     getTask(taskId?: unknown): Promise<GetTaskResult>;
     listTasks(): Promise<ListTasksResult>;
 }
 /**
- * 读并校验项目里的容量声明 `re/team/capacity.json`。
- * 文件缺失/JSON 坏/字段不合法都返回 `{known:false, gap}`，不抛。
- * @param {string} projectRoot 项目根
- */
-export declare function readDeclaredCapacity(projectRoot: unknown): Promise<DeclaredCapacity>;
-/**
  * 建一个 teamAdapter。
  *
  * 支持两种入参形态：
- * - `createTeamAdapter({ ctx })`：从装配上下文取 `services` / `exec` / `config` / `root`；
- * - `createTeamAdapter({ services, exec, agent, config, projectRoot })`：显式注入。
+ * - `createTeamAdapter({ ctx })`：从装配上下文取 `services` / `exec`；
+ * - `createTeamAdapter({ services, exec, agent })`：显式注入。
+ *
+ * `config` / `projectRoot` 仍然接受（装配层给两个适配器同一份 options），但不再被读取：
+ * T23 起团队适配器不读项目里的容量声明文件，也不读 profile 配置里的容量段。
  */
 export declare function createTeamAdapter(input?: TeamAdapterOptions): TeamAdapterApi;

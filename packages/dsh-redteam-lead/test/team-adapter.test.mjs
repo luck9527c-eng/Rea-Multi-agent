@@ -1,38 +1,14 @@
 // teamAdapter：宿主团队服务的薄封装。所有失败都必须落到 {ok:false, code}，绝不抛。
-// 关键判断点是 capacity()：只允许「已用席位可数 + 上限必须显式声明」，实现里不得有任何兜底。
+// 关键判断点是 usedSeats()：T23 起只允许「已用席位从 listMembers 数出来」，
+// 适配器不读任何容量声明、不猜上限，也不解析宿主拒绝消息里的数字。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
+import { readFileSync } from 'node:fs';
 
-import { createTeamAdapter, readDeclaredCapacity } from '../dist/team-adapter.js';
+import { createTeamAdapter } from '../dist/team-adapter.js';
 import { createFakeTeam, HOST_CODES } from './helpers/fake-team.mjs';
 
 const ADAPTER_SOURCE = readFileSync(new URL('../src/team-adapter.ts', import.meta.url), 'utf8');
-
-/** 建一个临时项目根，可带初始文件；测试结束自动删除。 */
-function makeProject(t, files = {}) {
-  const root = mkdtempSync(path.join(tmpdir(), 'rt4-team-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  for (const [relative, content] of Object.entries(files)) {
-    const target = path.join(root, ...relative.split('/'));
-    mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, typeof content === 'string' ? content : JSON.stringify(content, null, 2), 'utf8');
-  }
-  return root;
-}
-
-function declaredCapacityFile(overrides = {}) {
-  return {
-    schema_version: 1,
-    declared_at: '2026-10-29T12:00:00+08:00',
-    declared_by: 'operator:lead',
-    maxMembers: 8,
-    maxActiveSubagents: 4,
-    ...overrides,
-  };
-}
 
 const LEAD = { name: 'lead', role: 'lead' };
 
@@ -74,12 +50,10 @@ test('缺团队服务时所有方法返回 TEAM_SERVICE_UNAVAILABLE 且不抛', 
     assert.equal(result.code, 'TEAM_SERVICE_UNAVAILABLE', `${name} 必须给出稳定码`);
   }
 
-  const capacity = await adapter.capacity();
-  assert.equal(capacity.ok, false);
-  assert.equal(capacity.code, 'TEAM_SERVICE_UNAVAILABLE');
-  assert.deepEqual(capacity.memberSlots, { known: false, remaining: null, total: null, used: null });
-  assert.deepEqual(capacity.activations, { known: false, remaining: null, total: null });
-  assert.equal(capacity.evidence.source, 'unavailable');
+  const seats = await adapter.usedSeats();
+  assert.equal(seats.ok, false);
+  assert.equal(seats.used, null);
+  assert.equal(seats.code, 'TEAM_SERVICE_UNAVAILABLE');
 });
 
 test('membership 只认宿主给的活 agent；非成员与缺失 agent 都是 ROLE_REQUIRED', async (t) => {
@@ -283,94 +257,60 @@ test('interruptAgent 只回 running|inactive，非法目标不抛', async (t) =>
   assert.equal(team.callsFor('interrupt').length, 3);
 });
 
-test('capacity()：有项目声明时 known:true，used 计入失败成员', async (t) => {
-  const projectRoot = makeProject(t, {
-    're/team/capacity.json': declaredCapacityFile({ maxMembers: 5, maxActiveSubagents: 3 }),
-  });
+test('usedSeats()：已用席位只从 listMembers 数 teammate，失败成员也算在内', async () => {
   const team = createFakeTeam({
     members: [{ name: 'rt-scout' }, { name: 'rt-dead', status: 'failed' }],
   });
-  const adapter = createTeamAdapter({
-    services: { agentTeams: team.service },
-    agent: team.agent,
-    projectRoot,
-  });
-  const capacity = await adapter.capacity();
-  assert.deepEqual(capacity.memberSlots, { known: true, remaining: 3, total: 5, used: 2 });
-  // activation 的「当前占用」没有受支持的只读查询，所以 remaining 只能是 null，不能假装等于上限
-  assert.deepEqual(capacity.activations, { known: true, remaining: null, total: 3 });
-  assert.equal(capacity.evidence.source, 'declared:re/team/capacity.json');
-  assert.ok(capacity.ok);
-  assert.ok(capacity.gaps.some((gap) => gap.code === 'ACTIVATION_USAGE_UNOBSERVED'));
+  const adapter = createTeamAdapter({ services: { agentTeams: team.service }, agent: team.agent });
+  const seats = await adapter.usedSeats();
+  assert.deepEqual(seats, { ok: true, used: 2 }, 'lead 不计、两个 teammate（含 failed）都算');
+  assert.equal(team.callsFor('listMembers').length, 1);
 });
 
-test('capacity()：只有 profile config 声明时 known:true 且来源是 profile-config', async (t) => {
-  const projectRoot = makeProject(t);
-  const team = createFakeTeam({ members: [{ name: 'rt-scout' }] });
-  const adapter = createTeamAdapter({
-    services: { agentTeams: team.service },
-    agent: team.agent,
-    projectRoot,
-    config: { capacity: { maxMembers: 4, maxActiveSubagents: 2 } },
-  });
-  const capacity = await adapter.capacity();
-  assert.equal(capacity.memberSlots.known, true);
-  assert.deepEqual(capacity.memberSlots, { known: true, remaining: 3, total: 4, used: 1 });
-  assert.deepEqual(capacity.activations, { known: true, remaining: null, total: 2 });
-  assert.equal(capacity.evidence.source, 'declared:profile-config');
+test('usedSeats()：数不到就说数不到（null），绝不回落成 0', async () => {
+  const team = createFakeTeam();
+  team.faults.beforeHost('listMembers', 1, { code: 'SOMETHING_NEW', message: 'host exploded' });
+  const adapter = createTeamAdapter({ services: { agentTeams: team.service }, agent: team.agent });
+  const seats = await adapter.usedSeats();
+  assert.equal(seats.ok, false);
+  assert.equal(seats.used, null);
+  assert.equal(seats.code, 'RECOVERY_REQUIRED');
+  assert.match(seats.reason, /host exploded/u);
 });
 
-test('capacity()：没有显式声明时 known:false，但 used 仍然可数并给出下一步', async (t) => {
-  const projectRoot = makeProject(t);
-  const { adapter } = makeAdapter(t, { projectRoot });
-  const capacity = await adapter.capacity();
-  assert.deepEqual(capacity.memberSlots, { known: false, remaining: null, total: null, used: 1 });
-  assert.deepEqual(capacity.activations, { known: false, remaining: null, total: null });
-  assert.equal(capacity.evidence.source, 'unavailable');
-  assert.ok(capacity.gaps.length > 0, '必须给出 gap');
-  assert.equal(capacity.gaps[0].code, 'CAPACITY_DECLARATION_MISSING');
-  assert.match(capacity.gaps[0].nextStep, /re\/team\/capacity\.json/);
+test('usedSeats()：服务缺席 / 没有活 agent 都返回 {ok:false, used:null}', async () => {
+  const noService = createTeamAdapter({ services: {}, agent: undefined });
+  const missing = await noService.usedSeats();
+  assert.equal(missing.ok, false);
+  assert.equal(missing.used, null);
+  assert.equal(missing.code, 'TEAM_SERVICE_UNAVAILABLE');
+
+  const team = createFakeTeam();
+  const noAgent = createTeamAdapter({ services: { agentTeams: team.service }, agent: undefined });
+  const bare = await noAgent.usedSeats();
+  assert.equal(bare.ok, false);
+  assert.equal(bare.used, null);
+  assert.equal(bare.code, 'ROLE_REQUIRED');
 });
 
-test('capacity()：声明非法时 known:false 且指出哪里不合法，不崩', async (t) => {
-  const projectRoot = makeProject(t, {
-    're/team/capacity.json': declaredCapacityFile({ declared_by: '' }),
-  });
-  const { adapter } = makeAdapter(t, { projectRoot });
-  const capacity = await adapter.capacity();
-  assert.equal(capacity.memberSlots.known, false);
-  assert.equal(capacity.memberSlots.total, null);
-  assert.equal(capacity.evidence.source, 'unavailable');
-  const gap = capacity.gaps.find((entry) => entry.code === 'CAPACITY_DECLARATION_INVALID');
-  assert.ok(gap, '非法声明要有独立 gap');
-  assert.match(gap.detail, /declared_by/);
+test('源码级断言：适配器不读任何容量声明，也没有兜底常数', () => {
+  const forbidden = [
+    [/\bcapacity\.json\b/u, 'T23：不得再读 re/team/capacity.json'],
+    [/config\.capacity/u, 'T23：不得再读 profile 的 config.capacity'],
+    [/\bgetCapacity\b/u, '不得假设宿主有 getCapacity'],
+    [/\bprivate\b/u, '不得提及/读取 private 成员'],
+    [/\.slots\b/u, '不得读 ActivationPool.slots'],
+    [/service\.config/u, '不得读宿主 service.config'],
+    [/service\.(?:maxMembers|maxActiveSubagents)\b/u, '不得直接读宿主的私有上限字段'],
+    [/\blistChildren\b/u, '不得用 listChildren 算术当余额'],
+    [/\bDEFAULT_MAX_MEMBERS\b/u, '不得引用宿主默认上限'],
+    [/\b(?:8|16)\b/u, '不得出现 8/16 兜底常数'],
+  ];
+  for (const [pattern, why] of forbidden) {
+    assert.doesNotMatch(ADAPTER_SOURCE, pattern, why);
+  }
+  assert.match(ADAPTER_SOURCE, /listMembers[\s\S]{0,200}role === 'teammate'/u, 'used 只从 listMembers 数出来');
 });
-
-test('readDeclaredCapacity 校验字段而不是崩：缺失/坏 JSON/缺字段三类', async (t) => {
-  const missing = await readDeclaredCapacity(makeProject(t));
-  assert.equal(missing.known, false);
-  assert.equal(missing.gap.code, 'CAPACITY_DECLARATION_MISSING');
-
-  const broken = await readDeclaredCapacity(makeProject(t, { 're/team/capacity.json': '{ not json' }));
-  assert.equal(broken.known, false);
-  assert.equal(broken.gap.code, 'CAPACITY_DECLARATION_INVALID');
-
-  const partial = await readDeclaredCapacity(makeProject(t, {
-    're/team/capacity.json': { schema_version: 1, maxMembers: 3 },
-  }));
-  assert.equal(partial.known, false);
-  assert.equal(partial.gap.code, 'CAPACITY_DECLARATION_INVALID');
-  assert.match(partial.gap.detail, /declared_at|declared_by|maxActiveSubagents/);
-
-  const good = await readDeclaredCapacity(makeProject(t, {
-    're/team/capacity.json': declaredCapacityFile(),
-  }));
-  assert.equal(good.known, true);
-  assert.equal(good.maxMembers, 8);
-  assert.equal(good.maxActiveSubagents, 4);
-  assert.equal(good.source, 'declared:re/team/capacity.json');
-});
-
 test('createTask 失败（宿主校验拒绝/宿主异常）也返回 {ok:false, code}', async (t) => {
   const { adapter } = makeAdapter(t);
   const tooLong = await adapter.createTask({ subject: 'x'.repeat(201), description: 'd' });
@@ -410,21 +350,3 @@ test('服务可以通过 ctx.get("agentTeams") 可选注入', async (t) => {
   assert.equal(listed.members.length, 2);
 });
 
-test('源码级断言：capacity() 里没有任何兜底常数或私有读取', () => {
-  const forbidden = [
-    [/\bgetCapacity\b/u, '不得假设宿主有 getCapacity'],
-    [/\bprivate\b/u, '不得提及/读取 private 成员'],
-    [/\.slots\b/u, '不得读 ActivationPool.slots'],
-    [/service\.config/u, '不得读宿主 service.config'],
-    [/service\.(?:maxMembers|maxActiveSubagents)\b/u, '不得直接读宿主的私有上限字段'],
-    [/\blistChildren\b/u, '不得用 listChildren 算术当余额'],
-    [/\bDEFAULT_MAX_MEMBERS\b/u, '不得引用宿主默认上限'],
-    [/\b(?:8|16)\b/u, '不得出现 8/16 兜底常数'],
-  ];
-  for (const [pattern, why] of forbidden) {
-    assert.doesNotMatch(ADAPTER_SOURCE, pattern, why);
-  }
-  assert.match(ADAPTER_SOURCE, /declared:re\/team\/capacity\.json/u);
-  assert.match(ADAPTER_SOURCE, /declared:profile-config/u);
-  assert.match(ADAPTER_SOURCE, /listMembers[\s\S]{0,200}role === 'teammate'/u, 'used 只从 listMembers 数出来');
-});

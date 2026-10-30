@@ -44,7 +44,6 @@ const FULL_TOOLS = {
   web_search: {},
   skill: {},
 }
-const CAPACITY = { known: true, maxMembers: 8, maxActiveSubagents: 8, via: 'project' }
 
 const GOOD_RECOVERY = `# 旧 Lead 停止核查
 
@@ -99,13 +98,12 @@ function input(projectRoot, extra = {}) {
   return { project_root: projectRoot, ...extra }
 }
 
-/** 建一个可用的 Lead ctx：声明容量 + 完整工具集。 */
+/** 建一个可用的 Lead ctx：完整工具集（T23：不再有任何容量声明可传）。 */
 function leadCtx(t, project, options = {}) {
   return makeCtx({
     t,
     role: 'lead',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { lead: FULL_TOOLS },
     ...options,
   })
@@ -151,13 +149,18 @@ test('inspect 作为 Lead：给出可核对提议，且不创建成员/任务、
   }
 
   assert.equal(envelope.data.recommended_members, 2)
+  // T23：容量四字段是 wire 必备键，但本插件不再做容量规划 —— 一律「未知 / 不预留」。
   assert.deepEqual(envelope.data.capacity, {
-    remaining_member_slots: 7,
-    remaining_activations: 6,
-    reserved_member_slots: 1,
-    reserved_activations: 2,
+    remaining_member_slots: null,
+    remaining_activations: null,
+    reserved_member_slots: 0,
+    reserved_activations: 0,
   })
   assert.equal(JSON.stringify(envelope.data).includes('"known"'), false, 'D19：known 不得上线')
+  // 已用席位改成一条普通诊断（不参与判定）。
+  const seats = envelope.diagnostics.find((entry) => entry.code === 'TEAM_SEATS_USED')
+  assert.ok(seats, '名册必须报出「现在用了几个席位」')
+  assert.match(seats.reason, /已用 0 席/u)
 
   // 零副作用：宿主没有被要求建人/建任务；`re/team/` 完全不落盘（含审计）。
   assert.equal(ctx.fakes.team.callsFor('spawnTeammate').length, 0)
@@ -203,7 +206,6 @@ test('inspect 允许真实 teammate；裸子代理被拒且零副作用', async 
     role: 'teammate',
     agentName: 'rt-scout',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { 'rt-scout': FULL_TOOLS },
   })
   const before = await teamState(project.root)
@@ -254,25 +256,25 @@ test('inspect 未传 target_kinds：只做环境检查，不猜类别、不提�
   assert.deepEqual(changedKeys(before, await teamState(project.root)), [], 'inspect 不落盘')
 })
 
-test('inspect 的 gaps 区分：缺工具、未就绪 provider、预算延后、disabled', async (t) => {
+test('inspect 的 gaps 区分：缺工具、未就绪 provider、max_posts 延后、disabled', async (t) => {
   const project = makeTempProject({ t })
   // 只给 shell/fs/search，binary-static/binary-dynamic 这类无默认别名族自然缺通道；
-  // 席位只剩 1 且预留 1 → 新成员岗位全部延后。
+  // max_posts=1 → 其余能力已满足的岗位延后（T23：延后的唯一理由就是操作者的岗位数上限）。
   const ctx = makeCtx({
     t,
     role: 'lead',
     projectRoot: project.root,
-    capacity: { known: true, maxMembers: 1, maxActiveSubagents: 4, via: 'project' },
     tools: { lead: { pwsh: {}, read: {}, write: {}, glob: {}, grep: {} } },
   })
 
-  const { envelope } = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  const { envelope } = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'], max_posts: 1 }))
   assert.equal(envelope.status, 'ok')
 
   const codes = new Set(envelope.data.gaps.map((gap) => gap.code))
   assert.ok(codes.has('CAPABILITY_MISSING'), '缺注册工具 → CAPABILITY_MISSING')
   assert.ok(codes.has('POST_DISABLED'), 'web-attack → POST_DISABLED')
-  assert.ok(codes.has('CAPACITY_EXHAUSTED') || codes.has('CAPACITY_UNKNOWN'), '预算不足 → 容量缺口')
+  assert.ok(codes.has('CAPACITY_EXHAUSTED'), '超出 max_posts → CAPACITY_EXHAUSTED')
+  assert.equal(codes.has('CAPACITY_UNKNOWN'), false, 'T23：容量未知不再是缺口')
   for (const gap of envelope.data.gaps) {
     assert.deepEqual(Object.keys(gap).sort(), ['code', 'next_step', 'reason'])
     assert.match(gap.reason, /\S/u)
@@ -282,8 +284,8 @@ test('inspect 的 gaps 区分：缺工具、未就绪 provider、预算延后、
   const posts = new Map(envelope.data.posts.map((post) => [post.post_id, post]))
   assert.equal(posts.get('binary-static').state, 'vacant')
   assert.equal(posts.get('web-attack').state, 'disabled')
-  assert.ok([...posts.values()].some((post) => post.state === 'deferred'), '容量不足的岗位应被延后')
-  assert.equal(envelope.data.recommended_members, 0)
+  assert.ok([...posts.values()].some((post) => post.state === 'deferred'), '超出 max_posts 的岗位应被延后')
+  assert.equal(envelope.data.recommended_members, 1)
 })
 
 test('执行者注册表是数组形状（宿主真实形状）时 shell/fs/search 三项全部匹配', async (t) => {
@@ -351,7 +353,6 @@ test('inspect 工具可见性取自实际执行者：Lead 与 teammate 的 vacan
     role: 'teammate',
     agentName: 'rt-scout',
     projectRoot: projectB.root,
-    capacity: CAPACITY,
     // teammate 只有 shell；其他作用域（lead）里可见的 fs/search 不算它可调用。
     tools: { lead: FULL_TOOLS, 'rt-scout': { pwsh: {} } },
   })
@@ -390,7 +391,6 @@ test('inspect 复用已有成员时不计入 recommended_members', async (t) => 
     t,
     role: 'lead',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { lead: FULL_TOOLS },
     teamOpts: { members: [{ name: 'rt-triage', status: 'running' }] },
   })
@@ -412,7 +412,32 @@ test('inspect 复用已有成员时不计入 recommended_members', async (t) => 
   assert.equal(posts.get('triage').member, 'rt-triage')
   // 只有 cross-check 需要新建成员；triage 是复用。
   assert.equal(envelope.data.recommended_members, 1)
-  assert.equal(envelope.data.capacity.remaining_member_slots, 6, '已用席位要计入余额')
+  // T23：不再有「剩余余额」；已用席位只作一条诊断，不参与判定。
+  assert.equal(envelope.data.capacity.remaining_member_slots, null, '余额不可读，不假装知道')
+  assert.ok(envelope.diagnostics.some((entry) => entry.code === 'TEAM_SEATS_USED' && /已用 1 席/u.test(entry.reason)))
+})
+
+test('传了已废止的容量参数 → 明说「收到但没用」，不静默忽略（T23）', async (t) => {
+  const project = makeTempProject({ t })
+  const ctx = leadCtx(t, project)
+  // wire schema 仍是 docs/specs 的副本，所以这几个键仍能通过校验；实现必须明说它们已废止。
+  const { envelope } = await handleRoster(ctx, input(project.root, {
+    target_kinds: ['binary'],
+    capacity: { max_members: 2, max_active_subagents: 2 },
+    reserved_member_slots: 0,
+    reserved_activations: 0,
+  }))
+  assert.equal(envelope.status, 'ok')
+  const note = envelope.diagnostics.find((entry) => entry.code === 'CAPACITY_ARGUMENT_OBSOLETE')
+  assert.ok(note, '必须有一条「已废止」诊断')
+  assert.match(note.reason, /capacity/u)
+  assert.match(note.reason, /reserved_member_slots/u)
+  assert.match(note.reason, /reserved_activations/u)
+
+  // 不参与任何判定：岗位与提议哈希都得和「不传」完全一致。
+  const plain = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  assert.deepEqual(envelope.data.posts, plain.envelope.data.posts)
+  assert.equal(envelope.data.proposal_hash, plain.envelope.data.proposal_hash, '废止参数不得进提议指纹')
 })
 
 // ---------------------------------------------------------------------------
@@ -574,60 +599,38 @@ test('bind 用别的 target_kinds 的旧提议 → 拒绝且不写盘', async (t
   assert.deepEqual(changedKeys(before, await teamState(project.root)), ['audit.jsonl'])
 })
 
-test('proposal_hash 绑定已解析的容量：maxMembers 8→2 必须换提议', async (t) => {
-  // 容量声明决定「哪些岗位落到 deferred」：它一变，提议内容就变了，hash 必须跟着变，
-  // bind 才能拒绝「预算已经变了」的过期提议。声明里的 declared_at/declared_by 不是提议内容，
-  // 同样的数字重新声明一次不得换 hash。
+test('proposal_hash 绑定 max_posts：上限一变就必须换提议', async (t) => {
+  // max_posts 是提议里唯一还存在的「预算」参数：它决定哪些岗位落到 deferred，
+  // 所以它一变提议内容就变了，hash 必须跟着变；同样的数字重算必须得到同一个 hash。
   const project = makeTempProject({ t })
   const ctx = leadCtx(t, project)
 
-  const eight = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
-  assert.equal(eight.envelope.status, 'ok')
-  assert.equal(eight.envelope.data.recommended_members, 2)
+  const six = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  assert.equal(six.envelope.status, 'ok')
+  assert.equal(six.envelope.data.recommended_members, 2)
 
-  project.write('re/team/capacity.json', {
-    schema_version: 1,
-    declared_at: '2026-01-02T00:00:00Z',
-    declared_by: 'operator',
-    maxMembers: 2,
-    maxActiveSubagents: 8,
-  })
-  const two = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
-  assert.equal(two.envelope.status, 'ok')
+  const one = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'], max_posts: 1 }))
+  assert.equal(one.envelope.status, 'ok')
   assert.notEqual(
-    two.envelope.data.proposal_hash,
-    eight.envelope.data.proposal_hash,
-    'maxMembers 8→2 之后同一份提议不得还是同一个 hash',
+    one.envelope.data.proposal_hash,
+    six.envelope.data.proposal_hash,
+    'max_posts 6→1 之后同一份提议不得还是同一个 hash',
   )
-  assert.equal(two.envelope.data.recommended_members, 1, '席位从 7 降到 1，推荐成员数必须下降')
+  assert.equal(one.envelope.data.recommended_members, 1, 'max_posts 收到 1，只有一岗能新建成员')
 
-  project.write('re/team/capacity.json', {
-    schema_version: 1,
-    declared_at: '2026-01-03T00:00:00Z',
-    declared_by: 'another-operator',
-    maxMembers: 8,
-    maxActiveSubagents: 8,
-  })
-  const restored = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  const again = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'], max_posts: 6 }))
   assert.equal(
-    restored.envelope.data.proposal_hash,
-    eight.envelope.data.proposal_hash,
-    '数字改回去之后提议也回到原样：声明时间/人不进 hash',
+    again.envelope.data.proposal_hash,
+    six.envelope.data.proposal_hash,
+    'max_posts 改回去之后提议也回到原样',
   )
 })
 
-test('bind 拒绝「预算已经变了」的过期提议（inspect 之后改容量声明）', async (t) => {
+test('bind 拒绝「提议已经变了」的过期提议（inspect 之后改了 max_posts）', async (t) => {
   const project = makeTempProject({ t })
   const ctx = leadCtx(t, project)
   const inspected = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
   const hash = inspected.envelope.data.proposal_hash
-  project.write('re/team/capacity.json', {
-    schema_version: 1,
-    declared_at: '2026-01-02T00:00:00Z',
-    declared_by: 'operator',
-    maxMembers: 2,
-    maxActiveSubagents: 8,
-  })
   const before = await teamState(project.root)
 
   const { envelope } = await handleRoster(ctx, input(project.root, {
@@ -635,10 +638,11 @@ test('bind 拒绝「预算已经变了」的过期提议（inspect 之后改容�
     target_kinds: ['binary'],
     operation_id: 'op-bind-stale-budget',
     proposal_hash: hash,
+    max_posts: 1,
   }))
   assert.equal(envelope.status, 'blocked')
   assert.equal(envelope.code, 'OPERATION_CONFLICT')
-  assert.match(envelope.diagnostics[0].reason, /预算|容量/u)
+  assert.match(envelope.diagnostics[0].reason, /proposal_hash|预算/u)
   assert.match(envelope.diagnostics[0].next_step, /inspect|重新提议/u)
   await assert.rejects(readFile(path.join(project.root, 're', 'team', 'binding.json')))
   await assert.rejects(readFile(path.join(project.root, 're', 'team', 'roster.json')))
@@ -646,23 +650,17 @@ test('bind 拒绝「预算已经变了」的过期提议（inspect 之后改容�
   assert.equal(ctx.fakes.team.callsFor('spawnTeammate').length, 0)
 })
 
-test('bind 在锁内按同一预算复核：预算内无法满足 → CAPACITY_EXHAUSTED 且不写 binding', async (t) => {
-  // 席位 1、预留 1 → 可新建 0：提议在 inspect 时就已经 deferred（带 CAPACITY_EXHAUSTED），
-  // 此时 proposal_hash 仍然成立（inspect 与 bind 之间预算没变），所以拒绝必须来自
-  // 「锁内按当前预算复核」这条路径，而不是 hash 不一致。
+test('bind 在锁内按当前 max_posts 复核：放不下 → CAPACITY_EXHAUSTED 且不写 binding', async (t) => {
+  // max_posts=1 时提议在 inspect 阶段就已经 deferred（带 CAPACITY_EXHAUSTED），
+  // proposal_hash 仍然成立（inspect 与 bind 之间预算没变），所以拒绝必须来自
+  // 「锁内按当前提议复核」这条路径，而不是 hash 不一致。
   const project = makeTempProject({ t })
-  const ctx = makeCtx({
-    t,
-    role: 'lead',
-    projectRoot: project.root,
-    capacity: { known: true, maxMembers: 1, maxActiveSubagents: 4, via: 'project' },
-    tools: { lead: FULL_TOOLS },
-  })
-  const inspected = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'] }))
+  const ctx = leadCtx(t, project)
+  const inspected = await handleRoster(ctx, input(project.root, { target_kinds: ['binary'], max_posts: 1 }))
   assert.equal(inspected.envelope.status, 'ok')
   assert.ok(
     inspected.envelope.data.gaps.some((gap) => gap.code === 'CAPACITY_EXHAUSTED'),
-    '预算内放不下：inspect 就要报 CAPACITY_EXHAUSTED',
+    'max_posts 放不下：inspect 就要报 CAPACITY_EXHAUSTED',
   )
 
   const { envelope } = await handleRoster(ctx, input(project.root, {
@@ -670,6 +668,7 @@ test('bind 在锁内按同一预算复核：预算内无法满足 → CAPACITY_E
     target_kinds: ['binary'],
     operation_id: 'op-bind-tight',
     proposal_hash: inspected.envelope.data.proposal_hash,
+    max_posts: 1,
   }))
 
   assert.equal(envelope.status, 'blocked')
@@ -678,7 +677,6 @@ test('bind 在锁内按同一预算复核：预算内无法满足 → CAPACITY_E
   await assert.rejects(readFile(path.join(project.root, 're', 'team', 'roster.json')))
   assert.equal(ctx.fakes.team.callsFor('spawnTeammate').length, 0)
 })
-
 test('bind 时锁被占 → PROJECT_BUSY；持锁进程崩溃且已过期也不自动夺锁', async (t) => {
   const project = makeTempProject({ t })
   const ctx = leadCtx(t, project)
@@ -718,7 +716,6 @@ test('bind 变更操作仅 Lead：teammate 被拒且零副作用', async (t) => 
     role: 'teammate',
     agentName: 'rt-scout',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { 'rt-scout': FULL_TOOLS },
   })
   const before = await teamState(project.root)
@@ -752,7 +749,6 @@ test('bind 拒绝旧会话的绑定：同项目不同 team → PROJECT_SESSION_M
     t,
     role: 'lead',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { lead: FULL_TOOLS },
     teamOpts: { teamId: 'session-root-2' },
   })
@@ -934,7 +930,6 @@ test('新会话接管：takeover 换 session 并增 epoch，旧会话的变更�
     t,
     role: 'lead',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { lead: FULL_TOOLS },
     teamOpts: { teamId: 'session-root-2' },
   })
@@ -974,7 +969,6 @@ test('没有项目适配器时兼容性是 unknown：inspect 给缺口，bind �
     t,
     role: 'lead',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { lead: FULL_TOOLS },
     project: null,
   })
@@ -1179,10 +1173,11 @@ test('缺 Python / 非默认布局 → SKILL_INCOMPATIBLE，并点名具体缺�
   assert.match(layoutGap.reason, /legacy-flat/u)
 })
 
-test('项目声明了容量但适配器没读到 → 明确诊断，仍按 CAPACITY_UNKNOWN 处理', async (t) => {
+test('适配器没绑 projectRoot 也照样工作：容量不再从项目文件读（T23）', async (t) => {
   const project = makeTempProject({ t })
   const ctx = leadCtx(t, project)
-  // 模拟装配层没把 project_root 交给适配器：容量声明在项目里，但适配器创建时没有根。
+  // 旧实现会在「项目里声明了容量、但适配器没绑根」时报 CAPACITY_DECLARATION_UNREAD。
+  // T23 删掉了项目容量声明，这条缺口与这条装配要求一起消失：没绑根不影响岗位计划。
   ctx.deps.teamAdapter = createTeamAdapter({
     services: ctx.services,
     exec: ctx.exec,
@@ -1193,11 +1188,17 @@ test('项目声明了容量但适配器没读到 → 明确诊断，仍按 CAPAC
   assert.equal(envelope.status, 'ok')
   assert.equal(envelope.data.capacity.remaining_member_slots, null)
   assert.equal(envelope.data.capacity.remaining_activations, null)
-  assert.equal(envelope.data.recommended_members, 0)
-  const unread = envelope.data.gaps.find((gap) => gap.code === 'CAPACITY_DECLARATION_UNREAD')
-  assert.ok(unread, '必须点名「声明了但读不到」')
-  assert.match(unread.reason, /maxMembers=8/u)
-  assert.ok(envelope.data.gaps.some((gap) => gap.code === 'CAPACITY_UNKNOWN'))
+  assert.equal(envelope.data.recommended_members, 2)
+  assert.equal(
+    envelope.data.gaps.some((gap) => gap.code === 'CAPACITY_DECLARATION_UNREAD'),
+    false,
+    '不再有「声明了但读不到」这类缺口',
+  )
+  assert.equal(
+    envelope.data.gaps.some((gap) => gap.code === 'CAPACITY_UNKNOWN'),
+    false,
+    'T23：容量未知不再是缺口',
+  )
 })
 
 // ---------------------------------------------------------------------------

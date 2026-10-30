@@ -20,7 +20,7 @@ import assert from 'node:assert/strict'
 import { handleRoster } from '../dist/roster.js'
 import { makeCtx, makeTempProject } from './helpers/host.mjs'
 
-/** 与 roster.test.mjs 同一套 Lead 现场：声明容量 + 完整工具集。 */
+/** 与 roster.test.mjs 同一套 Lead 现场：完整工具集（T23：没有容量声明可传）。 */
 const FULL_TOOLS = {
   pwsh: {},
   read: {},
@@ -35,7 +35,6 @@ const FULL_TOOLS = {
   skill: {},
 }
 
-const CAPACITY = { known: true, maxMembers: 8, maxActiveSubagents: 8, via: 'project' }
 
 /** `$defs.rosterData` 的 12 个必备字段（wire shape；本票不动它）。 */
 const ROSTER_DATA_KEYS = [
@@ -84,7 +83,6 @@ async function realisticEnvelope(t) {
     t,
     role: 'lead',
     projectRoot: project.root,
-    capacity: CAPACITY,
     tools: { lead: FULL_TOOLS },
   })
   const { envelope } = await handleRoster(ctx, { project_root: project.root, target_kinds: ['binary'] })
@@ -104,46 +102,33 @@ function dataWithout(envelope, keys) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. capacity：4 个字段都打出来；未知渲染成 null（D19：wire 只有这 4 个，没有 known）
+// ---------------------------------------------------------------------------
+// 1. capacity：T23 起 render **不再**打印这一行（数据里仍是 wire 必备的 4 个键）
 // ---------------------------------------------------------------------------
 
-test('T20 capacity：四个字段都出现在渲染文本里，未知值渲染成 null 而不抛', async (t) => {
+test('T23 capacity：render 不再打印容量行，但 data 里仍是 wire 要求的 4 个键', async (t) => {
   const tool = await rosterTool()
   const envelope = await realisticEnvelope(t)
 
   const text = renderText(tool, envelope)
   for (const field of ['remaining_member_slots', 'remaining_activations', 'reserved_member_slots', 'reserved_activations']) {
-    assert.ok(text.includes(field), `渲染文本必须出现 ${field}：\n${text}`)
+    assert.equal(text.includes(field), false, `render 不得再打印 ${field}：\n${text}`)
   }
-  // 已知值要**带数字**，不能只打字段名
-  assert.ok(
-    text.includes(`remaining_member_slots=${envelope.data.capacity.remaining_member_slots}`),
-    `remaining_member_slots 应渲染出实际值：\n${text}`,
-  )
-  assert.ok(
-    text.includes(`reserved_activations=${envelope.data.capacity.reserved_activations}`),
-    `reserved_activations 应渲染出实际值：\n${text}`,
-  )
-  // D19：known 不上线，渲染层也不得凭空造一个
-  assert.equal(text.includes('known'), false, 'D19：capacity 没有 known 字段，渲染也不得出现')
+  assert.equal(text.includes('capacity：'), false, 'render 不得再有 capacity 行')
+  // 数据面不变（$defs.rosterData 仍要求这四个键；删字段要 Lead 改规格）
+  assert.deepEqual(Object.keys(envelope.data.capacity).sort(), [
+    'remaining_activations', 'remaining_member_slots', 'reserved_activations', 'reserved_member_slots',
+  ])
 
-  // 未知（null）不是异常：仍打全四个字段，值写 null
-  const unknown = envelopeWith(envelope, {
-    capacity: {
-      remaining_member_slots: null,
-      remaining_activations: null,
-      reserved_member_slots: 0,
-      reserved_activations: 2,
-    },
-  })
-  const unknownText = renderText(tool, unknown)
-  assert.ok(unknownText.includes('remaining_member_slots=null'), `未知应写成 null：\n${unknownText}`)
-  assert.ok(unknownText.includes('remaining_activations=null'), `未知应写成 null：\n${unknownText}`)
-  assert.ok(unknownText.includes('reserved_member_slots=0'))
-  assert.ok(unknownText.includes('reserved_activations=2'))
+  // 「现在用了几个席位」改由一条诊断承担 —— 它照样出现在渲染文本里（诊断段）。
+  assert.ok(
+    envelope.diagnostics.some((entry) => entry.code === 'TEAM_SEATS_USED'),
+    '已用席位必须以诊断形式存在',
+  )
+  assert.match(text, /\[TEAM_SEATS_USED\]/u, `已用席位必须可读：\n${text}`)
 
   // render 必须纯：同一输入两次逐字相同
-  assert.deepEqual(tool.output.render({}, unknown), tool.output.render({}, unknown))
+  assert.deepEqual(tool.output.render({}, envelope), tool.output.render({}, envelope))
 })
 
 // ---------------------------------------------------------------------------
@@ -224,7 +209,7 @@ test('T20 病态 data：缺 gaps / gaps 非数组 / capacity 为 null / posts �
 
   // 降级不吞信息：还能读到的那部分照常打出来
   const degraded = renderText(tool, dataWithout(envelope, ['gaps']))
-  assert.ok(degraded.includes('remaining_member_slots=7'), `capacity 仍可读：\n${degraded}`)
+  assert.ok(degraded.includes('gaps：无法读取（不是数组）'), `gaps 缺失要降级成可读文本：\n${degraded}`)
   assert.ok(degraded.includes(`session_id：${envelope.data.session_id}`), `session_id 仍可读：\n${degraded}`)
 
   const placeholder = renderText(tool, envelopeWith(envelope, { posts: [{ post_id: 'triage' }, {}] }))

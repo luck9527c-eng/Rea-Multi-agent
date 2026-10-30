@@ -23,7 +23,7 @@ test('makeCtx 装配出 SEAMS 第 1 节的全部 deps 键（已实现的给真�
   assert.equal(typeof ctx.deps.audit.appendAudit, 'function');
   assert.equal(typeof ctx.deps.catalog.composeTemplate, 'function');
   assert.equal(typeof ctx.deps.capability.matchCapabilities, 'function');
-  assert.equal(typeof ctx.deps.capacity.planBudget, 'function');
+  assert.equal(typeof ctx.deps.capacity.planPosts, 'function');
   assert.equal(typeof ctx.deps.envelope.ok, 'function');
   // 本轮（T4）还没实现的键
   assert.equal(ctx.deps.binding, null);
@@ -60,32 +60,13 @@ test('team:null → 服务缺席，所有团队方法 TEAM_SERVICE_UNAVAILABLE',
   assert.equal(listed.code, 'TEAM_SERVICE_UNAVAILABLE');
 });
 
-test('容量只来自显式声明：project 文件 / profile config / 都没有', async (t) => {
-  const declaredViaProject = makeCtx({
-    t,
-    teamOpts: { members: [{ name: 'rt-scout' }, { name: 'rt-dead', status: 'failed' }] },
-    capacity: { known: true, maxMembers: 5, maxActiveSubagents: 3, via: 'project' },
-  });
-  const projectFile = path.join(declaredViaProject.fakes.projectRoot, 're', 'team', 'capacity.json');
-  assert.ok(existsSync(projectFile), 'via:project 必须落成 re/team/capacity.json');
-  const fromProject = await declaredViaProject.deps.teamAdapter.capacity();
-  assert.deepEqual(fromProject.memberSlots, { known: true, remaining: 3, total: 5, used: 2 });
-  assert.equal(fromProject.evidence.source, 'declared:re/team/capacity.json');
-
-  const declaredViaConfig = makeCtx({
-    t,
-    teamOpts: { members: [{ name: 'rt-scout' }] },
-    capacity: { known: true, maxMembers: 4, maxActiveSubagents: 2, via: 'config' },
-  });
-  assert.equal(existsSync(path.join(declaredViaConfig.fakes.projectRoot, 're', 'team', 'capacity.json')), false);
-  const fromConfig = await declaredViaConfig.deps.teamAdapter.capacity();
-  assert.deepEqual(fromConfig.memberSlots, { known: true, remaining: 3, total: 4, used: 1 });
-  assert.equal(fromConfig.evidence.source, 'declared:profile-config');
-
-  const undeclared = makeCtx({ t, teamOpts: { members: [{ name: 'rt-scout' }] } });
-  const unknown = await undeclared.deps.teamAdapter.capacity();
-  assert.deepEqual(unknown.memberSlots, { known: false, remaining: null, total: null, used: 1 });
-  assert.equal(unknown.evidence.source, 'unavailable');
+test('makeCtx 不造任何容量声明：已用席位只从 listMembers 数', async (t) => {
+  // T23：容量子系统已删除，宿主也没有上限读数；装配助手不再写项目声明文件、不再塞 config 容量段。
+  const ctx = makeCtx({ t, teamOpts: { members: [{ name: 'rt-scout' }, { name: 'rt-dead', status: 'failed' }] } });
+  assert.equal(existsSync(path.join(ctx.fakes.projectRoot, 're', 'team', 'capacity.json')), false);
+  assert.equal(Object.hasOwn(ctx.config, 'capacity'), false);
+  const seats = await ctx.deps.teamAdapter.usedSeats();
+  assert.deepEqual(seats, { ok: true, used: 2 });
 });
 
 test('工具可见性按 agent 名字区分（T5 的 vacant 判定要用），且返回宿主真实形状', (t) => {

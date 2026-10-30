@@ -1,10 +1,14 @@
-// 席位 / activation 预算裁剪（纯函数）。
+// 岗位计划（原「席位 / activation 预算裁剪」；T23 起本模块**不做任何容量规划**）。
 //
-// 输入是显式余额与候选岗位；不读宿主、不猜 8/16、不按常数假定余额。
+// 为什么只剩这些：宿主不提供任何上限读数 —— `maxMembers` 是 `TeamService` 的构造函数参数，
+// 没有 getter 也没有 state 投影；`maxActiveSubagents` 在团队服务里根本不存在。它自己的强制执行
+// 就是唯一的上限事实（拒绝时抛 `TEAM_MEMBER_LIMIT` / `ACTIVATION_LIMIT_REACHED`）。
+// 所以「还能开几个」这个问题本模块不回答，也不猜；派不派只看**能力是否满足**与操作者给的 `max_posts`。
+//
+// 输入是候选岗位；不读宿主、不猜 8/16、不按常数假定余额。
 // 选择顺序：priority 升序，同值按 post_id 升序；已运行岗位永远保留且占 max_posts。
 import { isRecord, recordOf } from './guards.js';
-const NEW_MEMBER_NEXT_STEP = '在 re/team/capacity.json 声明 maxMembers/maxActiveSubagents（或改 profile config），或释放已有成员/activation 后重试';
-const UNKNOWN_NEXT_STEP = '在 re/team/capacity.json 显式声明 maxMembers/maxActiveSubagents（含 declared_at/declared_by），不要假定固定余额';
+const MAX_POSTS_NEXT_STEP = '提高 max_posts（本次调用或岗位目录 defaults.max_posts），或减少目标类别后重试';
 function toNonNegativeInt(value, fallback) {
     if (value === null || value === undefined)
         return fallback === undefined ? null : fallback;
@@ -13,9 +17,6 @@ function toNonNegativeInt(value, fallback) {
         return fallback === undefined ? null : fallback;
     }
     return Math.max(0, Math.floor(value));
-}
-function isInteger(value) {
-    return Number.isInteger(value);
 }
 function stringList(value) {
     return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [];
@@ -63,35 +64,14 @@ function normalizeCandidate(raw) {
     };
 }
 /**
- * 生成预算内的岗位计划。
+ * 把候选岗位归类成计划。
+ *
+ * 只有三种理由会让岗位「不能立刻派」：岗位被禁用（disabled）、能力不满足（vacant）、
+ * 超出操作者的 `max_posts`（deferred）。**没有**任何「剩余席位不足」这一类 —— 那件事宿主不说，
+ * 我们也不猜。
  */
-export function planBudget({ candidates = [], remainingMemberSlots = null, remainingActivations = null, reuseCandidates = [], maxPosts = 6, reservedMemberSlots = 1, reservedActivations = 2, } = {}) {
-    const reservedSeats = toNonNegativeInt(reservedMemberSlots, 0);
-    const reservedActs = toNonNegativeInt(reservedActivations, 0);
+export function planPosts({ candidates = [], maxPosts = 6 } = {}) {
     const postLimit = toNonNegativeInt(maxPosts, 6);
-    const remainingSeats = toNonNegativeInt(remainingMemberSlots, null);
-    const remainingActs = toNonNegativeInt(remainingActivations, null);
-    // 可新增成员数受「剩余席位 − 预留」与「剩余 activation − 预留」共同限制。
-    const availableSeats = remainingSeats === null ? null : Math.max(0, remainingSeats - reservedSeats);
-    const availableActs = remainingActs === null ? null : Math.max(0, remainingActs - reservedActs);
-    const reuseByPost = new Map();
-    for (const reuse of Array.isArray(reuseCandidates) ? reuseCandidates : []) {
-        const record = recordOf(reuse);
-        const id = candidateId(record);
-        const member = record.member;
-        if (!id || typeof member !== 'string' || member.length === 0)
-            continue;
-        const entry = { member, activation_increment: record.activation_increment };
-        const list = reuseByPost.get(id);
-        if (list === undefined)
-            reuseByPost.set(id, [entry]);
-        else
-            list.push(entry);
-    }
-    for (const list of reuseByPost.values()) {
-        // 同一岗位有多个可用复用人选时，按成员名稳定取第一个，避免结果依赖输入顺序。
-        list.sort((a, b) => (a.member < b.member ? -1 : a.member > b.member ? 1 : 0));
-    }
     const assigned = [];
     const vacant = [];
     const deferred = [];
@@ -99,9 +79,6 @@ export function planBudget({ candidates = [], remainingMemberSlots = null, remai
     const gaps = [];
     const seen = new Set();
     let usedPosts = 0;
-    let seatsLeft = availableSeats;
-    let actsLeft = availableActs;
-    let recommended = 0;
     const ordered = (Array.isArray(candidates) ? candidates : [])
         .map((raw, index) => ({ candidate: normalizeCandidate(raw), index }))
         .sort((left, right) => {
@@ -120,7 +97,7 @@ export function planBudget({ candidates = [], remainingMemberSlots = null, remai
             continue;
         }
         if (seen.has(candidate.post_id)) {
-            gaps.push(gap('INVALID_ARGUMENT', `候选岗位 ${candidate.post_id} 重复出现，只处理一次`, '按 post_id 去重后再做预算裁剪'));
+            gaps.push(gap('INVALID_ARGUMENT', `候选岗位 ${candidate.post_id} 重复出现，只处理一次`, '按 post_id 去重后再做岗位计划'));
             continue;
         }
         seen.add(candidate.post_id);
@@ -133,7 +110,7 @@ export function planBudget({ candidates = [], remainingMemberSlots = null, remai
             continue;
         }
         if (candidate.running) {
-            // 已运行岗位不因降低预算被取消；它占一个 max_posts 名额。
+            // 已运行岗位不因降低 max_posts 被取消；它占一个 max_posts 名额。
             assigned.push(postEntry(candidate, 'assigned', candidate.member, candidate.member
                 ? `已运行岗位保留，成员 ${candidate.member}，计入 max_posts`
                 : '已运行岗位保留，计入 max_posts'));
@@ -162,66 +139,11 @@ export function planBudget({ candidates = [], remainingMemberSlots = null, remai
         }
         if (usedPosts >= postLimit) {
             deferred.push(postEntry(candidate, 'deferred', null, `超出 max_posts=${postLimit}，按 priority 延后`));
-            gaps.push(gap('CAPACITY_EXHAUSTED', `岗位 ${candidate.post_id} 超出 max_posts=${postLimit}`, '提高 max_posts 或释放已运行岗位后重试'));
+            gaps.push(gap('CAPACITY_EXHAUSTED', `岗位 ${candidate.post_id} 超出 max_posts=${postLimit}`, MAX_POSTS_NEXT_STEP));
             continue;
         }
-        const reuse = reuseByPost.get(candidate.post_id)?.[0];
-        if (reuse) {
-            const increment = reuse.activation_increment;
-            if (!isInteger(increment) || increment < 0) {
-                deferred.push(postEntry(candidate, 'deferred', null, `复用成员 ${reuse.member} 的 activation 增量未知`));
-                gaps.push(gap('CAPACITY_UNKNOWN', `岗位 ${candidate.post_id} 复用成员 ${reuse.member} 时缺少宿主报告的 activation 增量`, '先由 teamAdapter 取得本次复用所需的 activation 增量，再重试；不要假定 inactive 成员自动释放额度'));
-                continue;
-            }
-            if (actsLeft === null) {
-                deferred.push(postEntry(candidate, 'deferred', null, 'activation 余额未知，无法确认复用额度'));
-                gaps.push(gap('CAPACITY_UNKNOWN', `岗位 ${candidate.post_id} 需要复用成员 ${reuse.member}，但 activation 余额未知`, UNKNOWN_NEXT_STEP));
-                continue;
-            }
-            if (increment > actsLeft) {
-                deferred.push(postEntry(candidate, 'deferred', null, `activation 不足：需要 ${increment}，可用 ${actsLeft}`));
-                gaps.push(gap('CAPACITY_EXHAUSTED', `岗位 ${candidate.post_id} 复用成员需要 ${increment} 个 activation，余额只剩 ${actsLeft}`, NEW_MEMBER_NEXT_STEP));
-                continue;
-            }
-            actsLeft -= increment;
-            assigned.push(postEntry(candidate, 'assigned', reuse.member, `复用已有成员 ${reuse.member}：只消耗 ${increment} 个 activation，不扣新席位`));
-            usedPosts += 1;
-            continue;
-        }
-        // 新成员：一席 + 一次启动额度。
-        if (seatsLeft === null || actsLeft === null) {
-            deferred.push(postEntry(candidate, 'deferred', null, `${seatsLeft === null ? '成员席位' : 'activation'}余额未知，不能盲目新建成员`));
-            gaps.push(gap('CAPACITY_UNKNOWN', `岗位 ${candidate.post_id} 需要新建成员，但${seatsLeft === null ? '剩余成员席位' : '剩余 activation'}未知`, UNKNOWN_NEXT_STEP));
-            continue;
-        }
-        if (seatsLeft < 1 || actsLeft < 1) {
-            deferred.push(postEntry(candidate, 'deferred', null, `预算不足：剩余席位 ${seatsLeft}，剩余 activation ${actsLeft}`));
-            gaps.push(gap('CAPACITY_EXHAUSTED', `岗位 ${candidate.post_id} 需要新建成员，但剩余席位 ${seatsLeft}、剩余 activation ${actsLeft}`, NEW_MEMBER_NEXT_STEP));
-            continue;
-        }
-        seatsLeft -= 1;
-        actsLeft -= 1;
-        recommended += 1;
-        assigned.push(postEntry(candidate, 'assigned', null, '预算内可选，需要新建 1 名成员'));
+        assigned.push(postEntry(candidate, 'assigned', null, '能力已满足，需要新建 1 名成员（能否建成由宿主决定）'));
         usedPosts += 1;
     }
-    return {
-        assigned,
-        vacant,
-        deferred,
-        disabled,
-        gaps,
-        recommended_members: recommended,
-        capacity: {
-            known: remainingSeats !== null && remainingActs !== null,
-            member_slots_known: remainingSeats !== null,
-            activations_known: remainingActs !== null,
-            remaining_member_slots: remainingSeats,
-            remaining_activations: remainingActs,
-            reserved_member_slots: reservedSeats,
-            reserved_activations: reservedActs,
-            available_member_slots: availableSeats,
-            available_activations: availableActs,
-        },
-    };
+    return { assigned, vacant, deferred, disabled, gaps };
 }
