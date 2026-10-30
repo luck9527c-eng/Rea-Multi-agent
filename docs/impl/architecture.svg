@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="830" viewBox="0 0 1240 830" font-family="'Microsoft YaHei','PingFang SC',sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6b7c"/>
+    </marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2f6f9f"/>
+    </marker>
+  </defs>
+
+  <rect width="1240" height="830" fill="#fbfcfd"/>
+  <text x="40" y="36" font-size="20" font-weight="bold" fill="#1f2a35">dsh-redteam-lead 架构：3 个工具 · 2 个适配器 · 1 套可复查账目</text>
+  <text x="40" y="58" font-size="13" fill="#6b7a88">29 个模块 / 19.3k 行 TypeScript；零运行时依赖、零 @deepseek-ai/* 导入；硬依赖只有 tools</text>
+
+  <!-- 调用方 -->
+  <rect x="40" y="76" width="300" height="46" rx="8" fill="#eef4fa" stroke="#2f6f9f" stroke-width="1.5"/>
+  <text x="190" y="96" font-size="15" font-weight="bold" fill="#1f2a35" text-anchor="middle">红队指挥（Lead 会话）</text>
+  <text x="190" y="113" font-size="12" fill="#5b6b7c" text-anchor="middle">或被派发的执行成员</text>
+
+  <!-- 入口 -->
+  <rect x="40" y="146" width="1160" height="56" rx="8" fill="#fff" stroke="#2f6f9f" stroke-width="2"/>
+  <text x="58" y="170" font-size="15" font-weight="bold" fill="#1f2a35">index.ts —— 入口（680 行）</text>
+  <text x="58" y="190" font-size="12.5" fill="#4a5b6b">tools.register(rt_roster, rt_dispatch, rt_conclude)　·　inject = ['tools']　·　agentTeams 走 ctx.get 探针 + 降级　·　整封回执按 $defs.result 校验</text>
+  <line x1="190" y1="122" x2="190" y2="144" stroke="#2f6f9f" stroke-width="2" marker-end="url(#b)"/>
+
+  <!-- 分层容器 -->
+  <rect x="40" y="222" width="1160" height="322" rx="10" fill="#f4f7fa" stroke="#c3ced9" stroke-width="1.5"/>
+  <line x1="190" y1="202" x2="190" y2="220" stroke="#2f6f9f" stroke-width="2" marker-end="url(#b)"/>
+
+  <rect x="58" y="236" width="1124" height="62" rx="7" fill="#fff" stroke="#8aa6bf"/>
+  <text x="74" y="258" font-size="14" font-weight="bold" fill="#1f2a35">① 契约与校验层</text>
+  <text x="74" y="280" font-size="12" fill="#4a5b6b">validate.ts　·　tool-schema.ts（specs 的逐字副本，有漂移用例）　·　envelope.ts　·　errors.ts　·　guards.ts　·　types.ts</text>
+
+  <rect x="58" y="308" width="1124" height="62" rx="7" fill="#fff" stroke="#8aa6bf"/>
+  <text x="74" y="330" font-size="14" font-weight="bold" fill="#1f2a35">② 编排层：三个工具的实现</text>
+  <text x="74" y="352" font-size="12" fill="#4a5b6b">roster.ts(1725)　·　dispatch.ts(2451)　·　conclude.ts(2405)　·　contract.ts(1136)　·　submission.ts　·　anchors.ts</text>
+
+  <rect x="58" y="380" width="1124" height="62" rx="7" fill="#fff" stroke="#8aa6bf"/>
+  <text x="74" y="402" font-size="14" font-weight="bold" fill="#1f2a35">③ 账目与一致性层</text>
+  <text x="74" y="424" font-size="12" fill="#4a5b6b">binding.ts　·　baseline.ts(507)　·　resources.ts　·　operation.ts（幂等台账）　·　audit.ts　·　lock.ts(322)</text>
+
+  <rect x="58" y="452" width="1124" height="62" rx="7" fill="#fff" stroke="#8aa6bf"/>
+  <text x="74" y="474" font-size="14" font-weight="bold" fill="#1f2a35">④ 基础设施与判定</text>
+  <text x="74" y="496" font-size="12" fill="#4a5b6b">atomic.ts　·　paths.ts　·　identity.ts　·　catalog.ts　·　capability.ts　·　compatibility.ts　·　doctor.ts　·　capacity.ts(planPosts)</text>
+
+  <text x="58" y="534" font-size="11.5" fill="#8a97a4">（4 层是职责分组，不是调用栈；同层可互相调用，下层不知道上层）</text>
+
+  <!-- 适配器 -->
+  <rect x="40" y="576" width="560" height="76" rx="8" fill="#eef7f0" stroke="#3f7f57" stroke-width="2"/>
+  <text x="58" y="600" font-size="14" font-weight="bold" fill="#1f2a35">teamAdapter —— 人由宿主管</text>
+  <text x="58" y="620" font-size="12" fill="#3f5b48">spawnTeammate　·　send_message　·　wait_agent　·　createTask/reassign</text>
+  <text x="58" y="640" font-size="12" fill="#3f5b48">只读 listMembers 数「已用席位」；上限不读、不猜、不预留</text>
+
+  <rect x="640" y="576" width="560" height="76" rx="8" fill="#fdf4ec" stroke="#b4703a" stroke-width="2"/>
+  <text x="658" y="600" font-size="14" font-weight="bold" fill="#1f2a35">projectAdapter —— 账由 skill 管</text>
+  <text x="658" y="620" font-size="12" fill="#6b4a2f">python .agents/skills/reverse-project-management/scripts/project.py</text>
+  <text x="658" y="640" font-size="12" fill="#6b4a2f">seal　·　impact　·　index　·　check --hashes（插件不重写算法）</text>
+
+  <line x1="330" y1="546" x2="330" y2="574" stroke="#5b6b7c" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="920" y1="546" x2="920" y2="574" stroke="#5b6b7c" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- 产物 -->
+  <rect x="40" y="692" width="560" height="104" rx="8" fill="#fff" stroke="#3f7f57" stroke-dasharray="5 4"/>
+  <text x="58" y="714" font-size="13" font-weight="bold" fill="#1f2a35">宿主侧状态（权威）</text>
+  <text x="58" y="735" font-size="12" fill="#4a5b6b">成员名册 / 任务板 / 消息队列 / 席位占用</text>
+  <text x="58" y="755" font-size="12" fill="#4a5b6b">⇒ 这些都不是插件的文件，只能通过适配器访问</text>
+  <text x="58" y="778" font-size="11.5" fill="#8a97a4">re/team/roster.json 只是 bind 时刻的计划快照，不是成员表</text>
+
+  <rect x="640" y="692" width="560" height="104" rx="8" fill="#fff" stroke="#b4703a" stroke-dasharray="5 4"/>
+  <text x="658" y="714" font-size="13" font-weight="bold" fill="#1f2a35">项目文件（re/）</text>
+  <text x="658" y="735" font-size="12" fill="#4a5b6b">skill 拥有：re/targets.json · routes/ · runs/ · seals/ · INDEX.md</text>
+  <text x="658" y="755" font-size="12" fill="#4a5b6b">插件拥有：re/team/　binding · dispatches · baselines · receipts · attempts ·</text>
+  <text x="658" y="772" font-size="12" fill="#4a5b6b">　　　　　work · operations · audit · resources · capabilities · lock</text>
+
+  <line x1="320" y1="652" x2="320" y2="690" stroke="#5b6b7c" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="920" y1="652" x2="920" y2="690" stroke="#5b6b7c" stroke-width="2" marker-end="url(#a)"/>
+
+  <text x="40" y="822" font-size="11.5" fill="#8a97a4">关键不变量：单写者锁（re/team/lock）· operation_id 幂等台账 · 派发时冻结基线 · 结论必须挂锚点 · 只有 rt_conclude 的收据算落定</text>
+</svg>
