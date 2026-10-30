@@ -1,29 +1,31 @@
-// 席位 / activation 预算裁剪（纯函数）。
+// 岗位计划（原「席位 / activation 预算裁剪」；T23 起本模块**不做任何容量规划**）。
 //
-// 输入是显式余额与候选岗位；不读宿主、不猜 8/16、不按常数假定余额。
+// 为什么只剩这些：宿主不提供任何上限读数 —— `maxMembers` 是 `TeamService` 的构造函数参数，
+// 没有 getter 也没有 state 投影；`maxActiveSubagents` 在团队服务里根本不存在。它自己的强制执行
+// 就是唯一的上限事实（拒绝时抛 `TEAM_MEMBER_LIMIT` / `ACTIVATION_LIMIT_REACHED`）。
+// 所以「还能开几个」这个问题本模块不回答，也不猜；派不派只看**能力是否满足**与操作者给的 `max_posts`。
+//
+// 输入是候选岗位；不读宿主、不猜 8/16、不按常数假定余额。
 // 选择顺序：priority 升序，同值按 post_id 升序；已运行岗位永远保留且占 max_posts。
 
 import { isRecord, recordOf } from './guards.js';
 
-const NEW_MEMBER_NEXT_STEP =
-  '在 re/team/capacity.json 声明 maxMembers/maxActiveSubagents（或改 profile config），或释放已有成员/activation 后重试';
-const UNKNOWN_NEXT_STEP =
-  '在 re/team/capacity.json 显式声明 maxMembers/maxActiveSubagents（含 declared_at/declared_by），不要假定固定余额';
+const MAX_POSTS_NEXT_STEP = '提高 max_posts（本次调用或岗位目录 defaults.max_posts），或减少目标类别后重试';
 
 /** 岗位在计划里的去向（`$defs.post.state` 的子集）。 */
-export type BudgetPostState = 'assigned' | 'vacant' | 'deferred' | 'disabled';
+export type PostPlanState = 'assigned' | 'vacant' | 'deferred' | 'disabled';
 
-/** 一条预算缺口（`$defs.diagnostic` 的三字段）。 */
-export interface BudgetGap {
+/** 一条缺口（`$defs.diagnostic` 的三字段）。 */
+export interface PostPlanGap {
   code: string;
   reason: string;
   next_step: string;
 }
 
 /** `assigned/vacant/deferred/disabled` 里的一项（`$defs.post` 的 7 字段形状）。 */
-export interface BudgetPostEntry {
+export interface PostPlanEntry {
   post_id: string | null;
-  state: BudgetPostState;
+  state: PostPlanState;
   required: string[];
   optional: string[];
   anchors_required: string[];
@@ -31,48 +33,20 @@ export interface BudgetPostEntry {
   reason: string;
 }
 
-/** 内部形状：投进 `rosterData.capacity` 前只能保留 schema 的 4 个字段（D19）。 */
-export interface BudgetCapacity {
-  known: boolean;
-  member_slots_known: boolean;
-  activations_known: boolean;
-  remaining_member_slots: number | null;
-  remaining_activations: number | null;
-  reserved_member_slots: number;
-  reserved_activations: number;
-  available_member_slots: number | null;
-  available_activations: number | null;
+/** `planPosts()` 的返回。 */
+export interface PostPlan {
+  assigned: PostPlanEntry[];
+  vacant: PostPlanEntry[];
+  deferred: PostPlanEntry[];
+  disabled: PostPlanEntry[];
+  gaps: PostPlanGap[];
 }
 
-/** `planBudget()` 的返回。 */
-export interface BudgetPlan {
-  assigned: BudgetPostEntry[];
-  vacant: BudgetPostEntry[];
-  deferred: BudgetPostEntry[];
-  disabled: BudgetPostEntry[];
-  gaps: BudgetGap[];
-  recommended_members: number;
-  capacity: BudgetCapacity;
-}
-
-/**
- * `planBudget()` 的入参。
- *
- * 余额/上限一律按「调用方给什么就收什么」声明：`null`=未知，非法值按缺省处理
- * （裁剪前会再过一遍 `toNonNegativeInt`），所以这里写 `unknown` 而不是假装一定是 number。
- */
-export interface PlanBudgetInput {
+/** `planPosts()` 的入参：候选岗位 + 操作者的岗位数上限。 */
+export interface PlanPostsInput {
   /** 候选岗位（可含 enabled/running/member/capability）。 */
   candidates?: unknown;
-  /** 宿主报告的剩余成员席位；null=未知。 */
-  remainingMemberSlots?: unknown;
-  /** 宿主报告的剩余 activation；null=未知。 */
-  remainingActivations?: unknown;
-  /** 复用项：`{post_id|id, member, activation_increment}`。 */
-  reuseCandidates?: unknown;
   maxPosts?: unknown;
-  reservedMemberSlots?: unknown;
-  reservedActivations?: unknown;
 }
 
 /** 规范化后的候选岗位。 */
@@ -91,12 +65,6 @@ interface NormalizedCandidate {
   capability: unknown;
 }
 
-/** 复用候选（只读两个字段，其余字段与裁剪无关）。 */
-interface ReuseCandidate {
-  member: string;
-  activation_increment: unknown;
-}
-
 /** 非负整数或 `fallback`；`fallback` 缺省时返回 null。 */
 function toNonNegativeInt(value: unknown, fallback: number): number;
 function toNonNegativeInt(value: unknown, fallback: null): number | null;
@@ -109,24 +77,20 @@ function toNonNegativeInt(value: unknown, fallback: number | null | undefined): 
   return Math.max(0, Math.floor(value));
 }
 
-function isInteger(value: unknown): value is number {
-  return Number.isInteger(value);
-}
-
 function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [];
 }
 
-function gap(code: string, reason: string, nextStep: string): BudgetGap {
+function gap(code: string, reason: string, nextStep: string): PostPlanGap {
   return { code, reason, next_step: nextStep };
 }
 
 function postEntry(
   candidate: NormalizedCandidate,
-  state: BudgetPostState,
+  state: PostPlanState,
   member: string | null,
   reason: string,
-): BudgetPostEntry {
+): PostPlanEntry {
   return {
     post_id: candidate.post_id,
     state,
@@ -167,53 +131,22 @@ function normalizeCandidate(raw: unknown): NormalizedCandidate {
 }
 
 /**
- * 生成预算内的岗位计划。
+ * 把候选岗位归类成计划。
+ *
+ * 只有三种理由会让岗位「不能立刻派」：岗位被禁用（disabled）、能力不满足（vacant）、
+ * 超出操作者的 `max_posts`（deferred）。**没有**任何「剩余席位不足」这一类 —— 那件事宿主不说，
+ * 我们也不猜。
  */
-export function planBudget({
-  candidates = [],
-  remainingMemberSlots = null,
-  remainingActivations = null,
-  reuseCandidates = [],
-  maxPosts = 6,
-  reservedMemberSlots = 1,
-  reservedActivations = 2,
-}: PlanBudgetInput = {}): BudgetPlan {
-  const reservedSeats = toNonNegativeInt(reservedMemberSlots, 0);
-  const reservedActs = toNonNegativeInt(reservedActivations, 0);
+export function planPosts({ candidates = [], maxPosts = 6 }: PlanPostsInput = {}): PostPlan {
   const postLimit = toNonNegativeInt(maxPosts, 6);
-  const remainingSeats = toNonNegativeInt(remainingMemberSlots, null);
-  const remainingActs = toNonNegativeInt(remainingActivations, null);
 
-  // 可新增成员数受「剩余席位 − 预留」与「剩余 activation − 预留」共同限制。
-  const availableSeats = remainingSeats === null ? null : Math.max(0, remainingSeats - reservedSeats);
-  const availableActs = remainingActs === null ? null : Math.max(0, remainingActs - reservedActs);
-
-  const reuseByPost = new Map<string, ReuseCandidate[]>();
-  for (const reuse of Array.isArray(reuseCandidates) ? reuseCandidates : []) {
-    const record = recordOf(reuse);
-    const id = candidateId(record);
-    const member = record.member;
-    if (!id || typeof member !== 'string' || member.length === 0) continue;
-    const entry: ReuseCandidate = { member, activation_increment: record.activation_increment };
-    const list = reuseByPost.get(id);
-    if (list === undefined) reuseByPost.set(id, [entry]);
-    else list.push(entry);
-  }
-  for (const list of reuseByPost.values()) {
-    // 同一岗位有多个可用复用人选时，按成员名稳定取第一个，避免结果依赖输入顺序。
-    list.sort((a, b) => (a.member < b.member ? -1 : a.member > b.member ? 1 : 0));
-  }
-
-  const assigned: BudgetPostEntry[] = [];
-  const vacant: BudgetPostEntry[] = [];
-  const deferred: BudgetPostEntry[] = [];
-  const disabled: BudgetPostEntry[] = [];
-  const gaps: BudgetGap[] = [];
+  const assigned: PostPlanEntry[] = [];
+  const vacant: PostPlanEntry[] = [];
+  const deferred: PostPlanEntry[] = [];
+  const disabled: PostPlanEntry[] = [];
+  const gaps: PostPlanGap[] = [];
   const seen = new Set<string>();
   let usedPosts = 0;
-  let seatsLeft = availableSeats;
-  let actsLeft = availableActs;
-  let recommended = 0;
 
   const ordered = (Array.isArray(candidates) ? candidates : [])
     .map((raw: unknown, index: number) => ({ candidate: normalizeCandidate(raw), index }))
@@ -236,7 +169,7 @@ export function planBudget({
       gaps.push(gap(
         'INVALID_ARGUMENT',
         `候选岗位 ${candidate.post_id} 重复出现，只处理一次`,
-        '按 post_id 去重后再做预算裁剪',
+        '按 post_id 去重后再做岗位计划',
       ));
       continue;
     }
@@ -252,7 +185,7 @@ export function planBudget({
     }
 
     if (candidate.running) {
-      // 已运行岗位不因降低预算被取消；它占一个 max_posts 名额。
+      // 已运行岗位不因降低 max_posts 被取消；它占一个 max_posts 名额。
       assigned.push(postEntry(
         candidate,
         'assigned',
@@ -299,120 +232,19 @@ export function planBudget({
       gaps.push(gap(
         'CAPACITY_EXHAUSTED',
         `岗位 ${candidate.post_id} 超出 max_posts=${postLimit}`,
-        '提高 max_posts 或释放已运行岗位后重试',
+        MAX_POSTS_NEXT_STEP,
       ));
       continue;
     }
 
-    const reuse = reuseByPost.get(candidate.post_id)?.[0];
-    if (reuse) {
-      const increment = reuse.activation_increment;
-      if (!isInteger(increment) || increment < 0) {
-        deferred.push(postEntry(
-          candidate,
-          'deferred',
-          null,
-          `复用成员 ${reuse.member} 的 activation 增量未知`,
-        ));
-        gaps.push(gap(
-          'CAPACITY_UNKNOWN',
-          `岗位 ${candidate.post_id} 复用成员 ${reuse.member} 时缺少宿主报告的 activation 增量`,
-          '先由 teamAdapter 取得本次复用所需的 activation 增量，再重试；不要假定 inactive 成员自动释放额度',
-        ));
-        continue;
-      }
-      if (actsLeft === null) {
-        deferred.push(postEntry(candidate, 'deferred', null, 'activation 余额未知，无法确认复用额度'));
-        gaps.push(gap(
-          'CAPACITY_UNKNOWN',
-          `岗位 ${candidate.post_id} 需要复用成员 ${reuse.member}，但 activation 余额未知`,
-          UNKNOWN_NEXT_STEP,
-        ));
-        continue;
-      }
-      if (increment > actsLeft) {
-        deferred.push(postEntry(
-          candidate,
-          'deferred',
-          null,
-          `activation 不足：需要 ${increment}，可用 ${actsLeft}`,
-        ));
-        gaps.push(gap(
-          'CAPACITY_EXHAUSTED',
-          `岗位 ${candidate.post_id} 复用成员需要 ${increment} 个 activation，余额只剩 ${actsLeft}`,
-          NEW_MEMBER_NEXT_STEP,
-        ));
-        continue;
-      }
-      actsLeft -= increment;
-      assigned.push(postEntry(
-        candidate,
-        'assigned',
-        reuse.member,
-        `复用已有成员 ${reuse.member}：只消耗 ${increment} 个 activation，不扣新席位`,
-      ));
-      usedPosts += 1;
-      continue;
-    }
-
-    // 新成员：一席 + 一次启动额度。
-    if (seatsLeft === null || actsLeft === null) {
-      deferred.push(postEntry(
-        candidate,
-        'deferred',
-        null,
-        `${seatsLeft === null ? '成员席位' : 'activation'}余额未知，不能盲目新建成员`,
-      ));
-      gaps.push(gap(
-        'CAPACITY_UNKNOWN',
-        `岗位 ${candidate.post_id} 需要新建成员，但${seatsLeft === null ? '剩余成员席位' : '剩余 activation'}未知`,
-        UNKNOWN_NEXT_STEP,
-      ));
-      continue;
-    }
-    if (seatsLeft < 1 || actsLeft < 1) {
-      deferred.push(postEntry(
-        candidate,
-        'deferred',
-        null,
-        `预算不足：剩余席位 ${seatsLeft}，剩余 activation ${actsLeft}`,
-      ));
-      gaps.push(gap(
-        'CAPACITY_EXHAUSTED',
-        `岗位 ${candidate.post_id} 需要新建成员，但剩余席位 ${seatsLeft}、剩余 activation ${actsLeft}`,
-        NEW_MEMBER_NEXT_STEP,
-      ));
-      continue;
-    }
-    seatsLeft -= 1;
-    actsLeft -= 1;
-    recommended += 1;
     assigned.push(postEntry(
       candidate,
       'assigned',
       null,
-      '预算内可选，需要新建 1 名成员',
+      '能力已满足，需要新建 1 名成员（能否建成由宿主决定）',
     ));
     usedPosts += 1;
   }
 
-  return {
-    assigned,
-    vacant,
-    deferred,
-    disabled,
-    gaps,
-    recommended_members: recommended,
-    capacity: {
-      known: remainingSeats !== null && remainingActs !== null,
-      member_slots_known: remainingSeats !== null,
-      activations_known: remainingActs !== null,
-      remaining_member_slots: remainingSeats,
-      remaining_activations: remainingActs,
-      reserved_member_slots: reservedSeats,
-      reserved_activations: reservedActs,
-      available_member_slots: availableSeats,
-      available_activations: availableActs,
-    },
-  };
+  return { assigned, vacant, deferred, disabled, gaps };
 }

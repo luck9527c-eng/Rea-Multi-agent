@@ -8,27 +8,34 @@
  *    本包必须自己做）。
  * 2. **inspect 零副作用**：不建成员、不建任务、不写 binding/roster，**也不写审计**
  *    （编排契约「roster inspect 不落盘」；审计只属于 bind/takeover 这类有后果的操作）。
- * 3. **容量口径照 DECISIONS D25**：上限未声明（`activations.known === false`）→ 传 `null` 让
- *    `planBudget` 延后 + `CAPACITY_UNKNOWN`；上限已声明 → 传**声明上限**（不是不可观测的占用），
- *    并把 `cap.gaps` 原样并入 `gaps` 作非阻塞诊断。`rosterData.capacity` 只投影 schema 的 4 个
- *    字段，未知用 `null`，`known` 不上线（D19）。
+ * 3. **不做容量规划**（T23 / D41）：宿主不提供上限读数，所以本模块只把**能力**与操作者的
+ *    `max_posts` 投影成岗位状态；已用席位数作为一条普通诊断如实报出（来自 `listMembers`），
+ *    **不**据此裁剪、不猜上限、不声称「还能开几个」。`rosterData.capacity` 的四个字段是 wire
+ *    schema 的必备键（`docs/specs` 由 Lead 维护），这里一律填「未知」：`remaining_*` 为 `null`、
+ *    `reserved_*` 为 0（本插件不再预留任何席位）。
  *
- * 提议哈希（`proposal_hash`）绑定：提议内容（岗位需求 + 目标类别 + 预算参数 + **已解析的容量声明**
- * `maxMembers`/`maxActiveSubagents`）、岗位目录版本、能力映射版本、规则/脚本/目录摘要、以及
- * **当前绑定**（epoch/session/team/摘要）。宿主**占用计数**（`used`/`remaining`）**不进**哈希 ——
- * bind 在项目锁内重读计数，资源不足时要求重新提议（不能沿旧快照超配）。
+ * 提议哈希（`proposal_hash`）绑定：提议内容（岗位需求 + 目标类别 + `max_posts`）、岗位目录版本、
+ * 能力映射版本、规则/脚本/目录摘要、以及**当前绑定**（epoch/session/team/摘要）。宿主**占用计数**
+ * （`used`）**不进**哈希 —— 它随时会变，且不再影响任何岗位判定。
  */
 import { createHash } from 'node:crypto';
 import * as envelopeModule from './envelope.js';
 import * as bindingModule from './binding.js';
-import * as capacitySource from './capacity-source.js';
 import { toolNamesFromSchemas } from './capability.js';
 import { isRecord, recordOf, thrownMessage } from './guards.js';
 const TOOL = 'rt_roster';
 const SHA256 = /^[0-9a-f]{64}$/u;
 const OPERATION_ID = /^[a-z0-9][a-z0-9_-]{0,95}$/u;
 const LEAD_ONLY = new Set(['bind', 'takeover']);
-const CAPACITY_CODES = new Set(['CAPACITY_UNKNOWN', 'CAPACITY_EXHAUSTED']);
+/** 只剩 `max_posts` 这一种「提议放不下」：宿主容量不在这里判（T23）。 */
+const POST_LIMIT_CODE = 'CAPACITY_EXHAUSTED';
+/**
+ * 已随 T23 废止、但 wire schema 仍接受的入参名。
+ *
+ * `docs/specs/rt-tools.schema.json` 由 Lead 维护，本包不改；`$defs.rosterInput` 里这四个键还在，
+ * 所以校验会放行。既然放行，就必须说清「收到了但没用」——静默丢掉等于让调用方以为上限生效了。
+ */
+const OBSOLETE_CAPACITY_ARGS = ['capacity', 'reserved_member_slots', 'reserved_activations'];
 const ADAPTER_CONTRACT_VERSION = 1;
 /** `probe().gaps` 里「项目未按 skill 默认布局建好」的那一类 → PROJECT_NOT_CONFIGURED。 */
 const NOT_CONFIGURED_GAP_CODES = new Set([
@@ -278,7 +285,7 @@ function composeTemplateFor(deps, kinds, env) {
     }
     return { ok: true, templateId, composed, catalogVersion: recordOf(catalogValue).catalog_version ?? null };
 }
-/** 一个岗位的候选条目（`planBudget` 的入参形状）。 */
+/** 一个岗位的候选条目（`planPosts` 的入参形状）。 */
 function candidateOf(post, { capability, running, member }) {
     return {
         post_id: post.id,
@@ -358,26 +365,10 @@ function bindingStateOf(bindingFile) {
     };
 }
 /**
- * 从 `capacity()` 的结果里取**声明上限**。
+ * 提议指纹：确定性内容，不含**宿主占用计数**（`used` 随时会变，且不再影响岗位判定）。
  *
- * 只取 `total`（`declared.maxMembers` / `declared.maxActiveSubagents`）：`used`/`remaining`
- * 是宿主计数，按契约在 bind 的锁内重读，不进哈希；`known` 混了「有没有声明」与
- * 「数不数得到占用」，同样不进哈希（未声明 → `null` 已经表达清楚）。
- */
-function declaredBudgetOf(cap) {
-    return {
-        max_members: typeof cap.memberSlots.total === 'number' ? cap.memberSlots.total : null,
-        max_active_subagents: typeof cap.activations.total === 'number' ? cap.activations.total : null,
-    };
-}
-/**
- * 提议指纹：确定性内容，不含**宿主占用计数**（`used`/`remaining` 在 bind 时于锁内重读）。
- *
- * `declared_budget` 是**已解析的容量声明**（`maxMembers`/`maxActiveSubagents`），不是计数：
- * 它决定 `planBudget()` 把哪些岗位判 `deferred`，因此属于「提议内容 + 预算」，必须进哈希 ——
- * 否则容量声明在 inspect 之后被改动时，bind 会静默沿旧提议落盘（T15 的 L3 证据
- * s2-rt_roster-capacity2.txt 与 capacity8 同 hash 就是这条漏项）。声明时间/声明人不进哈希：
- * 同样的数字重新声明一次不算换了提议。
+ * 唯一进哈希的「预算」是操作者的 `max_posts`：它决定 `planPosts()` 把哪些岗位判 `deferred`，
+ * 所以属于提议内容。容量声明（`maxMembers` 等）已随 T23 一起删除，不再进哈希。
  *
  * `proposal_hash = sha256(按键排序的 JSON(指纹))`。
  */
@@ -392,7 +383,6 @@ function proposalFingerprint(input) {
         catalog: { version: input.catalogVersion, digest: input.digests.catalogDigest },
         capability: input.capabilityVersion,
         budget: input.budget,
-        declared_budget: input.declaredBudget,
         posts: input.staticPosts,
         digests: input.digests,
         binding: input.bindingState,
@@ -422,16 +412,20 @@ function rosterDataOf(input) {
         binding_ref: input.bindingRef,
     };
 }
-/** D19：只有 4 个字段，未知用 null，`known` 不上线。 */
-function projectCapacity(planCapacity) {
-    const capacity = recordOf(planCapacity);
-    return {
-        remaining_member_slots: capacity.available_member_slots ?? null,
-        remaining_activations: capacity.available_activations ?? null,
-        reserved_member_slots: capacity.reserved_member_slots ?? 0,
-        reserved_activations: capacity.reserved_activations ?? 0,
-    };
-}
+/**
+ * `rosterData.capacity`（D19：恰好 4 个字段，没有 `known`）。
+ *
+ * 这四个键是 wire schema 的必备字段（`docs/specs` 由 Lead 维护，本包不改），但本插件**不再做
+ * 任何容量规划**：`remaining_*` 是「不知道」（宿主的 `maxMembers` 没有 getter），`reserved_*`
+ * 是 0（不再预留席位）。填 `null` / `0` 而不是删字段 —— 既过得了 `$defs.rosterData`，
+ * 也不假装知道余额。
+ */
+const NO_CAPACITY_PLAN = Object.freeze({
+    remaining_member_slots: null,
+    remaining_activations: null,
+    reserved_member_slots: 0,
+    reserved_activations: 0,
+});
 /** 按目录优先级（priority 升序、同值 post_id 升序）输出岗位，便于人读与 diff。 */
 function orderPosts(entries, priorityOf) {
     const list = Array.isArray(entries) ? entries : [];
@@ -455,88 +449,63 @@ function orderPosts(entries, priorityOf) {
         return left.post_id < right.post_id ? -1 : 1;
     });
 }
-async function readCapacity(deps, root, env) {
-    const adapter = deps.teamAdapter;
-    if (!adapter || typeof adapter.capacity !== 'function') {
-        return {
-            ok: false,
-            code: 'TEAM_SERVICE_UNAVAILABLE',
-            diagnostics: [env.diagnostic('TEAM_SERVICE_UNAVAILABLE', '没有团队适配器，取不到成员席位与 activation 上限', NEXT_STEP_SERVICE)],
-            memberSlots: { known: false, remaining: null, total: null, used: null },
-            activations: { known: false, remaining: null, total: null },
-            gaps: [],
-        };
-    }
-    const value = await adapter.capacity();
-    if (!value || typeof value !== 'object') {
-        return {
-            ok: false,
-            code: 'RECOVERY_REQUIRED',
-            diagnostics: [env.diagnostic('RECOVERY_REQUIRED', '团队适配器没有返回容量对象', '核对 team-adapter 版本后重试')],
-            memberSlots: { known: false, remaining: null, total: null, used: null },
-            activations: { known: false, remaining: null, total: null },
-            gaps: [],
-        };
-    }
-    // 诊断用：项目里明明声明了容量，但适配器没读到（典型原因是装配时没把 project_root 交给它）。
-    // 这里只**报告**，不改预算口径 —— 容量仍按适配器给的值走（D1/D25）。
-    if (value.memberSlots?.total === null && typeof adapter.readDeclaredCapacity === 'function') {
-        try {
-            const declared = recordOf(await adapter.readDeclaredCapacity(root));
-            if (declared.known === true) {
-                const gaps = Array.isArray(value.gaps) ? value.gaps : [];
-                return {
-                    ...value,
-                    gaps: [...gaps, {
-                            code: 'CAPACITY_DECLARATION_UNREAD',
-                            detail: `项目声明了容量（${declared.path ?? 're/team/capacity.json'}：maxMembers=${declared.maxMembers}、maxActiveSubagents=${declared.maxActiveSubagents}），但团队适配器没有读到它`,
-                            nextStep: '由装配层把本次 project_root 传给 createTeamAdapter（或把容量声明放进 profile 的 config.capacity）；在此之前按 CAPACITY_UNKNOWN 处理，不猜余额',
-                        }],
-                };
-            }
-        }
-        catch {
-            // 诊断失败不影响容量口径
-        }
-    }
-    return value;
-}
-/** `capacity().gaps`（`{code, detail, nextStep}`）→ 诊断。 */
-function capacityGapsToDiagnostics(value) {
-    return (Array.isArray(value) ? value : []).map((raw) => {
-        const gap = recordOf(raw);
-        return {
-            code: isNonEmptyString(gap.code) ? gap.code : 'CAPACITY_UNKNOWN',
-            reason: isNonEmptyString(gap.detail) ? gap.detail : '容量声明或计数不可用',
-            next_step: isNonEmptyString(gap.nextStep)
-                ? gap.nextStep
-                : '在 re/team/capacity.json 声明 maxMembers/maxActiveSubagents（含 declared_at/declared_by）后重试',
-        };
-    });
-}
 /**
- * 解析本次提议的**生效容量**（T18 优先级）：按调用 > 项目 > profile > 本会话观测 > unknown。
+ * 已用席位（T23）：唯一能数到的那一件事，来自宿主 `listMembers`。
  *
- * 适配器（D1）已经把「项目 `re/team/capacity.json` > profile `config.capacity`」合过一次并给出
- * `evidence.source`，这里只在其上叠加「本次调用声明」与「本会话观测值」。观测值按会话隔离：
- * `session_id` 不匹配（或无法确定当前会话）就不套用，理由见 `capacity-source` 文件头。
+ * `null` = 数不到（适配器缺席 / `listMembers` 失败），**不**回落成 0，也不据此裁剪岗位。
  */
-async function effectiveCapacityFor(root, sessionId, call, declared) {
-    const observed = await capacitySource.readObservedCapacity(root, sessionId);
-    return capacitySource.resolveCapacity({ call, declared, observed });
+async function usedSeatsFor(deps) {
+    const adapter = deps.teamAdapter;
+    if (!adapter || typeof adapter.usedSeats !== 'function')
+        return null;
+    try {
+        const read = recordOf(await adapter.usedSeats());
+        return read.ok === true && typeof read.used === 'number' && Number.isSafeInteger(read.used) ? read.used : null;
+    }
+    catch {
+        return null;
+    }
 }
 /**
- * 调 `capacity.planBudget`。
+ * 名册自报的「已用席位」诊断：一条，只陈述事实。
  *
- * 入参形状由本模块的 `PlanBudgetInput` 给出；`capacity.PlanBudgetInput` 把每个字段都声明成
+ * 不参与任何裁剪、不声称「还剩几个」、不预测宿主的拒绝 —— 上限读不到是宿主的**设计**，
+ * 不是我们的缺口（T23 / D41）。
+ */
+function seatsDiagnostic(env, used) {
+    if (used === null) {
+        return env.diagnostic('TEAM_SEATS_UNKNOWN', '数不到宿主已用席位（团队服务或成员名册不可用）：这不影响岗位判断，但当前占用了几个成员是未知的', '确认 ctx.services.agentTeams 与 exec.agent 可用后重新 inspect');
+    }
+    return env.diagnostic('TEAM_SEATS_USED', `宿主成员名册当前已用 ${used} 席（role=teammate 的成员数，含失败成员；来自 listMembers）。`
+        + '宿主不提供上限读数，也不告诉你还能开几个：能不能建由宿主自己决定', '按岗位能力与实际需要派人；宿主拒绝时 rt_dispatch 会报 CAPACITY_EXHAUSTED 并逐字带回宿主原话');
+}
+/** 传了已废止的容量参数时的一条诊断（没有就返回 `null`）。 */
+function obsoleteCapacityDiagnostic(env, names) {
+    if (names.length === 0)
+        return null;
+    return env.diagnostic('CAPACITY_ARGUMENT_OBSOLETE', `容量子系统已删除（T23/D41）：本次传入的 ${names.join('、')} 不参与任何判定，也不会被记住。`
+        + '宿主的席位/activation 上限没有读法：派发直接调 spawnTeammate，被拒时按宿主原话报 CAPACITY_EXHAUSTED', '去掉这些参数即可；岗位能不能派只看能力是否满足（与 max_posts 的岗位数上限）');
+}
+/** 成功信封上那两条「只陈述事实」的诊断：已用席位 + 废止参数。 */
+function rosterNotes(env, usedSeats, obsolete) {
+    const out = [seatsDiagnostic(env, usedSeats)];
+    const stale = obsoleteCapacityDiagnostic(env, obsolete);
+    if (stale !== null)
+        out.push(stale);
+    return out;
+}
+/**
+ * 调 `capacity.planPosts`。
+ *
+ * 入参形状由本模块的 `PlanPostsInput` 给出；`capacity.PlanPostsInput` 把每个字段都声明成
  * 可选 `unknown`（调用方给什么就收什么，非法值由它自己兜底），所以这里**不需要断言**——
  * 本模块的对象逐字可赋值给那个形状。运行时传的是同一个对象，字段一个不改。
  */
-function planBudgetOf(deps, input) {
-    return deps.capacity.planBudget(input);
+function planPostsOf(deps, input) {
+    return deps.capacity.planPosts(input);
 }
 /**
- * 组装一次提议：模板候选 + 能力匹配 + 预算裁剪 + 容量投影 + 提议指纹。
+ * 组装一次提议：模板候选 + 能力匹配 + 岗位计划 + 提议指纹。
  *
  * inspect 与 bind 共用**同一份**计算，保证 `proposal_hash` 在两边一致。
  */
@@ -570,6 +539,8 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
         if (member && member.role === 'teammate')
             liveMembers.set(member.name, member);
     }
+    // 已用席位：名单里真正的 teammate 数（含失败成员）。只报事实，不参与裁剪。
+    const usedSeats = recordOf(memberList).ok === true ? liveMembers.size : null;
     const reuseByPost = new Map();
     const rosterPosts = recordOf(rosterFile.value).posts;
     if (rosterFile.present && Array.isArray(rosterPosts)) {
@@ -595,32 +566,13 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
             member: reusable ? reusedName : null,
         }));
     }
-    const declaredCap = await readCapacity(deps, root, env);
-    if (declaredCap.ok === false) {
-        return {
-            ok: false,
-            code: declaredCap.code,
-            diagnostics: declaredCap.diagnostics ?? [],
-            capacityGaps: capacityGapsToDiagnostics(declaredCap.gaps),
-        };
-    }
-    // T18：叠加「按调用声明」与「本会话观测值」，得到本次提议真正使用的上限。
-    const cap = await effectiveCapacityFor(root, session.session_id, request.capacity, declaredCap);
-    // D25：上限未声明 → null（defer + CAPACITY_UNKNOWN）；已声明 → 传声明上限，占用不可观测只作 gap。
-    const remainingActivations = cap.activations.known === true ? cap.activations.total : null;
-    const plan = planBudgetOf(deps, {
-        candidates,
-        remainingMemberSlots: cap.memberSlots.remaining,
-        remainingActivations,
-        maxPosts: request.maxPosts,
-        reservedMemberSlots: request.reservedMemberSlots,
-        reservedActivations: request.reservedActivations,
-    });
+    // T23：不做任何容量裁剪 —— 岗位能不能派只看**能力**（以及操作者的 max_posts）。
+    // 宿主的席位/activation 上限读不到，也不该猜：真正的强制在宿主那边（拒绝时 CAPACITY_EXHAUSTED）。
+    const plan = planPostsOf(deps, { candidates, maxPosts: request.maxPosts });
     const posts = orderPosts([...plan.assigned, ...plan.vacant, ...plan.deferred, ...plan.disabled], priorityOf);
     const gaps = dedupeDiagnostics([
         ...environmentGaps,
         ...plan.gaps,
-        ...capacityGapsToDiagnostics(cap.gaps),
         ...(compatibility?.gaps ?? []),
     ]);
     const capabilityVersion = {
@@ -630,12 +582,7 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
         registry_sha256: bindings.value?.registry_sha256 ?? null,
         sha256: bindings.sha256 ?? null,
     };
-    const budget = {
-        max_posts: request.maxPosts,
-        reserved_member_slots: request.reservedMemberSlots,
-        reserved_activations: request.reservedActivations,
-    };
-    const declaredBudget = declaredBudgetOf(cap);
+    const budget = { max_posts: request.maxPosts };
     const digests = compatibility?.digests ?? { ruleDigest: null, scriptDigest: null, catalogDigest: null };
     const proposalHash = proposalHashOf(deps, proposalFingerprint({
         projectRoot: root,
@@ -645,7 +592,6 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
         catalogVersion: template.catalogVersion,
         capabilityVersion,
         budget,
-        declaredBudget,
         staticPosts: stablePosts([...template.composed.posts, ...template.composed.reserved_posts]),
         digests,
         bindingState: bindingStateOf(bindingFile),
@@ -659,13 +605,11 @@ async function assembleProposal(ctx, deps, { root, projectId, session, kinds, re
         posts,
         gaps,
         plan,
-        capacity: projectCapacity(plan.capacity),
-        recommendedMembers: plan.recommended_members,
+        usedSeats,
+        // 需要新建成员的岗位数（不含复用已运行成员的岗位）。它不再表示「预算内还能开几个」。
+        recommendedMembers: plan.assigned.filter((entry) => entry.member === null).length,
         capabilityVersion,
         budget,
-        declaredBudget,
-        capacitySource: cap.source,
-        capacityLimits: { max_members: cap.memberSlots.total, max_active_subagents: cap.activations.total },
         digests,
         bindingFile,
         proposalHash,
@@ -682,30 +626,17 @@ async function assembleEnvironmentOnly(ctx, deps, { root, session, request, comp
     if (!inventory.present) {
         gaps.push(env.diagnostic('TOOL_INVENTORY_MISSING', `没有可用的工具清单快照：${inventory.reason ?? 're/env/tools.json 缺失'}`, '由 Lead 按 skill 的工具清单规则补齐；插件不生成清单、不隐式扫描'));
     }
-    const declaredCap = await readCapacity(deps, root, env);
-    if (declaredCap.ok === false) {
-        return { ok: false, code: declaredCap.code, diagnostics: declaredCap.diagnostics ?? [] };
-    }
-    const cap = await effectiveCapacityFor(root, session.session_id, request.capacity, declaredCap);
-    const remainingActivations = cap.activations.known === true ? cap.activations.total : null;
-    const plan = planBudgetOf(deps, {
-        candidates: [],
-        remainingMemberSlots: cap.memberSlots.remaining,
-        remainingActivations,
-        maxPosts: request.maxPosts,
-        reservedMemberSlots: request.reservedMemberSlots,
-        reservedActivations: request.reservedActivations,
-    });
+    // 只查环境时没有任何候选岗位：仍然报一次「已用席位」这一条事实（数不到就照实说数不到）。
+    const plan = planPostsOf(deps, { candidates: [], maxPosts: request.maxPosts });
     return {
         ok: true,
         templateId: null,
         targetKinds: [],
         posts: [],
-        gaps: dedupeDiagnostics([...gaps, ...plan.gaps, ...capacityGapsToDiagnostics(cap.gaps)]),
-        capacity: projectCapacity(plan.capacity),
+        gaps: dedupeDiagnostics([...gaps, ...plan.gaps]),
+        plan,
+        usedSeats: await usedSeatsFor(deps),
         recommendedMembers: 0,
-        capacitySource: cap.source,
-        capacityLimits: { max_members: cap.memberSlots.total, max_active_subagents: cap.activations.total },
         proposalHash: null,
     };
 }
@@ -828,9 +759,9 @@ async function appendRosterAudit(deps, outcome) {
 async function runRoster(ctx, deps, input, env, action) {
     const operationId = sanitizeOperationId(input.operation_id);
     const kinds = stringList(input.target_kinds);
-    // T18：按调用声明的容量。wire schema 已经校验过一次；handler 也会被直接调用（测试/恢复），
-    // 所以这里再判一次形状，非法就按 INVALID_ARGUMENT 拒（不静默丢掉用户声明的上限）。
-    const callCapacity = capacitySource.parseCallCapacity(input.capacity);
+    // T23：容量子系统已删除，但 wire schema 仍声明 `capacity` / `reserved_*`（`docs/specs` 由
+    // Lead 维护）。传了就如实说「收到但不参与决策」，不静默忽略 —— 否则「我声明了上限」是一句谎话。
+    const obsolete = OBSOLETE_CAPACITY_ARGS.filter((name) => input[name] !== undefined);
     const request = {
         action,
         kinds,
@@ -839,26 +770,9 @@ async function runRoster(ctx, deps, input, env, action) {
         recoveryRef: input.recovery_ref ?? null,
         // `Number.isInteger()` 对非数字恒为 false，补的类型判断不改变取默认值的边界。
         maxPosts: typeof input.max_posts === 'number' && Number.isInteger(input.max_posts) ? input.max_posts : 6,
-        reservedMemberSlots: typeof input.reserved_member_slots === 'number' && Number.isInteger(input.reserved_member_slots)
-            ? input.reserved_member_slots
-            : 1,
-        reservedActivations: typeof input.reserved_activations === 'number' && Number.isInteger(input.reserved_activations)
-            ? input.reserved_activations
-            : 2,
-        capacity: callCapacity.value,
+        obsolete,
         raw: input,
     };
-    if (callCapacity.issue !== null) {
-        return {
-            envelope: env.error({
-                code: 'INVALID_ARGUMENT',
-                operationId,
-                diagnostics: [env.diagnostic('INVALID_ARGUMENT', callCapacity.issue, '按 $defs.rosterInput.capacity 传 {max_members, max_active_subagents}（都必须是 >=1 的整数）；不传则按项目/profile 声明')],
-            }),
-            root: null,
-            audit: { kind: `roster_${action}`, verdict: 'rejected' },
-        };
-    }
     // 1. 身份（唯一来源；入参自报角色被忽略）。
     const identity = await deps.identity.resolveCaller(ctx);
     if (!identity || identity.ok !== true) {
@@ -917,7 +831,7 @@ async function runRoster(ctx, deps, input, env, action) {
             compatibility: 'blocked',
             posts: [],
             gaps,
-            capacity: projectCapacity(null),
+            capacity: NO_CAPACITY_PLAN,
             recommendedMembers: 0,
             proposalHash: null,
             bindingRef: null,
@@ -1009,14 +923,16 @@ async function runRoster(ctx, deps, input, env, action) {
         compatibility: compatibility.status,
         posts: proposal.posts,
         gaps: proposal.gaps,
-        capacity: proposal.capacity,
+        capacity: NO_CAPACITY_PLAN,
         recommendedMembers: proposal.recommendedMembers,
         proposalHash: proposal.proposalHash,
         bindingRef: action === 'inspect' ? null : deps.binding.BINDING_PATH,
     });
+    // 「已用席位」与「废止参数」都只陈述事实：放在诊断里（不是 gaps），不参与任何判定。
+    const notes = rosterNotes(env, proposal.usedSeats, request.obsolete);
     if (action === 'inspect') {
         audit.verdict = 'inspected';
-        return { envelope: env.ok({ operationId: null, data, retryable: false }), root, audit };
+        return { envelope: env.ok({ operationId: null, data, diagnostics: notes, retryable: false }), root, audit };
     }
     // bind/takeover 都要求 `operation_id`，上面 `action !== 'inspect'` 的前置条件里已经拒过 null
     // （同码同文的 INVALID_ARGUMENT 信封）。这里显式收窄一次给台账用：既不改写 `request` 里
@@ -1054,13 +970,15 @@ function checkSessionMatch(deps, bindingValue, session) {
         : bindingModule.checkSessionMatch;
     return fn(bindingValue, { sessionId: session.session_id, teamId: session.team_id });
 }
-function firstCapacityGap(gaps) {
+/**
+ * 提议放不下的唯一一种信号：`max_posts` 用完了。
+ *
+ * T23 之后这里**不再**有 `CAPACITY_UNKNOWN` —— 宿主容量既不可读也不由本包判，
+ * 「未知」不是拒绝理由（D40/D41：unknown 也照派）。
+ */
+function postLimitProblem(gaps) {
     const list = Array.isArray(gaps) ? gaps : [];
-    if (list.some((gap) => gap.code === 'CAPACITY_EXHAUSTED'))
-        return 'CAPACITY_EXHAUSTED';
-    if (list.some((gap) => gap.code === 'CAPACITY_UNKNOWN'))
-        return 'CAPACITY_UNKNOWN';
-    return null;
+    return list.some((gap) => gap.code === POST_LIMIT_CODE) ? POST_LIMIT_CODE : null;
 }
 async function bindProject(ctx, shared) {
     const { deps, env, root, projectId, session, request, proposal, data, audit, operationId } = shared;
@@ -1120,7 +1038,7 @@ async function bindProject(ctx, shared) {
                 code: 'OPERATION_CONFLICT',
                 operationId,
                 data: { ...data, binding_ref: null },
-                diagnostics: [env.diagnostic('OPERATION_CONFLICT', `proposal_hash 与当前目录/能力映射/预算/绑定不符（当前目录版本=${String(proposal.catalogVersion)}，能力映射 revision=${String(recordOf(proposal.capabilityVersion).revision)}，绑定 epoch=${String(existing?.binding?.epoch ?? 'none')}，预算 max_posts=${String(recordOf(proposal.budget).max_posts)}/maxMembers=${String(recordOf(proposal.declaredBudget).max_members)}/maxActiveSubagents=${String(recordOf(proposal.declaredBudget).max_active_subagents)}）`, NEXT_STEP_REPROPOSE)],
+                diagnostics: [env.diagnostic('OPERATION_CONFLICT', `proposal_hash 与当前目录/能力映射/预算/绑定不符（当前目录版本=${String(proposal.catalogVersion)}，能力映射 revision=${String(recordOf(proposal.capabilityVersion).revision)}，绑定 epoch=${String(existing?.binding?.epoch ?? 'none')}，预算 max_posts=${String(recordOf(proposal.budget).max_posts)}）`, NEXT_STEP_REPROPOSE)],
             }),
             root,
             audit,
@@ -1176,20 +1094,22 @@ async function bindProject(ctx, shared) {
                     }),
                 };
             }
-            const capacityProblem = firstCapacityGap(freshProposal.gaps);
-            if (capacityProblem !== null) {
+            // 锁内只看「提议放不下」：`max_posts` 用完时不能 bind（否则会绑一份超出操作者上限的提议）。
+            // 容量不在这里判 —— 别人多开几个成员与本提议无关（T23）。
+            const limitProblem = postLimitProblem(freshProposal.gaps);
+            if (limitProblem !== null) {
                 return {
                     envelope: env.blocked({
-                        code: capacityProblem,
+                        code: limitProblem,
                         operationId,
                         data: {
                             ...data,
                             posts: freshProposal.posts,
                             gaps: freshProposal.gaps,
-                            capacity: freshProposal.capacity,
+                            capacity: NO_CAPACITY_PLAN,
                             recommended_members: freshProposal.recommendedMembers,
                         },
-                        diagnostics: freshProposal.gaps.filter((gap) => CAPACITY_CODES.has(gap.code)),
+                        diagnostics: freshProposal.gaps.filter((gap) => gap.code === POST_LIMIT_CODE),
                     }),
                 };
             }
@@ -1206,10 +1126,8 @@ async function bindProject(ctx, shared) {
                     epoch: existing?.binding?.epoch ?? null,
                     input_epoch: existing?.binding?.epoch ?? null,
                     proposal_hash: proposal.proposalHash,
-                    // T18：出问题要能回答「当时它以为上限是多少」。
-                    capacity_source: proposal.capacitySource ?? null,
-                    capacity_max_members: proposal.capacityLimits?.max_members ?? null,
-                    capacity_max_active_subagents: proposal.capacityLimits?.max_active_subagents ?? null,
+                    // 已用席位只作台账存证：它不参与任何判定，也不再是「当时以为的上限」。
+                    used_seats: freshProposal.usedSeats,
                 });
             }
             const existingEpoch = existingBinding?.epoch;
@@ -1249,7 +1167,7 @@ async function bindProject(ctx, shared) {
                 posts: freshProposal.posts,
                 members: [],
                 tasks: [],
-                capacity: freshProposal.capacity,
+                capacity: NO_CAPACITY_PLAN,
                 recommended_members: freshProposal.recommendedMembers,
                 created_at: now,
                 updated_at: now,
@@ -1269,10 +1187,12 @@ async function bindProject(ctx, shared) {
                     ...data,
                     posts: freshProposal.posts,
                     gaps: diagnostics,
-                    capacity: freshProposal.capacity,
+                    capacity: NO_CAPACITY_PLAN,
                     recommended_members: freshProposal.recommendedMembers,
                     binding_ref: deps.binding.BINDING_PATH,
                 },
+                // 已用席位 + 废止参数：bind 成功也照样交回（它们只陈述事实，不是缺口）。
+                diagnostics: rosterNotes(env, freshProposal.usedSeats, request.obsolete),
             });
             if (ledger !== null) {
                 await ledger.advance(operationId, 'completed', {
@@ -1436,10 +1356,8 @@ async function takeoverProject(ctx, shared) {
                     input_epoch: oldEpoch,
                     recovery_ref: request.recoveryRef,
                     proposal_hash: proposal.proposalHash,
-                    // T18：与 bind 同一口径。
-                    capacity_source: proposal.capacitySource ?? null,
-                    capacity_max_members: proposal.capacityLimits?.max_members ?? null,
-                    capacity_max_active_subagents: proposal.capacityLimits?.max_active_subagents ?? null,
+                    // 已用席位只作台账存证：它不参与任何判定，也不再是「当时以为的上限」。
+                    used_seats: proposal.usedSeats,
                 });
             }
             // 先归档（不删原件），再建立新 epoch 的绑定。
@@ -1485,7 +1403,7 @@ async function takeoverProject(ctx, shared) {
                 posts: proposal.posts,
                 members: [],
                 tasks: [],
-                capacity: proposal.capacity,
+                capacity: NO_CAPACITY_PLAN,
                 recommended_members: proposal.recommendedMembers,
                 recovered_from: { epoch: oldEpoch, recovery_ref: request.recoveryRef },
                 created_at: now,
@@ -1503,6 +1421,7 @@ async function takeoverProject(ctx, shared) {
             const envelope = env.ok({
                 operationId,
                 data: { ...data, gaps: diagnostics, binding_ref: deps.binding.BINDING_PATH },
+                diagnostics: rosterNotes(env, proposal.usedSeats, request.obsolete),
             });
             if (ledger !== null) {
                 await ledger.advance(operationId, 'completed', {

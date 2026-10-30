@@ -27,13 +27,13 @@ packages/dsh-redteam-lead/
     catalog.data.json           T3   # 岗位目录的包内副本（漂移测试对 docs/specs/roster-catalog.json）
     catalog.mjs                 T3   # 岗位目录加载/校验、模板组合、mixed 并集
     capability.mjs              T3   # 能力族解析、matchCapabilities 纯函数、绑定
-    capacity.mjs                T3   # 席位/activation 预算裁剪（含 CAPACITY_UNKNOWN）
+    capacity.mjs                T3   # 岗位计划 planPosts（T23 起不做任何容量/余额判定）
     team-adapter.mjs            T4   # ctx.agentTeams 薄封装
     project-adapter.mjs         T4   # reverse-project-management CLI adapter
     compatibility.mjs           T4   # 项目副本/规则/脚本指纹与兼容性检查
     roster.mjs                  T5   # rt_roster handler（inspect/bind/takeover）
     binding.mjs                 T5   # re/team/binding.json、roster.json、epoch、takeover
-                            # 注：re/team/capacity.json 由项目/操作者声明，插件只读（T4 的 readDeclaredCapacity）
+                            # 注：re/team/capacity.json 已随容量子系统删除（T23 / DECISIONS D41），插件不读也不写
     dispatch.mjs                T6   # rt_dispatch handler
     contract.mjs                T6   # 派发契约构建、持久化、交付信封、任务板映射
     resources.mjs               T6   # re/team/resources.json 资源租用/隔离

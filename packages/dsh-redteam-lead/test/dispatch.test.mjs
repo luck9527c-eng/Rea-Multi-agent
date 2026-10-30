@@ -76,7 +76,6 @@ function setup(t, options = {}) {
       routes: { 'R-001': ROUTE, ...(options.routes ?? {}) },
       seals: options.seals ?? [],
     },
-    capacity: options.capacity ?? { known: true, maxMembers: 6, maxActiveSubagents: 4, via: 'project' },
     tools: options.tools ?? BASE_TOOLS,
     depsOverrides: options.depsOverrides,
     config: options.config,
@@ -314,36 +313,41 @@ test('同岗成员忙碌 → MEMBER_BUSY，且零副作用', async (t) => {
   assert.deepEqual(await teamFiles(project.root), before)
 })
 
-test('未声明容量 → 照派并警告（T18）；席位不足 → CAPACITY_EXHAUSTED（都不动成员/任务）', async (t) => {
-  // T18：未知容量**不再**前置拒绝（旧行为是 CAPACITY_UNKNOWN + 零副作用）。
-  // 现在照派，但必须把「不保证有位置、最多损失一个名字与席位」写进诊断。
-  const unknown = setup(t, { capacity: { known: false } })
-  const first = await handleDispatch(unknown.ctx, unknown.input())
+test('容量不再前置判定：照派；宿主拒绝时才报 CAPACITY_EXHAUSTED 并逐字带回原话', async (t) => {
+  // T23 / D41：宿主不提供上限读数，派发不做任何容量前置判定。
+  const open = setup(t)
+  const first = await handleDispatch(open.ctx, open.input())
   assertEnvelopeShape(first.envelope, { expectStatus: 'ok' })
-  assert.equal(unknown.team.callsFor('spawnTeammate').length, 1, '未知容量照派：必须真的去创建')
-  assert.ok(
+  assert.equal(open.team.callsFor('spawnTeammate').length, 1, '不猜上限：直接去创建')
+  assert.equal(
     first.envelope.diagnostics.some((entry) => entry.code === 'CAPACITY_UNDECLARED'),
-    '风险必须写成诊断，而不是静默',
-  )
-  assert.match(
-    first.envelope.diagnostics.map((entry) => `${entry.reason}${entry.next_step}`).join('\n'),
-    /未声明[\s\S]*不保证[\s\S]*损失/u,
+    false,
+    'T23：「容量未声明」这类诊断已删除',
   )
 
-  // 上限**已声明**时行为不变：席位不够就是前置拒绝，零副作用。
-  const exhausted = setup(t, {
-    capacity: { known: true, maxMembers: 1, maxActiveSubagents: 4, via: 'project' },
-    members: [{ name: 'rt-other' }],
-  })
-  const beforeExhausted = await teamFiles(exhausted.project.root)
-  const second = await handleDispatch(exhausted.ctx, exhausted.input())
-  assertEnvelopeShape(second.envelope, { expectStatus: 'blocked' })
+  // 宿主自己拒绝（席位满）：partial + CAPACITY_EXHAUSTED，诊断里是宿主原话，不声称烧掉/损失。
+  const tight = setup(t, { members: [{ name: 'rt-other' }], teamOpts: { memberLimit: 1 } })
+  const second = await handleDispatch(tight.ctx, tight.input())
+  assertEnvelopeShape(second.envelope, { expectStatus: 'partial' })
   assert.equal(second.envelope.code, 'CAPACITY_EXHAUSTED')
-  assert.equal(exhausted.team.callsFor('spawnTeammate').length, 0)
-  assert.equal(exhausted.team.callsFor('createTask').length, 0)
-  assert.deepEqual(await teamFiles(exhausted.project.root), beforeExhausted)
-})
+  assert.equal(second.envelope.data.phase, 'prepared', '成员身份没落进台账，阶段不得声称 member_ready')
+  const text = second.envelope.diagnostics
+    .map((entry) => `${entry.code}\n${entry.reason}\n${entry.next_step}`)
+    .join('\n');
+  assert.match(text, /Team member limit 1 reached/u, '必须逐字包含宿主原话');
+  assert.match(text, /hostCode=TEAM_MEMBER_LIMIT/u);
+  assert.doesNotMatch(text, /烧掉|烧了|损失一个|丢失一个|会被消耗/u, '不得声称任何推断性损坏');
+  assert.equal(tight.team.callsFor('spawnTeammate').length, 1, '宿主已经真的被调用过一次');
+  assert.equal(tight.team.callsFor('createTask').length, 0, '成员没建成就不建任务');
 
+  // T23 验收第 4 条：即使真的发生拒绝，`re/team/` 下也不得再出现任何容量观测文件。
+  const written = await teamFiles(tight.project.root);
+  assert.deepEqual(
+    written.filter((name) => /capacity/i.test(name)),
+    [],
+    `拒绝之后不得落任何容量文件：${written.join(', ')}`,
+  );
+})
 test('执行者注册表是数组形状（宿主真实形状）时派发不再被 CAPABILITY_MISSING 拦下', async (t) => {
   // T15 回归：宿主 `tools.schemas(agent)` 返回 schema 对象数组（名字在元素的 `.name` 上）。
   // 旧实现 `Object.keys()` 数组只拿到 ["0","1",…]，于是真会话里任何派发都在 preflight 被
@@ -554,7 +558,6 @@ test('禁用的岗位 / 工作区被换成 junction → 拒绝且不建成员', 
 test('前置拒绝在完全没有 re/team 的项目上也不创建任何目录或文件', async (t) => {
   const { project, ctx, team, input } = setup(t, {
     files: { 're/team/resources.json': null },
-    capacity: { known: false },
     tools: { default: { read: {}, glob: {}, grep: {} } },
   })
 
@@ -690,16 +693,20 @@ test('createTask 生效但响应丢失 → 按摘要标记唯一关联，不建�
   assert.equal(envelope.data.task_id, team.snapshot().tasks[0].id)
 })
 
-test('spawn 失败（席位被烧）→ partial + 记录 failed，且允许下一次用 -2 名字', async (t) => {
+test('spawn 失败（宿主已在成员行之后拒绝）→ partial + 记录 failed，且允许下一次用 -2 名字', async (t) => {
   const { ctx, team, input } = setup(t)
-  team.failNextSpawn({ code: 'ACTIVATION_LIMIT_REACHED', message: 'subagent limit reached' })
+  team.failNextSpawn({ code: 'ACTIVATION_LIMIT_REACHED', message: 'subagent limit reached (active child limit: 1)' })
 
   const first = await handleDispatch(ctx, input())
   assertEnvelopeShape(first.envelope, { expectStatus: 'partial' })
   assert.equal(first.envelope.code, 'CAPACITY_EXHAUSTED')
-  assert.equal(first.envelope.data.phase, 'member_ready')
+  // T23：成员身份没落进台账 → 阶段是 prepared（旧实现写 member_ready，等于声称成员已就绪）。
+  assert.equal(first.envelope.data.phase, 'prepared')
+  const text = first.envelope.diagnostics.map((entry) => `${entry.reason}\n${entry.next_step}`).join('\n')
+  assert.match(text, /subagent limit reached \(active child limit: 1\)/u, '必须逐字带回宿主原话')
+  assert.doesNotMatch(text, /烧掉|损失一个|丢失一个/u, '不得声称任何推断性损坏')
   const failed = team.snapshot().members.find((row) => row.name === 'rt-cross-check')
-  assert.equal(failed.status, 'failed', '失败成员占位（D12）')
+  assert.equal(failed.status, 'failed', '失败成员占位（D12：宿主自己把它 settle 成 failed）')
 
   // 换一个 operation（新的派发）→ 必须用 rt-cross-check-2，绝不能同名重试
   const second = await handleDispatch(ctx, input({ operation_id: 'op-2' }))
@@ -710,6 +717,21 @@ test('spawn 失败（席位被烧）→ partial + 记录 failed，且允许下�
     team.callsFor('spawnTeammate').map((call) => call.args[1].name),
     ['rt-cross-check', 'rt-cross-check-2'],
   )
+})
+
+test('传了已废止的 capacity → 派发照旧成功，并明说它不参与任何判定（T23）', async (t) => {
+  const { ctx, team, input } = setup(t)
+  const { envelope } = await handleDispatch(ctx, input({ capacity: { max_members: 2, max_active_subagents: 2 } }))
+  assertEnvelopeShape(envelope, { expectStatus: 'ok' })
+  const note = envelope.diagnostics.find((entry) => entry.code === 'CAPACITY_ARGUMENT_OBSOLETE')
+  assert.ok(note, '必须明说 capacity 已废止，不静默忽略')
+  assert.match(note.reason, /capacity/u)
+  assert.equal(team.callsFor('spawnTeammate').length, 1, '不因传了这个参数而少派或多派')
+
+  // 输入哈希兼容：`capacity` 键名与位置保持原样，同一 operation 才能重放（否则升级前登记的
+  // operation 恢复时会被判 OPERATION_CONFLICT）。
+  const replay = await handleDispatch(ctx, input({ capacity: { max_members: 2, max_active_subagents: 2 } }))
+  assert.equal(replay.envelope.replayed, true, '同一 operation_id 必须重放，不得判冲突')
 })
 
 // ---------------------------------------------------------------------------

@@ -86,6 +86,8 @@ function makeHost(t, options = {}) {
         schema_version: 1,
         targets: [{ id: 'T-001', path: 're/samples/sample.bin', sha256: SAMPLE_SHA256 }],
       }),
+      // T23：容量声明已从实现里删除；这份遗留文件放在项目里，正好用来说明「插件不再读它」
+      // （见下面「teamAdapter 不读项目文件」那条用例）。
       're/team/capacity.json': JSON.stringify({
         schema_version: 1,
         declared_at: '2026-01-01T00:00:00.000Z',
@@ -204,18 +206,18 @@ test('projectRoot 真的传进 createProjectAdapter：readRoute 读文件而不�
   assert.equal(notFound.notFound, true)
 })
 
-test('projectRoot 也绑到 teamAdapter：容量来源是项目声明而不是 unavailable', async (t) => {
+test('teamAdapter 不读项目文件：projectRoot 传不传都一样，used 只从 listMembers 数', async (t) => {
   const host = makeHost(t)
+  // 项目里仍然放着旧的声明文件（本包已不读；放着正好证明「不读」）。
   const bound = createDeps({ ...host, projectRoot: host.project.root })
 
-  const capacity = await bound.teamAdapter.capacity()
-  assert.equal(capacity.evidence.source, 'declared:re/team/capacity.json', '必须读到项目里的容量声明（D1）')
-  assert.equal(capacity.memberSlots.known, true)
-  assert.equal(capacity.memberSlots.total, 6)
+  const seats = await bound.teamAdapter.usedSeats()
+  assert.equal(seats.ok, true)
+  assert.equal(seats.used, 0, '名字册里只有 Lead 时已用席位是 0')
 
   const unbound = createDeps({ ...host, config: { defaults: {}, presetId: 'redteam-lead' } })
-  const blind = await unbound.teamAdapter.capacity()
-  assert.equal(blind.evidence.source, 'unavailable', '没有 root 时容量只能是未声明（不要猜余额）')
+  const blind = await unbound.teamAdapter.usedSeats()
+  assert.deepEqual(blind, seats, 'T23：团队适配器不再依赖 projectRoot（不读项目里的容量声明）')
 })
 
 // ---------------------------------------------------------------------------
@@ -309,17 +311,20 @@ test('rt_dispatch → rt_conclude：同一份派发记录能被收口按原样�
   const asm = makeAssembled(t)
   const { project, deps, ctx, team, fakeProject } = asm
 
-  // —— 3.1 rt_roster inspect：容量来自项目声明（projectRoot 绑到了 teamAdapter） ——
+  // —— 3.1 rt_roster inspect：容量不再来自任何声明（T23），岗位计划照样成立 ——
   const roster = await handleRoster(ctx, { project_root: project.root, action: 'inspect' })
   assert.equal(roster.envelope.status, 'ok', JSON.stringify(roster.envelope.diagnostics))
-  const capacity = await deps.teamAdapter.capacity()
-  assert.equal(capacity.evidence.source, 'declared:re/team/capacity.json', '容量来源必须是项目声明，不能是 unavailable')
-  assert.equal(typeof roster.envelope.data.capacity.remaining_member_slots, 'number', '声明可用时余额必须是数字（D19：known 不上线）')
+  const seats = await deps.teamAdapter.usedSeats()
+  assert.equal(seats.ok, true);
+  assert.equal(seats.used, 0, '装配出来的 teamAdapter 仍然能从 listMembers 数已用席位')
+  // wire 里那 4 个字段仍在（schema 必备），但一律「未知 / 不预留」。
+  assert.equal(roster.envelope.data.capacity.remaining_member_slots, null)
+  assert.equal(roster.envelope.data.capacity.remaining_activations, null)
   const gapCodes = (roster.envelope.data.gaps ?? []).map((gap) => gap.code)
-  assert.ok(!gapCodes.includes('CAPACITY_UNKNOWN'), `声明了容量就不该报 CAPACITY_UNKNOWN：${gapCodes.join(',')}`)
+  assert.ok(!gapCodes.includes('CAPACITY_UNKNOWN'), `T23：容量未知不再是缺口：${gapCodes.join(',')}`)
   assert.ok(
     !gapCodes.includes('CAPACITY_DECLARATION_UNREAD'),
-    `项目声明了容量却没被适配器读到（正是 projectRoot 没绑上的症状）：${gapCodes.join(',')}`,
+    `T23：项目容量声明已删除，不该再有「声明了但读不到」：${gapCodes.join(',')}`,
   )
 
   // —— 3.2 rt_dispatch ——

@@ -79,11 +79,7 @@ listMembers()                            -> {ok, members: [{id, name, role, stat
 spawnTeammate({name, prompt})            -> {ok, member} | {ok:false, code: 'CAPACITY_EXHAUSTED'|'ACTIVATION_LIMIT_REACHED'|..., retryable}
 sendMessage({target, message})           -> {ok} | {ok:false, code:'DELIVERY_FAILED', reason}
 interruptAgent({target})                 -> {ok, previousStatus: 'running'|'inactive'}
-capacity()                               -> {
-  memberSlots:  {known: boolean, remaining: number|null, total: number|null, used: number},
-  activations:  {known: boolean, remaining: number|null, total: number|null},
-  evidence: {source: string}             // 'declared:re/team/capacity.json' | 'declared:profile-config' | 'unavailable'
-}
+usedSeats()                              -> {ok: true, used: number} | {ok: false, used: null, code, reason, nextStep}
 createTask({subject, description, blockedBy}) -> {ok, task} | {ok:false, code}
 updateTask({taskId, expectedRevision, action, owner?}) -> {ok, task} | {ok:false, code:'REVISION_CONFLICT'|'TEAM_TASK_*'}
 getTask(taskId)                          -> {ok, task} | {ok:false, code}
@@ -92,12 +88,14 @@ listTasks()                              -> {ok, tasks: []}
 
 `task` 统一投影为 `{id, revision, status: 'pending'|'in_progress'|'completed', owner: string|null, subject, description, blockedBy: []}`。
 
-**`capacity()` 是本次实现最容易瞎编的地方，规则见 [DECISIONS.md](DECISIONS.md) D1。** 宿主**没有任何**受支持的只读余额查询（`maxMembers` / `maxActiveSubagents` / `ActivationPool.slots` 全私有，唯一公开限额 getter 是 `resolveMaxDepth()`）。因此：
+**`usedSeats()` 只回答一件能数到的事**（T23 起替换原来的 `capacity()`，见 [DECISIONS.md](DECISIONS.md) D41）：
 
-- `used` 恒为 `listMembers().filter(r => r.role === 'teammate').length`，**永远可数，且必须计入失败成员**（失败 spawn 会永久占用名字与席位）。
-- `total` / `remaining` **只允许**来自显式声明：`re/team/capacity.json`（`evidence.source: 'declared:re/team/capacity.json'`）或插件 `config.capacity`（`'declared:profile-config'`）；都没有 → `known:false` 且置 `null`。
+- `used` 恒为 `listMembers().filter(r => r.role === 'teammate').length`，**包含失败成员**（它们占着名册行）。
+- 数不到就是 `used: null` + 一条原因（服务缺席 / 没有活 agent / `listMembers` 失败），**不回落成 0**。
+- **没有** `total` / `remaining`，也**不读**任何容量声明：宿主不提供上限读数（`maxMembers` 是 `TeamService` 的
+  构造函数参数，没有 getter；`maxActiveSubagents` 在团队服务里不存在）。上限的唯一体现是宿主自己拒绝时抛的
+  `TEAM_MEMBER_LIMIT` / `ACTIVATION_LIMIT_REACHED`（适配器映射成 `CAPACITY_EXHAUSTED`，原话留在 `reason`）。
 - **禁止**：猜 8/16、读 `service.config` 或任何私有字段、用 `listChildren()` 算术当余额、**靠 spawn 试探余额**。
-- `known:false` 是合法结果，上层转 `CAPACITY_UNKNOWN` 并给出「怎么声明容量」的具体下一步。
 
 ## 4. `projectAdapter`（T4 提供，跑项目 skill 的真实 CLI）
 
@@ -159,12 +157,16 @@ readSeals()            -> {ok, seals: [{path, sha256, bytes}]}
 | 成员/任务/名册 | 宿主（`teamAdapter`）；本地只做恢复关联 |
 | `re/team/binding.json`、`roster.json`、`dispatches/`、`receipts/`、`audit.jsonl`、`capabilities.json`、`resources.json`、`lock` | 本插件（`atomic` + `lock`） |
 | `re/team/operations/<operation_id>.json` | 本插件（T1 的 `operation` 台账落盘位置；`$defs.id` 保证文件名安全） |
-| `re/team/capacity.json` | **项目/操作者显式声明**，插件只读（T4 `readDeclaredCapacity`）；插件**不写**它 |
 | `re/targets.json`、`re/routes/`、`re/runs/`、`re/conditions/`、`re/project.json`、`re/env/`、`re/seals/`、`INDEX.md` | 项目 skill（本插件只经 `projectAdapter` 调用，不自己重写算法） |
 
+> **没有容量声明这一行**：T23 删除了 `re/team/capacity.json` 与 `profile config.capacity` 的读取
+> （DECISIONS D41）—— 宿主的上限不可读，本插件也不再从任何文件推断它。
+>
 > **`re/team/roster.json` 不是成员表。** 它在 `rt_roster(bind)` 时写一次，内容是**当时的绑定计划快照**
 > （`template`、`posts`、`capacity`、`recommended_members`），其中 `members` 与 `tasks` **按构造恒为 `[]`**
-> （`src/roster.ts:1726-1727`、`:1999`），之后**永不更新**。要看真实成员与任务，读宿主
+> （`src/roster.ts` 的 `writeRoster` 调用点），之后**永不更新**。要看真实成员与任务，读宿主
 > （`rt_roster` 的 `data`），**不要读这个文件**——按上表第一行，名册的权威从来不在本地。
+> 另外 `capacity` 那四个字段自 T23 起恒为「未知 / 不预留」（`remaining_*: null`、`reserved_*: 0`），
+> 它们只是 wire schema 的必备键，不表示任何余额。
 > 实测依证：7 名成员之后它仍是 `members: []`
 > （[第三轮记录 §4 N3](../verify/records/20261030-session-c7189ebb.md)）。

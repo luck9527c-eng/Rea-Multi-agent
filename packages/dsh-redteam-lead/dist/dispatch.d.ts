@@ -7,7 +7,8 @@
  *    `target_ids` 必须是该路线目标集合的非空子集，额外目标要先建新路线。
  * 2. 有效 `validated` 依赖、条件版本、open 争议、恢复待办逐项核查。
  * 3. 能力 = 岗位 `required` ∪ 任务 `capability_needs`（只追加）；缺通道/入口 → `CAPABILITY_MISSING`。
- * 4. 预算（D25 组装口径）+ `MEMBER_BUSY` + `DEPENDENCY_BLOCKED`。
+ * 4. 成员占用（`MEMBER_BUSY`）+ `DEPENDENCY_BLOCKED`。**不做容量规划**（T23 / D41）：
+ *    宿主的上限读不到，派发直接调 `spawnTeammate`；宿主拒绝时按它的原话报 `CAPACITY_EXHAUSTED`。
  * 5. 资源在锁内检查/租用；别名归一、默认独占、`quarantined` 不再分配。
  *
  * 前置任一不过 → `status=blocked` **且零副作用**（不建成员、不建任务、不写 `re/team/`）。
@@ -18,7 +19,6 @@
  * 每步「先存意图、后存实际 ID」；同 `operation_id` 重入从已存阶段续做
  * （不重复 spawn、不建第二个 task），响应丢失时按确定的成员名 / 任务摘要标记唯一关联。
  */
-import type { CallCapacity } from './capacity-source.js';
 import type { Diagnostic, HandlerCtx, HandlerResult } from './types.js';
 /** 项目规则入口（bootstrap prompt 与交付信封都指向它）。 */
 export declare const RULES_ENTRY = "docs/agents/reverse-project-management.md";
@@ -43,13 +43,16 @@ interface DispatchRequest {
     delivery_timeout_ms: number;
     retry_of: Record<string, unknown> | null;
     /**
-     * T18：本次调用声明的容量（优先级最高）。
+     * 收到但**已废止**的 `capacity` 入参（T23）：`docs/specs` 仍声明它，校验会放行。
      *
-     * **可选**而不是 `null` 占位：`operationInputHash()` 会对整个请求对象求哈希，
-     * 未声明时也不能凭空多出一个键 —— 否则升级前登记的 operation 在恢复时会被判
-     * `OPERATION_CONFLICT`（输入哈希变了，但输入其实没变）。
+     * 值本身**一个字段都不读**（不解析、不落盘、不进任何判定），只用来回一条
+     * `CAPACITY_ARGUMENT_OBSOLETE`。键名与位置保持原样还有一个硬理由：
+     * `operationInputHash()` 对**规范化后的请求**求哈希，升级前登记过的 operation
+     * 里带着 `capacity`，改名/挪位置会让它们在恢复时被判 `OPERATION_CONFLICT`。
+     *
+     * **可选**而不是 `null` 占位：没声明时不能凭空多出一个键（同样的哈希兼容理由）。
      */
-    capacity?: CallCapacity | null;
+    capacity?: unknown;
 }
 /** `normalizeDispatchInput` 的结果：形状错误时 `value` 为空对象（调用方不会读它）。 */
 type NormalizedDispatch = {

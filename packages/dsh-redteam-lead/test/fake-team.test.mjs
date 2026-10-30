@@ -375,17 +375,13 @@ test('interrupt 只回 running|inactive，且 Lead only', async () => {
   );
 });
 
-test('capacity fixture 两种形态：known:true 带余额，缺省表示没有声明', () => {
-  const declared = createFakeTeam({
-    capacity: { known: true, maxMembers: 5, maxActiveSubagents: 3, via: 'project' },
-  });
-  assert.deepEqual(declared.capacityDeclaration, {
-    known: true,
-    maxMembers: 5,
-    maxActiveSubagents: 3,
-    via: 'project',
-  });
-  assert.equal(createFakeTeam().capacityDeclaration, null);
+test('替身没有容量读取口：上限只体现为两条宿主拒绝', () => {
+  // T23：真实宿主不提供容量查询，替身也不许编一个 —— 一旦有人给替身加 capacity() 之类的口，
+  // 测试就会重新给「能读到上限」这个不存在的契约背书。
+  const team = createFakeTeam({ memberLimit: 2, activationLimit: 1 });
+  assert.equal(Object.hasOwn(team, 'capacityDeclaration'), false);
+  assert.equal(typeof team.service.capacity, 'undefined');
+  assert.equal(typeof team.service.getCapacity, 'undefined');
 });
 
 test('故障注入 beforeHost：副作用未发生；afterHost：副作用已发生', async () => {

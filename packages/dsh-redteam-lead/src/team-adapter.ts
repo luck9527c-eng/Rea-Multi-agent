@@ -10,29 +10,21 @@
  *    原始错误码保留在 `hostCode`，原始文案保留在 `reason`（SEAMS 第 6 节：不把宿主异常串当 code）。
  * 3. **权威在宿主**：角色授权、任务板 CAS、成员名规则都由服务层判定，适配器只做投影与映射，
  *    不在本地重新实现一遍更弱的检查（D4）。
- * 4. **capacity() 只说实话**：真实宿主没有任何容量查询（D1）。已用席位恒从
- *    `listMembers()` 数 `role === 'teammate'` 得出（含失败成员）；上限只认显式声明
- *    （`re/team/capacity.json` 或 profile 的 `config.capacity`）；两者都没有就 `known:false`。
- *    这里**绝不**猜常数、绝不读宿主内部结构、绝不靠 spawn 试探余额（D12：失败会烧掉名字与席位）。
+ * 4. **`usedSeats()` 只报能数到的那一件事**（T23）：已用席位恒从 `listMembers()` 数
+ *    `role === 'teammate'` 得出（含失败成员）。宿主**不提供任何上限读数**：`maxMembers` 是
+ *    `TeamService` 的构造函数参数（没有 getter），`maxActiveSubagents` 在团队服务里不存在。
+ *    所以适配器不再回答「还剩几个」，也**不读任何容量声明文件**；上限的唯一体现是宿主自己的
+ *    拒绝（`TEAM_MEMBER_LIMIT` / `ACTIVATION_LIMIT_REACHED` → `CAPACITY_EXHAUSTED`）。
  *
- * `capacity()` 的返回形状（在 SEAMS 之上加了 `ok` 与 `gaps`）：
+ * `usedSeats()` 的返回形状：
  *
  * ```js
- * {
- *   ok: boolean,
- *   memberSlots: {known, remaining, total, used},   // used 恒可数；total/remaining 需声明
- *   activations: {known, remaining, total},         // 只声明上限；当前占用不可观测 → remaining 为 null
- *   evidence: {source: 'declared:re/team/capacity.json'|'declared:profile-config'|'unavailable', …},
- *   gaps: [{code, detail, nextStep}],
- * }
+ * { ok: boolean, used: number | null, code?, reason?, nextStep? }   // used === null 表示数不到，不是 0
  * ```
  *
  * 宿主服务的形状是**外部事实**：本模块只声明自己真正调用的方法子集，所有值按 `unknown`
  * 收、按需收窄（`guards.recordOf`），不假定宿主的对象形状。
  */
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-
 import { isRecord, recordOf, thrownCode } from './guards.js';
 
 /** 适配器契约版本（写进 re/team/binding.json 的 `adapter.contract_version`）。 */
@@ -124,8 +116,6 @@ const TASK_ACTIONS = new Set([
   'claim', 'release', 'edit', 'set_dependencies', 'complete', 'reopen', 'reassign', 'delete',
 ]);
 
-const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
-
 /** 适配器诊断（`code`/`detail` 必有，`nextStep`/`hostCode` 视分支而定）。 */
 export interface AdapterDiagnostic {
   code: string;
@@ -191,74 +181,25 @@ export interface TeamTask {
   writeScopes: string[];
 }
 
-/** 容量声明里的一个缺口（绝不猜上限）。 */
-export interface CapacityGap {
-  code: string;
-  detail: string;
-  nextStep: string;
-}
-
-/** 席位（`used` 恒可数；`total`/`remaining` 只来自显式声明）。 */
-export interface MemberSlots {
-  known: boolean;
-  remaining: number | null;
-  total: number | null;
-  used: number | null;
-}
-
-/** activation 池（只声明上限；当前占用不可观测）。 */
-export interface ActivationSlots {
-  known: boolean;
-  remaining: number | null;
-  total: number | null;
-}
-
-/** 容量来源与声明身份。 */
-export interface CapacityEvidence {
-  source: string;
-  declaredAt?: unknown;
-  declaredBy?: unknown;
-  maxMembers?: number;
-  maxActiveSubagents?: number;
-  usedSeats: number | null;
-}
-
-/** `capacity()` 的返回：两支都带容量投影（服务缺席时也要说清「数不到已用席位」）。 */
-export interface TeamCapacityResult {
+/** 已用席位（唯一可读的容量事实）的结果。`used === null` = 数不到，不是 0。 */
+export interface UsedSeatsResult {
   ok: boolean;
+  used: number | null;
   code?: string;
   reason?: string;
-  memberSlots: MemberSlots;
-  activations: ActivationSlots;
-  evidence: CapacityEvidence;
-  gaps: CapacityGap[];
+  nextStep?: string;
 }
-
-/** `re/team/capacity.json` 校验通过后的声明。 */
-export interface DeclaredCapacityKnown {
-  known: true;
-  maxMembers: number;
-  maxActiveSubagents: number;
-  declaredAt: unknown;
-  declaredBy: unknown;
-  source: string;
-  path: string;
-}
-
-/** 声明缺失/非法：只给缺口，不给数字。 */
-export interface DeclaredCapacityMissing {
-  known: false;
-  gap: CapacityGap;
-}
-
-/** `readDeclaredCapacity()` 的产物。 */
-export type DeclaredCapacity = DeclaredCapacityKnown | DeclaredCapacityMissing;
 
 /** `createTeamAdapter()` 的入参：两种形态（装配上下文 / 显式注入）的并集，全部按 `unknown` 收。 */
 export interface TeamAdapterOptions {
   ctx?: unknown;
   services?: unknown;
   exec?: unknown;
+  /**
+   * `config` / `projectRoot` 只为与装配层（`index.ts` 的两个适配器共用一份 options）保持同一形状：
+   * T23 起团队适配器**不读项目文件、也不读 profile 配置里的容量段**，只有 `exec.agent` 与
+   * `services.agentTeams` 会被用到。
+   */
   config?: unknown;
   agent?: unknown;
   projectRoot?: unknown;
@@ -419,13 +360,12 @@ export interface TeamAdapterApi {
   contract_version: number;
   CONTRACT_VERSION: number;
   hasService(): boolean;
-  readDeclaredCapacity(root?: unknown): Promise<DeclaredCapacity>;
   membership(agent?: unknown): Promise<MembershipResult>;
   listMembers(agent?: unknown): Promise<ListMembersResult>;
   spawnTeammate(request?: SpawnTeammateRequest): Promise<SpawnTeammateResult>;
   sendMessage(request?: SendMessageRequest): Promise<SendMessageResult>;
   interruptAgent(request?: InterruptRequest): Promise<InterruptResult>;
-  capacity(): Promise<TeamCapacityResult>;
+  usedSeats(): Promise<UsedSeatsResult>;
   createTask(request?: CreateTaskRequest): Promise<CreateTaskResult>;
   updateTask(request?: UpdateTaskRequest): Promise<UpdateTaskResult>;
   getTask(taskId?: unknown): Promise<GetTaskResult>;
@@ -434,22 +374,6 @@ export interface TeamAdapterApi {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
-}
-
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
-}
-
-/**
- * 已经过 `isPositiveInteger()` 校验的值。
- *
- * 存在的理由：`problems` 式校验只收集问题、不产生控制流收窄，返回对象时需要一处
- * 「命题已在上文证明」的断言点。不变式：每个调用点都紧跟在同一字段的
- * `isPositiveInteger()` 校验之后，且只有 `problems` 为空才会走到返回值。
- */
-function provenPositive(value: unknown): number {
-  // 断言：调用点紧跟 isPositiveInteger() 校验，且只有 problems 为空才走到这里。
-  return value as number;
 }
 
 /** 是否是「装配上下文里的 getter」（等价于原来的 `ctx && typeof ctx.get === 'function'`）。 */
@@ -542,137 +466,11 @@ function failureFrom(error: unknown, context: FailureContext): FailureBranch {
   };
 }
 
-/** 容量声明缺失/非法时的 gap（绝不猜上限）。 */
-function capacityGap(code: string, detail: string, nextStep: string): CapacityGap {
-  return { code, detail, nextStep };
-}
-
-const DECLARE_NEXT_STEP =
-  '在项目里声明 re/team/capacity.json（schema_version:1、带时区的 declared_at、declared_by、'
-  + 'maxMembers、maxActiveSubagents），或在 profile patch 的 redteam-lead-tools.config.capacity 里声明；'
-  + '未声明时上层按 CAPACITY_UNKNOWN 处理，不拿常数猜余额。';
-
-/**
- * 读并校验项目里的容量声明 `re/team/capacity.json`。
- * 文件缺失/JSON 坏/字段不合法都返回 `{known:false, gap}`，不抛。
- * @param {string} projectRoot 项目根
- */
-export async function readDeclaredCapacity(projectRoot: unknown): Promise<DeclaredCapacity> {
-  if (!isNonEmptyString(projectRoot)) {
-    return {
-      known: false,
-      gap: capacityGap('CAPACITY_DECLARATION_MISSING', '没有项目根，读不到 re/team/capacity.json', DECLARE_NEXT_STEP),
-    };
-  }
-  const file = path.join(projectRoot, 're', 'team', 'capacity.json');
-  let text: string;
-  try {
-    text = await readFile(file, 'utf8');
-  } catch (error) {
-    const missing = thrownCode(error) === 'ENOENT';
-    return {
-      known: false,
-      gap: capacityGap(
-        missing ? 'CAPACITY_DECLARATION_MISSING' : 'CAPACITY_DECLARATION_INVALID',
-        missing ? `没有找到 ${file}` : `读不了 ${file}: ${error instanceof Error ? error.message : String(error)}`,
-        DECLARE_NEXT_STEP,
-      ),
-    };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch (error) {
-    return {
-      known: false,
-      gap: capacityGap(
-        'CAPACITY_DECLARATION_INVALID',
-        `${file} 不是合法 JSON: ${error instanceof Error ? error.message : String(error)}`,
-        DECLARE_NEXT_STEP,
-      ),
-    };
-  }
-  if (!isRecord(parsed) || Array.isArray(parsed)) {
-    return {
-      known: false,
-      gap: capacityGap('CAPACITY_DECLARATION_INVALID', `${file} 必须是 JSON 对象`, DECLARE_NEXT_STEP),
-    };
-  }
-  const problems: string[] = [];
-  if (parsed.schema_version !== 1) problems.push('schema_version 必须是 1');
-  if (!isNonEmptyString(parsed.declared_at) || !ISO_WITH_ZONE.test(parsed.declared_at)) {
-    problems.push('declared_at 必须是带时区的 ISO 8601 时间');
-  }
-  if (!isNonEmptyString(parsed.declared_by)) problems.push('declared_by 必须是非空字符串');
-  if (!isPositiveInteger(parsed.maxMembers)) problems.push('maxMembers 必须是 >=1 的整数');
-  if (!isPositiveInteger(parsed.maxActiveSubagents)) problems.push('maxActiveSubagents 必须是 >=1 的整数');
-  if (problems.length > 0) {
-    return {
-      known: false,
-      gap: capacityGap('CAPACITY_DECLARATION_INVALID', `${file} 字段不合法：${problems.join('；')}`, DECLARE_NEXT_STEP),
-    };
-  }
-  return {
-    known: true,
-    maxMembers: provenPositive(parsed.maxMembers),
-    maxActiveSubagents: provenPositive(parsed.maxActiveSubagents),
-    declaredAt: parsed.declared_at,
-    declaredBy: parsed.declared_by,
-    source: 'declared:re/team/capacity.json',
-    path: 're/team/capacity.json',
-  };
-}
-
-/** profile config 里的容量声明（合法时）。 */
-interface ConfigCapacityKnown {
-  ok: true;
-  maxMembers: number;
-  maxActiveSubagents: number;
-  declaredAt: unknown;
-  declaredBy: unknown;
-  source: string;
-}
-
-/** profile config 里的容量声明（非法时）。 */
-interface ConfigCapacityInvalid {
-  ok: false;
-  gap: CapacityGap;
-}
-
-/** 归一 profile config 里的容量声明；没有声明返回 `null`，非法返回 `{ok:false, gap}`。 */
-function normalizeConfigCapacity(config: unknown): ConfigCapacityKnown | ConfigCapacityInvalid | null {
-  const declared = isRecord(config) ? config.capacity : undefined;
-  if (declared === undefined || declared === null) return null;
-  if (!isRecord(declared) || Array.isArray(declared)) {
-    return {
-      ok: false,
-      gap: capacityGap('CAPACITY_DECLARATION_INVALID', 'config.capacity 必须是对象', DECLARE_NEXT_STEP),
-    };
-  }
-  const problems: string[] = [];
-  if (!isPositiveInteger(declared.maxMembers)) problems.push('maxMembers 必须是 >=1 的整数');
-  if (!isPositiveInteger(declared.maxActiveSubagents)) problems.push('maxActiveSubagents 必须是 >=1 的整数');
-  if (problems.length > 0) {
-    return {
-      ok: false,
-      gap: capacityGap('CAPACITY_DECLARATION_INVALID', `config.capacity 字段不合法：${problems.join('；')}`, DECLARE_NEXT_STEP),
-    };
-  }
-  return {
-    ok: true,
-    maxMembers: provenPositive(declared.maxMembers),
-    maxActiveSubagents: provenPositive(declared.maxActiveSubagents),
-    declaredAt: declared.declared_at ?? null,
-    declaredBy: declared.declared_by ?? 'profile-config',
-    source: 'declared:profile-config',
-  };
-}
-
 /**
  * 已用席位：恒从 listMembers 数 teammate（含 failed），这是唯一受支持的「已用」来源。
  *
  * 行按宿主形状标注（`{role}`）而不是 `recordOf` 兜底：迁移前的 `row.role` 在行不是对象时
- * 会抛，由 `capacity()` 的 `try/catch` 记成 `CAPACITY_USED_UNKNOWN`；这里保持同一条路径。
+ * 会抛，由 `usedSeats()` 的 `try/catch` 记成「数不到已用席位」；这里保持同一条路径。
  */
 function countUsedSeats(service: HostTeamService, agent: unknown): number {
   const rows = service.listMembers(agent);
@@ -731,19 +529,18 @@ function projectMemberRow(view: { id?: unknown; name?: unknown; role?: unknown; 
  * 建一个 teamAdapter。
  *
  * 支持两种入参形态：
- * - `createTeamAdapter({ ctx })`：从装配上下文取 `services` / `exec` / `config` / `root`；
- * - `createTeamAdapter({ services, exec, agent, config, projectRoot })`：显式注入。
+ * - `createTeamAdapter({ ctx })`：从装配上下文取 `services` / `exec`；
+ * - `createTeamAdapter({ services, exec, agent })`：显式注入。
+ *
+ * `config` / `projectRoot` 仍然接受（装配层给两个适配器同一份 options），但不再被读取：
+ * T23 起团队适配器不读项目里的容量声明文件，也不读 profile 配置里的容量段。
  */
 export function createTeamAdapter(input: TeamAdapterOptions = {}): TeamAdapterApi {
   const ctx = input.ctx ?? undefined;
   const ctxView = recordOf(ctx);
   const services = input.services ?? ctxView.services ?? undefined;
   const exec = input.exec ?? ctxView.exec ?? undefined;
-  const config = input.config ?? ctxView.config ?? {};
   const explicitAgent = input.agent ?? undefined;
-  const declaredProjectRoot = input.projectRoot
-    ?? (typeof ctxView.root === 'string' ? ctxView.root : undefined)
-    ?? (isRecord(config) ? config.projectRoot : undefined);
 
   function service(): unknown {
     const injected = isRecord(services) ? services.agentTeams : undefined;
@@ -765,11 +562,6 @@ export function createTeamAdapter(input: TeamAdapterOptions = {}): TeamAdapterAp
     return isRecord(exec) ? exec.agent : undefined;
   }
 
-  function projectRoot(): string | undefined {
-    if (isNonEmptyString(declaredProjectRoot)) return declaredProjectRoot;
-    return undefined;
-  }
-
   const adapter: TeamAdapterApi = {
     contract_version: CONTRACT_VERSION,
     CONTRACT_VERSION,
@@ -777,11 +569,6 @@ export function createTeamAdapter(input: TeamAdapterOptions = {}): TeamAdapterAp
     /** 团队服务是否可用（doctor/identity 用）。 */
     hasService(): boolean {
       return service() !== undefined;
-    },
-
-    /** 见文件头。 */
-    async readDeclaredCapacity(root: unknown): Promise<DeclaredCapacity> {
-      return readDeclaredCapacity(root ?? projectRoot());
     },
 
     /** 解析调用者在团队里的身份；只接受宿主给的活 agent。 */
@@ -943,110 +730,46 @@ export function createTeamAdapter(input: TeamAdapterOptions = {}): TeamAdapterAp
     },
 
     /**
-     * 容量：已用席位可数，上限必须显式声明（见文件头与 D1）。
+     * 已用席位（T23）：只回答这一件能数到的事。
+     *
+     * 数不到就说数不到（`used: null` + 原因），**不**回落成 0，也**不**顺手编一个上限。
+     * 上限由宿主自己强制：`spawnTeammate` 被拒时适配器把 `TEAM_MEMBER_LIMIT` /
+     * `ACTIVATION_LIMIT_REACHED` 映射成 `CAPACITY_EXHAUSTED`，原始文案留在 `reason`。
      */
-    async capacity(): Promise<TeamCapacityResult> {
+    async usedSeats(): Promise<UsedSeatsResult> {
       const teams = service();
-      const root = projectRoot();
-      const declaration = await readDeclaredCapacity(root);
-      const configured = normalizeConfigCapacity(config);
-      const gaps: CapacityGap[] = [];
-
-      let declared: {
-        maxMembers: number;
-        maxActiveSubagents: number;
-        declaredAt: unknown;
-        declaredBy: unknown;
-        source: string;
-      } | null = null;
-      if (declaration.known === true) {
-        declared = {
-          maxMembers: declaration.maxMembers,
-          maxActiveSubagents: declaration.maxActiveSubagents,
-          declaredAt: declaration.declaredAt,
-          declaredBy: declaration.declaredBy,
-          source: declaration.source,
-        };
-      } else if (configured !== null && configured.ok === true) {
-        declared = {
-          maxMembers: configured.maxMembers,
-          maxActiveSubagents: configured.maxActiveSubagents,
-          declaredAt: configured.declaredAt,
-          declaredBy: configured.declaredBy,
-          source: configured.source,
-        };
-      } else {
-        gaps.push(declaration.gap ?? capacityGap(
-          'CAPACITY_DECLARATION_MISSING',
-          're/team/capacity.json 与 profile config.capacity 都没有声明容量',
-          DECLARE_NEXT_STEP,
-        ));
-        if (configured !== null && configured.ok === false) gaps.push(configured.gap);
-      }
-
-      let used: number | null = null;
       if (teams === undefined) {
-        gaps.push(capacityGap(
-          'CAPACITY_USED_UNKNOWN',
-          'agentTeams 未挂载，数不到已用席位',
-          '启用团队 profile bundle 后重试；未挂载时不要建岗',
-        ));
-      } else {
-        const live = callerAgent();
-        if (live === undefined) {
-          gaps.push(capacityGap('CAPACITY_USED_UNKNOWN', '没有宿主的活 exec.agent，数不到已用席位', '在 Agent 作用域内调用 rt_roster/rt_dispatch'));
-        } else {
-          try {
-            const host = asHostTeamService(teams);
-            if (host === null) throw new TypeError('agentTeams is not an object');
-            used = countUsedSeats(host, live);
-          } catch (error) {
-            gaps.push(capacityGap(
-              'CAPACITY_USED_UNKNOWN',
-              `listMembers() 失败，数不到已用席位：${error instanceof Error ? error.message : String(error)}`,
-              '先修好团队服务/身份，再决定是否建岗',
-            ));
-          }
-        }
+        return {
+          ok: false,
+          used: null,
+          code: SERVICE_UNAVAILABLE,
+          reason: 'agentTeams 未挂载，数不到已用席位',
+          nextStep: '启用团队 profile bundle 后重试',
+        };
       }
-
-      const memberSlotsKnown = declared !== null && used !== null;
-      let remaining: number | null = null;
-      if (declared !== null && used !== null) remaining = Math.max(0, declared.maxMembers - used);
-      const memberSlots: MemberSlots = {
-        known: memberSlotsKnown,
-        remaining,
-        total: declared === null ? null : declared.maxMembers,
-        used,
-      };
-      if (declared !== null && used !== null) {
-        gaps.push(capacityGap(
-          'ACTIVATION_USAGE_UNOBSERVED',
-          'activation 池的当前占用没有受支持的只读查询（池内计数是私有的），只能声明上限',
-          '把 maxActiveSubagents 当硬上限保守派发；真正的额度由宿主 ACTIVATION_LIMIT_REACHED 兜底，不要用成员名册或子代理列表推算占用',
-        ));
+      const live = callerAgent();
+      if (live === undefined) {
+        return {
+          ok: false,
+          used: null,
+          code: ROLE_REQUIRED,
+          reason: '没有宿主的活 exec.agent，数不到已用席位',
+          nextStep: '在 Agent 作用域内调用 rt_roster/rt_dispatch',
+        };
       }
-      const activations: ActivationSlots = {
-        known: declared !== null,
-        remaining: null,
-        total: declared === null ? null : declared.maxActiveSubagents,
-      };
-      const evidence: CapacityEvidence = {
-        source: declared === null ? 'unavailable' : declared.source,
-        ...(declared === null ? {} : {
-          declaredAt: declared.declaredAt ?? null,
-          declaredBy: declared.declaredBy ?? null,
-          maxMembers: declared.maxMembers,
-          maxActiveSubagents: declared.maxActiveSubagents,
-        }),
-        usedSeats: used,
-      };
-
-      const base = { memberSlots, activations, evidence, gaps };
-      if (teams === undefined) {
-        return { ok: false, code: SERVICE_UNAVAILABLE, ...base };
+      try {
+        const host = asHostTeamService(teams);
+        if (host === null) throw new TypeError('agentTeams is not an object');
+        return { ok: true, used: countUsedSeats(host, live) };
+      } catch (error) {
+        return {
+          ok: false,
+          used: null,
+          code: RECOVERY_REQUIRED,
+          reason: `listMembers() 失败，数不到已用席位：${error instanceof Error ? error.message : String(error)}`,
+          nextStep: '先修好团队服务/身份，再读已用席位',
+        };
       }
-      return { ok: true, ...base };
     },
 
     /**

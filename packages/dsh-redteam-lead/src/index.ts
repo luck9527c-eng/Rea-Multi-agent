@@ -38,7 +38,7 @@ import * as identity from './identity.js'
 import * as operation from './operation.js'
 import * as audit from './audit.js'
 
-// —— 岗位目录 / 能力 / 预算（T3）——
+// —— 岗位目录 / 能力 / 岗位计划（T3）——
 import * as catalog from './catalog.js'
 import * as capability from './capability.js'
 import * as capacity from './capacity.js'
@@ -113,12 +113,12 @@ export const TOOLS = Object.freeze([
     title: 'Inspect or bind the red-team roster',
     description:
       'Lead only. Step 1 of the project ledger. action=inspect (default) is read-only roster diagnosis: skill ' +
-      'compatibility gaps, candidate posts, capacity, recommended members, proposal hash. Read gaps[] before ' +
-      'dispatching — it says which posts are dispatchable and what is missing (tool inventory, capability ' +
-      'registration, capacity). Step 2 is action=bind/takeover to bind project+session; it needs operation_id, ' +
-      'proposal_hash and at least one target_kind (takeover also needs recovery_ref), and it refuses while any ' +
-      'gap is CAPACITY_EXHAUSTED or CAPACITY_UNKNOWN. On CAPACITY_UNKNOWN the project has no capacity source ' +
-      'yet: put one in re/team/capacity.json, or pass capacity on that call.',
+      'compatibility gaps, candidate posts, capability gaps, proposal hash. Read gaps[] before dispatching — ' +
+      'it says which posts are dispatchable and what is missing (tool inventory, capability registration). ' +
+      'Step 2 is action=bind/takeover to bind project+session; it needs operation_id, proposal_hash and at ' +
+      'least one target_kind (takeover also needs recovery_ref), and it refuses while any gap is ' +
+      'CAPACITY_EXHAUSTED (max_posts overflow). There is no capacity plan: the host does not expose its ' +
+      'member/activation limits, so this tool reports how many seats are used and leaves the limit to the host.',
   },
   {
     name: 'rt_dispatch',
@@ -226,7 +226,7 @@ interface CreateDepsOptions {
  *   exec/services/config 与 `projectRoot` 绑进去（不跨调用复用）。
  *
  * `projectRoot` 必须由调用方（`invokeTool`）先解析入参、`normalizeProjectRoot` 之后再传进来：
- * 适配器只有在拿到真实根时才能读 `re/routes/**`、`re/team/capacity.json`。传 `undefined`
+ * 项目适配器只有在拿到真实根时才能读 `re/routes/**`。传 `undefined`
  * 表示本次没有可用根（入参非法），适配器仍会装配但不绑定 —— 由 handler 返回可读错误。
  *
  * @param {{ services: object, exec: unknown, config: object, ctx?: unknown,
@@ -564,32 +564,12 @@ function oneLineText(value: unknown, max: number): string {
   return clipText(flatText(value), max)
 }
 
-/** 「要么有值、要么未知」的字段：缺失/异常形状一律写 `null`（与 D19 的 capacity 口径一致）。 */
+/**
+ * 「要么有值、要么未知」的字段：缺失/异常形状一律写 `null`。
+ */
 function scalarOrNull(value: unknown): string {
   const text = oneLineText(value, 200)
   return text.length > 0 ? text : 'null'
-}
-
-/**
- * D19：wire `capacity` 恰好 4 个字段（没有 `known`）。未知写 `null`，不猜、不省略字段 ——
- * A09 的判据就是「未知显示 null，声明后显示数值」，渲染层必须把这两态都摆出来。
- */
-const CAPACITY_FIELDS = Object.freeze([
-  'remaining_member_slots',
-  'remaining_activations',
-  'reserved_member_slots',
-  'reserved_activations',
-] as const)
-
-/** `capacity` 一行：`remaining_member_slots=7，remaining_activations=null，…`。 */
-function capacityLine(capacity: unknown): string {
-  const view = recordOf(capacity)
-  const parts = CAPACITY_FIELDS.map((field) => {
-    const value = view[field]
-    const known = typeof value === 'number' && Number.isFinite(value)
-    return `${field}=${known ? String(value) : 'null'}`
-  })
-  return `capacity：${parts.join('，')}`
 }
 
 /**
@@ -598,7 +578,7 @@ function capacityLine(capacity: unknown): string {
  * `required` 是岗位**要求**的能力族（含 `shell`/`fs` 这类已被满足的），所以只标「要求」而不标
  * 「缺失」：真正缺哪一族写在岗位自己的 `reason` 与 `gaps` 条目里，渲染层不替数据下结论。
  *
- * `gapReasons` 是 `gaps` 段已经打印过的 reason：容量模块把同一条缺口拼成 `岗位 <post_id> <reason>`
+ * `gapReasons` 是 `gaps` 段已经打印过的 reason：岗位计划把同一条缺口拼成 `岗位 <post_id> <reason>`
  * 投进 gaps，这里就不再逐字重复一遍 —— 岗位行保持摘要，细节仍在下面 `gaps` 段可读。
  */
 function postsLines(posts: unknown, gapReasons: ReadonlySet<string>): string[] {
@@ -668,8 +648,8 @@ function summarizeData(label: string, data: unknown): string[] {
     lines.push(`session_id：${scalarOrNull(view.session_id)}`)
     lines.push(`team_id：${scalarOrNull(view.team_id)}`)
     push('compatibility', view.compatibility)
-    // A09：4 个容量字段（未知写 null）；A38：每条缺口带 code 与一行 reason。
-    lines.push(capacityLine(view.capacity))
+    // 容量一行不再渲染（T23：本插件不做容量规划；`capacity` 字段只是 wire 的必备键）。
+    // A38：每条缺口带 code 与一行 reason。
     lines.push(...postsLines(view.posts, gapReasonSet(view.gaps)))
     lines.push(...gapsLines(view.gaps))
     push('recommended_members', view.recommended_members)

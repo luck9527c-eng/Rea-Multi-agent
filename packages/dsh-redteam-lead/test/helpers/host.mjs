@@ -25,17 +25,8 @@
  * - 本轮尚未实现的键（`binding`/`contract`/`resources`/`submission`/`anchors`/`baseline`）为 `null`；
  * - `ctx.deps.clock` / `ctx.deps.fs` = 假时钟与 `fs/promises` 薄封装。
  *
- * 容量：真实宿主没有容量查询（D1），所以容量只能来自**显式声明**
- * （`re/team/capacity.json` 或 `ctx.config.capacity`）。`makeCtx({capacity})` 只负责把这份
- * 声明落到项目文件或 config 里；不传就什么都不落（→ `capacity().memberSlots.known === false`）。
- *
- * | `capacity` | 行为 |
- * |---|---|
- * | `{known:true, maxMembers, maxActiveSubagents, via:'project'}` | 写 `re/team/capacity.json` |
- * | `{known:true, maxMembers, maxActiveSubagents, via:'config'}` | 写 `ctx.config.capacity` |
- * | `{known:false}` / 不传 | 不声明 |
- *
- * `teamOpts.capacity` 也会被当作同一个 fixture 使用（`createFakeTeam` 只是它的载体）。
+ * 容量：T23 起**没有任何容量来源**（宿主不提供上限读数，项目声明文件也随容量子系统删除了）。
+ * `used` 只能从 `listMembers` 数出来（`deps.teamAdapter.usedSeats()`），本助手不造任何声明。
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import * as fsp from 'node:fs/promises';
@@ -220,7 +211,6 @@ export function makeFs() {
  * @param {object} [options.teamOpts] 传给 `createFakeTeam`
  * @param {object|null} [options.project] 直接给一个项目 adapter；`null` 表示不挂
  * @param {object} [options.projectOpts] 传给 `createFakeProject`
- * @param {object} [options.capacity] 容量声明 fixture（见文件头）
  * @param {object} [options.tools] 传给 `makeFakeTools`
  * @param {object} [options.depsOverrides] 覆盖/注入 `deps` 的任意键
  * @param {object} [options.config] 合并进 `ctx.config`
@@ -241,35 +231,12 @@ export function makeCtx(options = {}) {
       ...(options.teamOpts ?? {}),
     }));
 
-  const declared = options.capacity
-    ?? (team !== null && team.capacityDeclaration !== null ? team.capacityDeclaration : null);
-
-  if (declared !== null && declared !== undefined) {
-    if (declared.known === true && declared.via === 'config') {
-      // 由下面 config 分支写入
-    } else if (declared.known === true) {
-      const payload = {
-        schema_version: 1,
-        declared_at: declared.declared_at ?? new Date(clock.now()).toISOString(),
-        declared_by: declared.declared_by ?? 'host-helper',
-        maxMembers: declared.maxMembers,
-        maxActiveSubagents: declared.maxActiveSubagents,
-      };
-      const target = path.join(projectRoot, 're', 'team', 'capacity.json');
-      mkdirSync(path.dirname(target), { recursive: true });
-      writeFileSync(target, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-    }
-  }
-
   const config = {
     defaults: {},
     presetId: 'redteam-lead',
     bundleRoot: undefined,
     projectRoot,
     ...(options.config ?? {}),
-    ...(declared !== null && declared !== undefined && declared.known === true && declared.via === 'config'
-      ? { capacity: { maxMembers: declared.maxMembers, maxActiveSubagents: declared.maxActiveSubagents } }
-      : {}),
   };
 
   const execAgent = team !== null ? team.agent : undefined;
